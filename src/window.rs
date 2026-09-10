@@ -20,7 +20,7 @@ const HOTKEY_ID: i32 = 1;
 const CARET_TIMER_ID: usize = 1;
 const CARET_BLINK_MS: u32 = 530;
 
-pub fn run() -> Result<()> {
+pub fn run(config: &crate::config::Config) -> Result<()> {
     unsafe {
         // Single instance: bail silently if apex is already running.
         CreateMutexW(None, true, w!("Local\\apex-launcher-mutex"))?;
@@ -30,6 +30,9 @@ pub fn run() -> Result<()> {
 
         // Shell launches (shell:AppsFolder) want COM on the calling thread.
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
+        // Start menu entry + run-at-login, per config.
+        crate::setup::ensure(config);
 
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
@@ -95,17 +98,22 @@ pub fn run() -> Result<()> {
         );
 
         // Attach application state to the window.
-        let app = Box::new(App::new(crate::plugins()));
+        let app = Box::new(App::new(crate::plugins(config)));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
 
-        // Ctrl+Esc. RegisterHotKey claims it before the shell's legacy
-        // Start-menu handling sees it (Win key still opens Start).
-        RegisterHotKey(
-            Some(hwnd),
-            HOTKEY_ID,
-            MOD_CONTROL | MOD_NOREPEAT,
-            VK_ESCAPE.0 as u32,
-        )?;
+        // Hotkey from config (default Ctrl+Esc; RegisterHotKey claims it
+        // before the shell's legacy Start-menu handling sees it). If the
+        // configured combo is taken, fall back to the default.
+        let mods = HOT_KEY_MODIFIERS(config.hotkey_mods) | MOD_NOREPEAT;
+        if RegisterHotKey(Some(hwnd), HOTKEY_ID, mods, config.hotkey_vk).is_err() {
+            crate::dlog!("configured hotkey unavailable; falling back to Ctrl+Esc");
+            RegisterHotKey(
+                Some(hwnd),
+                HOTKEY_ID,
+                MOD_CONTROL | MOD_NOREPEAT,
+                VK_ESCAPE.0 as u32,
+            )?;
+        }
         crate::dlog!("hotkey registered, entering message loop");
 
         let mut msg = MSG::default();

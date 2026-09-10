@@ -16,20 +16,27 @@ macro_rules! dlog {
 }
 
 mod app;
+mod config;
 mod fuzzy;
 mod plugin;
 mod plugins;
 mod render;
+mod setup;
 mod window;
 
-/// Construct the set of enabled plugins. Later this reads the user config;
-/// disabled plugins are never built, so they cost nothing.
-fn plugins() -> Vec<Box<dyn plugin::Plugin>> {
-    vec![Box::new(plugins::search::Search::new())]
+/// Construct the set of enabled plugins. Disabled plugins are never built,
+/// so they cost zero memory and zero startup time.
+fn plugins(config: &config::Config) -> Vec<Box<dyn plugin::Plugin>> {
+    let mut list: Vec<Box<dyn plugin::Plugin>> = Vec::new();
+    if config.plugin_enabled(plugins::search::ID) {
+        list.push(Box::new(plugins::search::Search::new()));
+    }
+    list
 }
 
 fn main() {
-    if let Err(err) = window::run() {
+    let config = config::Config::load();
+    if let Err(err) = window::run(&config) {
         fatal(&format!("apex failed to start:\n{err}"));
     }
 }
