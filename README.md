@@ -11,7 +11,9 @@ Ultra-fast, ultra-lightweight launcher for Windows. Raycast, but native.
 
 ## Status
 
-Early development.
+`v0.1.0`, pre-release. Working today: global hotkey, fuzzy app search with
+icons (desktop + Store apps), launching, and aliases. See
+[ROADMAP.md](ROADMAP.md) for what's shipped and what's next.
 
 ## Build
 
@@ -24,6 +26,10 @@ cargo build --release
 - `Ctrl+Esc` — toggle the launcher (configurable)
 - `Esc` — dismiss
 - `↑/↓` — move selection, `Enter` — launch
+- `Ctrl+K` — actions for the selected result (set/remove alias)
+
+Aliases: press `Ctrl+K` on any app, choose `Set Alias…`, and type a short
+name. Typing that alias afterwards puts the app first.
 
 Note: `Ctrl+Esc` normally opens the Start menu. Apex claims it with a
 low-level keyboard hook - before the shell sees it - so it wins even over
