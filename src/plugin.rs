@@ -52,6 +52,16 @@ impl FormField {
     }
 }
 
+/// Operations a plugin can ask for but cannot carry out itself, because they
+/// need the window handle or the process.
+#[derive(Clone, Copy, PartialEq)]
+pub enum ShellCommand {
+    Quit,
+    Restart,
+    ToggleTray,
+    ClearHistory,
+}
+
 /// What the UI should do after a plugin handled an action.
 pub enum ActionResult {
     /// Back to search mode; results are re-queried.
@@ -65,6 +75,8 @@ pub enum ActionResult {
     /// Reload every plugin from disk and return to the default list. Not
     /// recorded: reloading is not launching anything.
     Refresh,
+    /// Hand a shell-level operation up to the window. Not recorded.
+    Shell(ShellCommand),
     /// Open a one-line text input (e.g. "set alias"); the entered text is
     /// delivered to [`Plugin::submit_text`] with `action_id`.
     RequestText {

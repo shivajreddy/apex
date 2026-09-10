@@ -20,6 +20,8 @@ const DEFAULT_FILE: &str = r#"# Apex configuration
 start_menu = true
 # Launch apex automatically at sign-in.
 start_on_startup = true
+# Show a tray icon (right-click for Open / Reload / Config / Quit).
+tray_icon = true
 
 [hotkey]
 # Modifiers joined with '+': ctrl, alt, shift, win. Use "none" for bare keys.
@@ -173,25 +175,81 @@ fn drop_alias_lines(text: &str, drop: impl Fn(&str, &str) -> bool) -> Vec<String
     out
 }
 
-/// Index just past the last line of the `[aliases]` section, if present.
-fn alias_section_end(lines: &[String]) -> Option<usize> {
-    let mut in_aliases = false;
+/// Index just past the last non-blank line of `[section]`, if present.
+fn section_end(lines: &[String], section: &str) -> Option<usize> {
+    let mut inside = false;
     let mut end = None;
     for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if let Some(name) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-            if in_aliases {
+        if let Some(name) = header_name(line) {
+            if inside {
                 break;
             }
-            in_aliases = name.trim().eq_ignore_ascii_case("aliases");
-            if in_aliases {
+            inside = name.eq_ignore_ascii_case(section);
+            if inside {
                 end = Some(i + 1);
             }
-        } else if in_aliases && !trimmed.is_empty() {
+        } else if inside && !line.trim().is_empty() {
             end = Some(i + 1);
         }
     }
     end
+}
+
+fn alias_section_end(lines: &[String]) -> Option<usize> {
+    section_end(lines, "aliases")
+}
+
+/// Insert or replace a single `key = value` line inside `[section]`.
+///
+/// Line surgery, like the alias and quicklink writers: every other line,
+/// comments included, is preserved byte-for-byte. A trailing comment on the
+/// replaced line is carried over rather than silently dropped.
+fn upsert_key_text(text: &str, section: &str, key: &str, value: &str) -> String {
+    let new_line = format!("{key} = {value}");
+    let mut lines: Vec<String> = Vec::new();
+    let mut inside = false;
+    let mut replaced = false;
+
+    for line in text.lines() {
+        if let Some(name) = header_name(line) {
+            inside = name.eq_ignore_ascii_case(section);
+        } else if inside
+            && !replaced
+            && strip_comment(line)
+                .split_once('=')
+                .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case(key))
+        {
+            let comment = line[strip_comment(line).len()..].trim();
+            lines.push(if comment.is_empty() {
+                new_line.clone()
+            } else {
+                format!("{new_line}  {comment}")
+            });
+            replaced = true;
+            continue;
+        }
+        lines.push(line.to_string());
+    }
+
+    if !replaced {
+        match section_end(&lines, section) {
+            Some(idx) => lines.insert(idx, new_line),
+            None => {
+                if !lines.last().is_none_or(|l| l.trim().is_empty()) {
+                    lines.push(String::new());
+                }
+                lines.push(format!("[{section}]"));
+                lines.push(new_line);
+            }
+        }
+    }
+    join_lines(lines)
+}
+
+/// Persist a `[general]` boolean.
+pub fn set_general_flag_file(key: &str, value: bool) {
+    let v = if value { "true" } else { "false" };
+    edit_config_file(|text| upsert_key_text(text, "general", key, v));
 }
 
 fn join_lines(lines: Vec<String>) -> String {
@@ -538,6 +596,44 @@ mod tests {
             assert_eq!(Config::from_text(&line).subtables("").len(), 0);
             assert_eq!(parse(&line)[&("s".to_string(), "k".to_string())], v);
         }
+    }
+
+    #[test]
+    fn general_flag_write_back_replaces_in_place() {
+        let text = "# top\n[general]\n# keep this comment\nstart_menu = true\n\
+                    start_on_startup = true  # trailing note\n\n[plugins]\nsearch = true\n";
+        let out = upsert_key_text(text, "general", "start_on_startup", "false");
+        assert!(out.contains("# keep this comment"));
+        assert!(out.contains("start_menu = true"));
+        assert!(out.contains("search = true"));
+        // The trailing comment survives the rewrite.
+        assert!(out.contains("start_on_startup = false  # trailing note"), "{out}");
+
+        let cfg = Config::from_text(&out);
+        assert!(!cfg.general_flag("start_on_startup", true));
+        assert!(cfg.general_flag("start_menu", false));
+    }
+
+    #[test]
+    fn general_flag_write_back_adds_missing_key_and_section() {
+        // Key absent, section present.
+        let added = upsert_key_text("[general]\nstart_menu = true\n", "general", "tray_icon", "false");
+        assert!(!Config::from_text(&added).general_flag("tray_icon", true));
+
+        // Section absent entirely.
+        let fresh = upsert_key_text("[plugins]\nsearch = true\n", "general", "tray_icon", "true");
+        let cfg = Config::from_text(&fresh);
+        assert!(cfg.general_flag("tray_icon", false));
+        assert!(cfg.plugin_enabled("search"));
+    }
+
+    #[test]
+    fn general_flag_write_back_ignores_same_key_in_another_section() {
+        let text = "[general]\ntray_icon = true\n\n[plugins]\ntray_icon = true\n";
+        let out = upsert_key_text(text, "general", "tray_icon", "false");
+        assert!(!Config::from_text(&out).general_flag("tray_icon", true));
+        // The [plugins] entry of the same name is untouched.
+        assert!(Config::from_text(&out).plugin_enabled("tray_icon"));
     }
 
     #[test]

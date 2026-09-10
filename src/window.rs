@@ -20,10 +20,14 @@ use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
+use windows::Win32::UI::Shell::{
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 
 use crate::app::{App, Mode, UiOutcome};
+use crate::plugin::ShellCommand;
 use crate::render;
 
 const CARET_TIMER_ID: usize = 1;
@@ -34,6 +38,15 @@ const HOTKEY_ID: i32 = 1;
 const WM_APP_TOGGLE: u32 = WM_APP + 1;
 /// Posted by either hook when the user interacts outside the window.
 const WM_APP_DISMISS: u32 = WM_APP + 2;
+/// Tray icon callback; the mouse event arrives in lparam.
+const WM_APP_TRAY: u32 = WM_APP + 3;
+
+const TRAY_UID: u32 = 1;
+// Tray menu command ids.
+const IDM_OPEN: usize = 1;
+const IDM_RELOAD: usize = 2;
+const IDM_CONFIG: usize = 3;
+const IDM_QUIT: usize = 4;
 
 // Hook state (the hook procs are free functions, so this lives in statics).
 static HOOK_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -45,14 +58,21 @@ static HOOK_HELD: AtomicBool = AtomicBool::new(false);
 static VISIBLE: AtomicBool = AtomicBool::new(false);
 /// Mouse hook handle; installed only while the window is visible.
 static MOUSE_HOOK: AtomicIsize = AtomicIsize::new(0);
+/// Single-instance mutex, kept so Restart can release it before relaunching.
+static INSTANCE_MUTEX: AtomicIsize = AtomicIsize::new(0);
+/// Embedded app icon, reused for the tray.
+static APP_ICON: AtomicIsize = AtomicIsize::new(0);
+/// Whether the tray icon is currently registered.
+static TRAY_SHOWN: AtomicBool = AtomicBool::new(false);
 
 pub fn run(config: &crate::config::Config) -> Result<()> {
     unsafe {
         // Single instance: bail silently if apex is already running.
-        CreateMutexW(None, true, w!("Local\\apex-launcher-mutex"))?;
+        let mutex = CreateMutexW(None, true, w!("Local\\apex-launcher-mutex"))?;
         if GetLastError() == ERROR_ALREADY_EXISTS {
             return Ok(());
         }
+        INSTANCE_MUTEX.store(mutex.0 as isize, Relaxed);
 
         // Shell launches (shell:AppsFolder) want COM on the calling thread.
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
@@ -77,6 +97,7 @@ pub fn run(config: &crate::config::Config) -> Result<()> {
         )
         .map(|h| HICON(h.0))
         .unwrap_or_default();
+        APP_ICON.store(icon.0 as isize, Relaxed);
 
         let wc = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
@@ -127,6 +148,10 @@ pub fn run(config: &crate::config::Config) -> Result<()> {
         // Attach application state to the window.
         let app = Box::new(App::new(crate::plugins(config)));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
+
+        if config.general_flag("tray_icon", true) {
+            add_tray(hwnd);
+        }
 
         // Global hotkey via low-level keyboard hook (see module docs).
         HOOK_HWND.store(hwnd.0 as isize, Relaxed);
@@ -295,6 +320,26 @@ unsafe extern "system" fn wndproc(
                 toggle(hwnd);
                 LRESULT(0)
             }
+            WM_APP_TRAY => {
+                match lparam.0 as u32 {
+                    WM_LBUTTONUP => toggle(hwnd),
+                    WM_RBUTTONUP => tray_menu(hwnd),
+                    _ => {}
+                }
+                LRESULT(0)
+            }
+            WM_COMMAND => {
+                match (wparam.0 & 0xFFFF) as usize {
+                    IDM_OPEN => show(hwnd),
+                    IDM_RELOAD => reload_plugins(hwnd),
+                    IDM_CONFIG => crate::plugins::commands::open_config_file(),
+                    IDM_QUIT => {
+                        let _ = DestroyWindow(hwnd);
+                    }
+                    _ => {}
+                }
+                LRESULT(0)
+            }
             WM_APP_DISMISS => {
                 crate::dlog!("WM_APP_DISMISS (visible={})", IsWindowVisible(hwnd).as_bool());
                 if IsWindowVisible(hwnd).as_bool() {
@@ -384,6 +429,7 @@ unsafe extern "system" fn wndproc(
                 LRESULT(0)
             }
             WM_DESTROY => {
+                remove_tray(hwnd);
                 let ptr = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as *mut App;
                 if !ptr.is_null() {
                     drop(Box::from_raw(ptr));
@@ -416,14 +462,147 @@ unsafe fn mode_kind(hwnd: HWND) -> ModeKind {
     }
 }
 
-/// Apply a mode-level outcome: dismiss, or refit the window and repaint.
+/// Apply a mode-level outcome: dismiss, refit and repaint, or run something
+/// only the window can do.
 unsafe fn settle(hwnd: HWND, outcome: UiOutcome) {
     unsafe {
-        if outcome == UiOutcome::Hide {
-            hide(hwnd);
+        match outcome {
+            UiOutcome::Hide => hide(hwnd),
+            UiOutcome::Stay => {
+                resize_to_content(hwnd);
+                invalidate(hwnd);
+            }
+            UiOutcome::Shell(cmd) => run_shell_command(hwnd, cmd),
+        }
+    }
+}
+
+unsafe fn run_shell_command(hwnd: HWND, cmd: ShellCommand) {
+    unsafe {
+        match cmd {
+            ShellCommand::Quit => {
+                let _ = DestroyWindow(hwnd);
+            }
+            ShellCommand::Restart => restart(hwnd),
+            ShellCommand::ToggleTray => {
+                toggle_tray(hwnd);
+                hide(hwnd);
+            }
+            // Handled by App, which owns the history.
+            ShellCommand::ClearHistory => {
+                resize_to_content(hwnd);
+                invalidate(hwnd);
+            }
+        }
+    }
+}
+
+/// Relaunch apex and exit.
+///
+/// The single-instance mutex has to go first: the replacement checks it
+/// immediately on startup and would otherwise see this process still holding
+/// it and quit silently. Closing our only handle destroys the named object.
+unsafe fn restart(hwnd: HWND) {
+    unsafe {
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let mutex = INSTANCE_MUTEX.swap(0, Relaxed);
+        if mutex != 0 {
+            let _ = CloseHandle(HANDLE(mutex as *mut core::ffi::c_void));
+        }
+        if let Err(e) = std::process::Command::new(&exe).spawn() {
+            crate::dlog!("restart: failed to spawn {}: {e}", exe.display());
+        }
+        let _ = DestroyWindow(hwnd);
+    }
+}
+
+// ---- tray icon --------------------------------------------------------
+
+unsafe fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
+    NOTIFYICONDATAW {
+        cbSize: size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_UID,
+        ..Default::default()
+    }
+}
+
+unsafe fn add_tray(hwnd: HWND) {
+    unsafe {
+        if TRAY_SHOWN.load(Relaxed) {
+            return;
+        }
+        let mut nid = tray_data(hwnd);
+        nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        nid.uCallbackMessage = WM_APP_TRAY;
+        nid.hIcon = HICON(APP_ICON.load(Relaxed) as *mut core::ffi::c_void);
+        for (i, c) in "Apex".encode_utf16().enumerate() {
+            nid.szTip[i] = c;
+        }
+        if Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
+            TRAY_SHOWN.store(true, Relaxed);
+        }
+    }
+}
+
+unsafe fn remove_tray(hwnd: HWND) {
+    unsafe {
+        if !TRAY_SHOWN.swap(false, Relaxed) {
+            return;
+        }
+        let nid = tray_data(hwnd);
+        let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+    }
+}
+
+unsafe fn toggle_tray(hwnd: HWND) {
+    unsafe {
+        let shown = TRAY_SHOWN.load(Relaxed);
+        if shown {
+            remove_tray(hwnd);
         } else {
-            resize_to_content(hwnd);
-            invalidate(hwnd);
+            add_tray(hwnd);
+        }
+        crate::config::set_general_flag_file("tray_icon", !shown);
+    }
+}
+
+unsafe fn tray_menu(hwnd: HWND) {
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return };
+        let _ = AppendMenuW(menu, MF_STRING, IDM_OPEN, w!("Open Apex"));
+        let _ = AppendMenuW(menu, MF_STRING, IDM_RELOAD, w!("Reload"));
+        let _ = AppendMenuW(menu, MF_STRING, IDM_CONFIG, w!("Open Config"));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let _ = AppendMenuW(menu, MF_STRING, IDM_QUIT, w!("Quit"));
+
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        // Required foreground dance: without it the menu refuses to close
+        // when you click elsewhere.
+        let _ = SetForegroundWindow(hwnd);
+        let _ = TrackPopupMenu(
+            menu,
+            TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
+            pt.x,
+            pt.y,
+            None,
+            hwnd,
+            None,
+        );
+        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = DestroyMenu(menu);
+    }
+}
+
+unsafe fn reload_plugins(hwnd: HWND) {
+    unsafe {
+        if let Some(app) = app_mut(hwnd) {
+            for p in &mut app.plugins {
+                p.refresh();
+            }
         }
     }
 }

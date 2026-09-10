@@ -2,7 +2,7 @@
 //! UI mode (search / actions panel / one-line text input).
 
 use crate::frecency::{self, Frecency};
-use crate::plugin::{Action, ActionResult, FormField, Plugin, ResultItem};
+use crate::plugin::{Action, ActionResult, FormField, Plugin, ResultItem, ShellCommand};
 use crate::render::Renderer;
 
 pub const MAX_RESULTS: usize = 8;
@@ -31,6 +31,8 @@ pub enum Mode {
 pub enum UiOutcome {
     Stay,
     Hide,
+    /// Something only the window can do: quit, restart, toggle the tray.
+    Shell(ShellCommand),
 }
 
 pub struct App {
@@ -285,6 +287,16 @@ impl App {
                 self.mode = Mode::Search;
                 UiOutcome::Hide
             }
+            ActionResult::Shell(cmd) => {
+                self.mode = Mode::Search;
+                // Launch history lives here, so clearing it never needs to
+                // reach the window.
+                if cmd == ShellCommand::ClearHistory {
+                    self.clear_history();
+                    return UiOutcome::Stay;
+                }
+                UiOutcome::Shell(cmd)
+            }
             ActionResult::Refresh => {
                 self.mode = Mode::Search;
                 for p in &mut self.plugins {
@@ -457,6 +469,15 @@ impl App {
             p.browse(free, &mut self.results);
         }
         self.results.truncate(MAX_RESULTS);
+    }
+
+    /// Forget all launch history, in memory and on disk, and show the result.
+    fn clear_history(&mut self) {
+        self.frecency = Frecency::default();
+        self.frecency.save(frecency::now());
+        self.query.clear();
+        self.pending_surrogate = None;
+        self.refresh_results();
     }
 
     /// Record the selected result as launched and persist immediately - the

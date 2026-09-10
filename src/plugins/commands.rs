@@ -1,9 +1,9 @@
 //! Apex's own commands, as searchable rows.
 //!
-//! Distinct from anything the machine can do: these act on apex itself. The
-//! first is "Reload Apex", which re-reads every plugin's data from disk -
-//! newly installed applications, and hand-edits to `config.toml` such as new
-//! quicklinks or aliases - without restarting.
+//! Distinct from anything the machine can do: these act on apex itself. They
+//! share an `Apex: ` prefix so the whole set is one keystroke away - typing
+//! "apex" lists them - while each remains reachable by its own word, since
+//! fuzzy matching only needs a subsequence.
 //!
 //! Rows here are deliberately excluded from launch history and from the
 //! empty-query list: running a command is not launching something, and
@@ -11,28 +11,77 @@
 
 use std::sync::Arc;
 
+use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows::core::{PCWSTR, w};
+
+use crate::config;
 use crate::fuzzy;
 use crate::icon;
-use crate::plugin::{Action, ActionResult, Icon, Plugin, ResultItem};
+use crate::plugin::{Action, ActionResult, Icon, Plugin, ResultItem, ShellCommand};
 
 pub const ID: &str = "commands";
+
+/// How much a keyword-only hit is docked, so a command whose *label* matches
+/// always outranks one that only matched a hidden synonym.
+const KEYWORD_PENALTY: i32 = 12;
 
 struct Command {
     id: &'static str,
     label: &'static str,
     folded: Vec<char>,
     bonus: Vec<i32>,
+    /// Label plus hidden synonyms, matched separately so that scoring the
+    /// label is unaffected by however many keywords a command carries.
+    alt_folded: Vec<char>,
+    alt_bonus: Vec<i32>,
 }
 
 impl Command {
-    fn new(id: &'static str, label: &'static str) -> Self {
+    fn new(id: &'static str, label: &'static str, keywords: &str) -> Self {
+        let alt = format!("{label} {keywords}");
         Self {
             id,
             label,
             folded: fuzzy::fold_case(label),
             bonus: fuzzy::bonuses(label),
+            alt_folded: fuzzy::fold_case(&alt),
+            alt_bonus: fuzzy::bonuses(&alt),
         }
     }
+
+    fn score(&self, query: &[char]) -> Option<i32> {
+        let direct = fuzzy::score(query, &self.folded, &self.bonus);
+        let alt = fuzzy::score(query, &self.alt_folded, &self.alt_bonus)
+            .map(|s| s - KEYWORD_PENALTY);
+        match (direct, alt) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    }
+}
+
+/// Hidden keywords exist because the obvious search term is often not in the
+/// label: "startup" appears nowhere in "Toggle Start at Login".
+fn all() -> Vec<Command> {
+    vec![
+        Command::new("reload", "Apex: Reload", "refresh rescan reindex"),
+        Command::new("restart", "Apex: Restart", "relaunch"),
+        Command::new("quit", "Apex: Quit", "exit close kill"),
+        Command::new("config", "Apex: Open Config", "settings toml preferences edit"),
+        Command::new("config_folder", "Apex: Open Config Folder", "directory appdata"),
+        Command::new("tray", "Apex: Toggle Tray Icon", "systray notification area"),
+        Command::new(
+            "startup",
+            "Apex: Toggle Start at Login",
+            "startup autostart boot signin",
+        ),
+        Command::new(
+            "clear_history",
+            "Apex: Clear Launch History",
+            "frecency reset forget ranking",
+        ),
+    ]
 }
 
 pub struct Commands {
@@ -49,7 +98,7 @@ impl Default for Commands {
 impl Commands {
     pub fn new() -> Self {
         Self {
-            commands: vec![Command::new("reload", "Reload Apex")],
+            commands: all(),
             icon: icon::app().map(Arc::new),
         }
     }
@@ -63,7 +112,7 @@ impl Plugin for Commands {
     fn query(&mut self, q: &str, out: &mut Vec<ResultItem>) {
         let query = fuzzy::fold_case(q);
         for c in &self.commands {
-            if let Some(score) = fuzzy::score(&query, &c.folded, &c.bonus) {
+            if let Some(score) = c.score(&query) {
                 out.push(ResultItem {
                     plugin: ID,
                     title: c.label.to_string(),
@@ -80,6 +129,24 @@ impl Plugin for Commands {
     fn activate(&mut self, item: &ResultItem) -> ActionResult {
         match item.payload.as_str() {
             "reload" => ActionResult::Refresh,
+            "restart" => ActionResult::Shell(ShellCommand::Restart),
+            "quit" => ActionResult::Shell(ShellCommand::Quit),
+            "tray" => ActionResult::Shell(ShellCommand::ToggleTray),
+            "clear_history" => ActionResult::Shell(ShellCommand::ClearHistory),
+            "config" => {
+                open_config(false);
+                ActionResult::Dismiss
+            }
+            "config_folder" => {
+                open_config(true);
+                ActionResult::Dismiss
+            }
+            "startup" => {
+                toggle_startup();
+                // Stay open: the change is silent, and Done re-queries so the
+                // row is still there to toggle back.
+                ActionResult::Done
+            }
             _ => ActionResult::Done,
         }
     }
@@ -96,58 +163,159 @@ impl Plugin for Commands {
     }
 }
 
+/// Open `config.toml` in the default editor. Also used by the tray menu.
+pub fn open_config_file() {
+    open_config(false);
+}
+
+/// Open `config.toml`, or the folder holding it.
+fn open_config(folder: bool) {
+    let Some(path) = config::config_path() else {
+        return;
+    };
+    let target = if folder {
+        path.parent().map(|p| p.to_path_buf()).unwrap_or(path)
+    } else {
+        path
+    };
+    let wide: Vec<u16> = target
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let inst = ShellExecuteW(
+            None,
+            w!("open"),
+            PCWSTR(wide.as_ptr()),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        );
+        if inst.0 as isize <= 32 {
+            crate::dlog!("commands: failed to open {}", target.display());
+        }
+    }
+}
+
+/// Flip `[general] start_on_startup` and apply it straight away, so the Run
+/// key matches the file without waiting for a restart.
+fn toggle_startup() {
+    let enabled = config::Config::load().general_flag("start_on_startup", true);
+    config::set_general_flag_file("start_on_startup", !enabled);
+    crate::setup::ensure(&config::Config::load());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn reload_is_findable_by_either_word() {
-        let mut c = Commands {
-            commands: vec![Command::new("reload", "Reload Apex")],
+    fn commands() -> Commands {
+        Commands {
+            commands: all(),
             icon: None,
-        };
-        for q in ["reload", "apex", "rel", "reload apex"] {
-            let mut out = Vec::new();
-            c.query(q, &mut out);
-            assert_eq!(out.len(), 1, "query {q:?} should find the command");
-            assert_eq!(out[0].payload, "reload");
+        }
+    }
+
+    fn find(q: &str) -> Vec<String> {
+        let mut c = commands();
+        let mut out = Vec::new();
+        c.query(q, &mut out);
+        out.into_iter().map(|i| i.payload).collect()
+    }
+
+    #[test]
+    fn the_prefix_lists_every_command() {
+        assert_eq!(find("apex").len(), all().len());
+    }
+
+    #[test]
+    fn hidden_keywords_find_commands_their_label_does_not_contain() {
+        // "startup" shares no subsequence with "Toggle Start at Login".
+        assert_eq!(find("startup").first().map(String::as_str), Some("startup"));
+        assert_eq!(find("exit").first().map(String::as_str), Some("quit"));
+        assert_eq!(
+            find("settings").first().map(String::as_str),
+            Some("config")
+        );
+        assert_eq!(
+            find("frecency").first().map(String::as_str),
+            Some("clear_history")
+        );
+    }
+
+    #[test]
+    fn a_label_match_outranks_a_keyword_match() {
+        // "reload" is Reload's label and also a keyword on nothing else, but
+        // "refresh" is only a keyword - both must still land on reload.
+        assert_eq!(find("reload").first().map(String::as_str), Some("reload"));
+        assert_eq!(find("refresh").first().map(String::as_str), Some("reload"));
+    }
+
+    #[test]
+    fn each_command_is_reachable_by_its_own_word() {
+        for (q, id) in [
+            ("reload", "reload"),
+            ("restart", "restart"),
+            ("quit", "quit"),
+            ("tray", "tray"),
+            ("startup", "startup"),
+            ("clear history", "clear_history"),
+        ] {
+            let hits = find(q);
+            assert!(
+                hits.first().map(String::as_str) == Some(id),
+                "query {q:?} ranked {hits:?}, wanted {id} first"
+            );
         }
     }
 
     #[test]
-    fn unrelated_queries_match_nothing() {
-        let mut c = Commands {
-            commands: vec![Command::new("reload", "Reload Apex")],
-            icon: None,
-        };
-        let mut out = Vec::new();
-        c.query("spotify", &mut out);
-        assert!(out.is_empty());
+    fn open_config_outranks_open_config_folder_for_its_own_name() {
+        let hits = find("open config");
+        assert_eq!(hits.first().map(String::as_str), Some("config"));
     }
 
     #[test]
-    fn activating_reload_asks_for_a_global_refresh() {
-        let mut c = Commands {
-            commands: vec![Command::new("reload", "Reload Apex")],
-            icon: None,
-        };
-        let item = ResultItem {
+    fn unrelated_queries_match_nothing() {
+        assert!(find("spotify").is_empty());
+    }
+
+    #[test]
+    fn commands_map_to_the_right_outcomes() {
+        let mut c = commands();
+        let item = |id: &str| ResultItem {
             plugin: ID,
-            title: "Reload Apex".into(),
+            title: String::new(),
             badge: None,
-            subtitle: "Command".into(),
-            payload: "reload".into(),
+            subtitle: String::new(),
+            payload: id.to_string(),
             score: 0,
             icon: None,
         };
-        assert!(matches!(c.activate(&item), ActionResult::Refresh));
+        assert!(matches!(c.activate(&item("reload")), ActionResult::Refresh));
+        assert!(matches!(
+            c.activate(&item("quit")),
+            ActionResult::Shell(ShellCommand::Quit)
+        ));
+        assert!(matches!(
+            c.activate(&item("restart")),
+            ActionResult::Shell(ShellCommand::Restart)
+        ));
+        assert!(matches!(
+            c.activate(&item("tray")),
+            ActionResult::Shell(ShellCommand::ToggleTray)
+        ));
+        assert!(matches!(
+            c.activate(&item("clear_history")),
+            ActionResult::Shell(ShellCommand::ClearHistory)
+        ));
     }
 
     #[test]
     fn commands_stay_out_of_history_and_the_default_list() {
-        let mut c = Commands::new();
-        // No item_for and no browse: the trait defaults keep command rows out
-        // of the empty-query list even if one somehow reached frecency.
+        let mut c = commands();
         assert!(c.item_for("reload").is_none());
         let mut out = Vec::new();
         c.browse(8, &mut out);
