@@ -1,4 +1,4 @@
-//! Window creation, global hotkey, and the message loop.
+//! Window creation, global hotkey, input routing, and the message loop.
 
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::*;
@@ -10,11 +10,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 
-const HOTKEY_ID: i32 = 1;
+use crate::app::App;
+use crate::render;
 
-/// Logical (96-dpi) window size. Scaled per-monitor at show time.
-const WINDOW_WIDTH: i32 = 720;
-const WINDOW_HEIGHT: i32 = 480;
+const HOTKEY_ID: i32 = 1;
+const CARET_TIMER_ID: usize = 1;
+const CARET_BLINK_MS: u32 = 530;
 
 pub fn run() -> Result<()> {
     unsafe {
@@ -74,6 +75,10 @@ pub fn run() -> Result<()> {
             size_of_val(&dark) as u32,
         );
 
+        // Attach application state to the window.
+        let app = Box::new(App::new(crate::plugins())?);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
+
         RegisterHotKey(
             Some(hwnd),
             HOTKEY_ID,
@@ -93,6 +98,22 @@ pub fn run() -> Result<()> {
     }
 }
 
+/// Borrow the App attached to the window. Callers must not overlap two
+/// mutable borrows; wndproc arms fetch it locally and drop it before any
+/// call that fetches it again (show/hide re-fetch internally).
+unsafe fn app_mut(hwnd: HWND) -> Option<&'static mut App> {
+    unsafe {
+        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
+        ptr.as_mut()
+    }
+}
+
+unsafe fn invalidate(hwnd: HWND) {
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+}
+
 unsafe extern "system" fn wndproc(
     hwnd: HWND,
     msg: u32,
@@ -102,7 +123,6 @@ unsafe extern "system" fn wndproc(
     unsafe {
         match msg {
             WM_HOTKEY if wparam.0 as i32 == HOTKEY_ID => {
-                crate::dlog!("WM_HOTKEY received");
                 toggle(hwnd);
                 LRESULT(0)
             }
@@ -110,23 +130,57 @@ unsafe extern "system" fn wndproc(
                 on_keydown(hwnd, VIRTUAL_KEY(wparam.0 as u16));
                 LRESULT(0)
             }
+            WM_CHAR => {
+                on_char(hwnd, wparam.0 as u16);
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == CARET_TIMER_ID => {
+                if let Some(app) = app_mut(hwnd) {
+                    app.caret_visible = !app.caret_visible;
+                }
+                invalidate(hwnd);
+                LRESULT(0)
+            }
+            WM_SIZE => {
+                if let Some(app) = app_mut(hwnd) {
+                    let w = (lparam.0 & 0xFFFF) as u32;
+                    let h = ((lparam.0 >> 16) & 0xFFFF) as u32;
+                    app.renderer.resize(w, h);
+                }
+                LRESULT(0)
+            }
+            WM_DPICHANGED => {
+                if let Some(app) = app_mut(hwnd) {
+                    app.renderer.update_dpi((wparam.0 & 0xFFFF) as f32);
+                }
+                LRESULT(0)
+            }
+            WM_PAINT => {
+                let mut ps = PAINTSTRUCT::default();
+                let _ = BeginPaint(hwnd, &mut ps);
+                if let Some(app) = app_mut(hwnd) {
+                    app.renderer.draw(
+                        hwnd,
+                        &app.query,
+                        app.caret_visible,
+                        &app.results,
+                        app.selected,
+                    );
+                }
+                let _ = EndPaint(hwnd, &ps);
+                LRESULT(0)
+            }
+            WM_ERASEBKGND => LRESULT(1),
             // Dismiss when the window loses focus (click elsewhere), Raycast-style.
             WM_ACTIVATE if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE => {
                 hide(hwnd);
                 LRESULT(0)
             }
-            WM_PAINT => {
-                let mut ps = PAINTSTRUCT::default();
-                let hdc = BeginPaint(hwnd, &mut ps);
-                // Placeholder dark fill until Direct2D rendering lands.
-                let brush = CreateSolidBrush(COLORREF(0x001E1E1E));
-                FillRect(hdc, &ps.rcPaint, brush);
-                let _ = DeleteObject(brush.into());
-                let _ = EndPaint(hwnd, &ps);
-                LRESULT(0)
-            }
-            WM_ERASEBKGND => LRESULT(1),
             WM_DESTROY => {
+                let ptr = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as *mut App;
+                if !ptr.is_null() {
+                    drop(Box::from_raw(ptr));
+                }
                 PostQuitMessage(0);
                 LRESULT(0)
             }
@@ -144,7 +198,44 @@ unsafe fn on_keydown(hwnd: HWND, key: VIRTUAL_KEY) {
             VK_Q if ctrl => {
                 let _ = DestroyWindow(hwnd);
             }
+            VK_DOWN => {
+                if let Some(app) = app_mut(hwnd) {
+                    app.move_selection(1);
+                }
+                invalidate(hwnd);
+            }
+            VK_UP => {
+                if let Some(app) = app_mut(hwnd) {
+                    app.move_selection(-1);
+                }
+                invalidate(hwnd);
+            }
+            VK_RETURN => {
+                let close = app_mut(hwnd).map(|a| a.activate_selected()).unwrap_or(false);
+                if close {
+                    hide(hwnd);
+                }
+            }
             _ => {}
+        }
+    }
+}
+
+unsafe fn on_char(hwnd: HWND, unit: u16) {
+    unsafe {
+        let changed = match unit {
+            0x08 => app_mut(hwnd).map(|a| a.backspace(false)).unwrap_or(false),
+            0x7F => app_mut(hwnd).map(|a| a.backspace(true)).unwrap_or(false),
+            u if u >= 0x20 => app_mut(hwnd).map(|a| a.insert_utf16(u)).unwrap_or(false),
+            _ => false,
+        };
+        if changed {
+            if let Some(app) = app_mut(hwnd) {
+                app.caret_visible = true;
+            }
+            SetTimer(Some(hwnd), CARET_TIMER_ID, CARET_BLINK_MS, None);
+            resize_to_content(hwnd);
+            invalidate(hwnd);
         }
     }
 }
@@ -159,9 +250,8 @@ unsafe fn toggle(hwnd: HWND) {
     }
 }
 
-/// Show centered (upper third) on the monitor containing the cursor,
-/// scaled to that monitor's DPI.
-unsafe fn show(hwnd: HWND) {
+/// DPI scale factor for the monitor under the cursor, plus its work area.
+unsafe fn cursor_monitor_metrics() -> (f32, RECT) {
     unsafe {
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
@@ -176,23 +266,68 @@ unsafe fn show(hwnd: HWND) {
         let mut dpi_x = 96u32;
         let mut dpi_y = 96u32;
         let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
-        let scale = dpi_x as f32 / 96.0;
+        (dpi_x as f32 / 96.0, mi.rcWork)
+    }
+}
 
-        let w = (WINDOW_WIDTH as f32 * scale) as i32;
-        let h = (WINDOW_HEIGHT as f32 * scale) as i32;
-        let work = mi.rcWork;
+/// Show centered (upper third) on the monitor containing the cursor,
+/// scaled to that monitor's DPI.
+unsafe fn show(hwnd: HWND) {
+    unsafe {
+        let (scale, work) = cursor_monitor_metrics();
+
+        let content_h = app_mut(hwnd)
+            .map(|a| a.content_height())
+            .unwrap_or(render::INPUT_H);
+        let w = (render::WINDOW_WIDTH * scale) as i32;
+        let h = (content_h * scale) as i32;
         let x = work.left + (work.right - work.left - w) / 2;
-        let y = work.top + (work.bottom - work.top - h) / 3;
+        let y = work.top + (work.bottom - work.top) / 5;
 
         crate::dlog!("show: x={x} y={y} w={w} h={h} scale={scale}");
         let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_SHOWWINDOW);
         let _ = SetForegroundWindow(hwnd);
         let _ = SetFocus(Some(hwnd));
+
+        if let Some(app) = app_mut(hwnd) {
+            app.caret_visible = true;
+        }
+        SetTimer(Some(hwnd), CARET_TIMER_ID, CARET_BLINK_MS, None);
+        invalidate(hwnd);
+    }
+}
+
+/// Grow/shrink the window height to fit the current results.
+unsafe fn resize_to_content(hwnd: HWND) {
+    unsafe {
+        let Some(app) = app_mut(hwnd) else { return };
+        let content_h = app.content_height();
+        let dpi = GetDpiForWindow(hwnd) as f32;
+        let h = (content_h * dpi / 96.0) as i32;
+
+        let mut rc = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut rc);
+        if rc.bottom - rc.top != h {
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                rc.right - rc.left,
+                h,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
     }
 }
 
 unsafe fn hide(hwnd: HWND) {
     unsafe {
+        let _ = KillTimer(Some(hwnd), CARET_TIMER_ID);
         let _ = ShowWindow(hwnd, SW_HIDE);
+        // Fresh query next time the launcher opens.
+        if let Some(app) = app_mut(hwnd) {
+            app.clear_query();
+        }
     }
 }
