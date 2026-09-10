@@ -12,9 +12,10 @@ Ultra-fast, ultra-lightweight launcher for Windows. Raycast, but native.
 
 ## Status
 
-`v0.1.0`, pre-release. Working today: global hotkey, fuzzy app search with
-icons (desktop + Store apps), frecency ranking, quicklinks, aliases, and an
-actions panel. See [ROADMAP.md](ROADMAP.md) for what's shipped and what's next.
+`v0.2.0`, pre-release. Working today: global hotkey, fuzzy app search with
+icons (desktop + Store apps), frecency ranking, quicklinks, apex commands, a
+tray icon, aliases, and an actions panel. See [ROADMAP.md](ROADMAP.md) for
+what's shipped and what's next.
 
 ## Install
 
@@ -23,6 +24,11 @@ cargo install apex-launcher
 ```
 
 The crate is `apex-launcher` because `apex` was taken; the binary is `apex`.
+For the latest commit rather than the last release:
+
+```powershell
+cargo install --git https://github.com/shivajreddy/apex
+```
 
 ### From source
 
@@ -100,11 +106,24 @@ open_with = 'chrome'        # optional; defaults to the system handler
 Prefer `'single quotes'`: they keep Windows paths like `C:\tools\x.exe`
 literal, with no escaping.
 
-### Reload
+### Apex commands
 
-Type `reload` to re-read everything from disk - newly installed applications,
-and hand-edits to `config.toml` such as new quicklinks or aliases - without
-restarting. `[general]` and `[hotkey]` still need a restart.
+Type `apex` to list them all; each is also reachable by its own word, and by
+hidden synonyms (`startup` finds Toggle Start at Login, `exit` finds Quit).
+
+| Command | |
+|---|---|
+| `Apex: Reload` | re-read apps, quicklinks, aliases and config from disk |
+| `Apex: Restart` | relaunch, the only way to apply `[hotkey]` / `[general]` |
+| `Apex: Quit` | exit |
+| `Apex: Open Config` | open `config.toml` in your editor |
+| `Apex: Open Config Folder` | reveal `%APPDATA%\apex` |
+| `Apex: Toggle Tray Icon` | show/hide the tray icon, and remember the choice |
+| `Apex: Toggle Start at Login` | flip `start_on_startup` and apply it now |
+| `Apex: Clear Launch History` | reset frecency ranking |
+
+Reload picks up hand-edits to `config.toml`, so editing it in your dotfiles
+and reloading is enough. `[general]` and `[hotkey]` still need a restart.
 
 ## Configuration
 
@@ -115,6 +134,7 @@ run. Symlink it into your dotfiles if that's how you roll.
 [general]
 start_menu = true        # Start menu entry, refreshed each launch
 start_on_startup = true  # run Apex at sign-in (HKCU Run key)
+tray_icon = true         # tray icon: Open / Reload / Open Config / Quit
 
 [hotkey]
 modifiers = "ctrl"       # ctrl, alt, shift, win, joined with '+'; or "none"

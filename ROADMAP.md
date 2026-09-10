@@ -6,8 +6,9 @@
 
 Where Apex is, how it got here, and where it's going.
 
-**Status:** `v0.1.0` — pre-release, in active development.
-**Working today:** global hotkey, app search with icons, launch, aliases.
+**Status:** `v0.2.0` — pre-release, in active development.
+**Working today:** global hotkey, app search with icons, frecency ranking,
+quicklinks, apex commands, tray icon, aliases.
 
 ---
 
@@ -33,11 +34,15 @@ feature loses.
 
 | | |
 |---|---|
-| Binary size | 172 KB |
-| Memory, idle before first use | ~1.6 MB private |
-| Memory, after use | ~11 MB private |
-| App index | 133 apps in ~1.0 s (background thread) |
-| Tests | 16 unit tests + scripted UI/e2e checks |
+| Binary size | 530 KB |
+| Memory, idle | ~11.8 MB private |
+| App index | ~150 apps in ~1 s (background thread) |
+| Tests | 57 unit tests |
+
+Idle memory is what it is because icon extraction runs during the startup
+scan, loading the Windows imaging DLLs immediately and never unloading them.
+There is no cheaper "before first use" state to report: the helper-process
+icon cache below is the fix.
 
 ### Shipped
 
@@ -69,60 +74,100 @@ feature loses.
 - Real app icons via `IShellItemImageFactory`, extracted once at index time
 - Launch through `shell:AppsFolder\<AppUserModelID>`
 
+**Frecency**
+- One decaying weight per entry, 14-day half-life: a single number captures
+  both how often and how recently something was picked
+- Bonus saturates, so heavy use can outrank a slightly better match but never
+  beats an exact alias
+- Owned by the shell and keyed on `(plugin, payload)`, so every plugin
+  inherits ranking without implementing it
+- Empty query lists the most-used entries, padded from each plugin's own
+  catalogue
+- Machine-local, in `%LOCALAPPDATA%\apex\frecency.tsv`
+
+**Quicklinks plugin**
+- Links, folders and programs opened by name, as `[quicklinks.<slug>]`
+  sub-tables in the config
+- A `{token}` in the link takes an argument, prompting by the token's name and
+  percent-encoding only for URLs
+- Created and edited in-app through a multi-field form; slugs survive renames
+  so launch history isn't orphaned
+- Optional `open_with` to route through a specific program
+
+**Commands plugin**
+- `Apex: ` namespace — Reload, Restart, Quit, Open Config, Open Config Folder,
+  Toggle Tray Icon, Toggle Start at Login, Clear Launch History
+- Hidden keywords, so `startup` finds "Toggle Start at Login" and `exit` finds
+  "Quit"
+- Excluded from launch history and the default list
+
 **Actions & aliases**
 - `Ctrl+K` actions panel on the selected result
 - `Set Alias…` / `Remove Alias`, persisted to `[aliases]` in config
-- Exact alias match jumps the app to the top with a badge
+- Exact alias match jumps the app to the top, shown as a pill beside the name
+- `Open in Explorer` reveals where an entry came from
 
 **Config & integration**
 - `%APPDATA%\apex\config.toml`, auto-created with commented defaults
-- Dependency-free TOML-subset parser
-- `[general]` Start menu entry and run-at-login, both self-healing and
-  cleanly removed when disabled
+- Dependency-free TOML-subset parser, both quote styles
+- Writes are line surgery on `[aliases]`, `[quicklinks.*]` and single
+  `[general]` keys; every other line and comment is preserved byte-for-byte
+- `[general]` Start menu entry, run-at-login and tray icon, all self-healing
+  and cleanly removed when disabled
 - `[hotkey]` custom chord, `[plugins]` per-plugin toggles
+- Tray icon with Open / Reload / Open Config / Quit
+- Clipboard paste in the query, prompts and forms
 - Embedded app icon and version metadata
 
 ### Version history
 
 | Version | Contents |
 |---|---|
-| `v0.1.0` (current) | Everything above. First usable launcher. |
+| `v0.2.0` (current) | Frecency ranking, quicklinks, apex commands, tray icon, clipboard paste, alias pills, icon fallback. |
+| `v0.1.0` | Global hotkey, app search with icons, launch, aliases, actions panel. First usable launcher. |
 
 ---
 
 ## Roadmap
 
-### v0.2 — "Feels finished"
+### v0.2 — "Feels finished" (shipped, partly)
 
 Polish the launcher until it's the fastest path to any app.
 
-- [ ] **Frecency ranking** — recently and frequently launched apps rank
+- [x] **Frecency ranking** — recently and frequently launched apps rank
       first. The single biggest perceived-quality win.
-- [ ] **Tray icon** with Settings / Restart / Quit (retires the `Ctrl+Q`
-      dev shortcut)
+- [x] **Tray icon** with Open / Reload / Open Config / Quit
+- [x] **Live index refresh** — via `Apex: Reload`. Still manual; watching for
+      installs and removals is the remaining half.
+- [~] **Text editing** in the query — clipboard paste and word delete are in;
+      caret movement and selection are not.
 - [ ] **Icon cache on disk** — skip re-extraction at every start, and move
       extraction into a helper process so the shell imaging DLLs stay out
-      of the resident set (targets ~2 MB idle again)
-- [ ] **Text editing** in the query: caret movement, word delete, selection
+      of the resident set (the ~11.8 MB idle figure above is entirely this)
 - [ ] **Mouse support** — hover to highlight, click to launch
+- [ ] **Blur / acrylic backdrop** — needs per-pixel alpha, which the current
+      `ID2D1HwndRenderTarget` cannot do; a layered window driven by
+      `UpdateLayeredWindow` is the likely route
 - [ ] **Fade/scale animation** on summon
-- [ ] **Live index refresh** when apps are installed or removed
 - [ ] **`run_as_admin` setting** — elevated logon task, so the hotkey works
       over Task Manager and other elevated windows
 
 ### v0.3 — "More than apps"
 
-Additional plugins, all **off by default**. Enabling one is a deliberate
-line in the config; disabled ones cost nothing.
+Additional plugins. Disabled ones are never constructed and cost nothing.
 
+- [x] ~~**Plugin: Web search**~~ — absorbed by quicklinks: a `{query}` token
+      *is* a web search
+- [x] ~~**Plugin: Folder jump**~~ — absorbed by quicklinks: a link can be a
+      directory
 - [ ] **Plugin: Window switcher** — jump to any open window
 - [ ] **Plugin: System commands** — lock, sleep, restart, empty recycle bin
-- [ ] **Plugin: Web search** — hand the query to a search engine
-- [ ] **Plugin: Folder jump** — open frequently used directories
+      (distinct from the `Apex:` commands, which act on apex itself)
 - [ ] **Prefix routing** — a leading token selects a plugin, so plugins
       don't all pay the cost of every keystroke
-- [ ] **More actions** — Run as administrator, Open file location, Copy
-      path, Pin to top
+- [ ] **Quicklink aliases** — aliases are app-only today
+- [ ] **More actions** — Run as administrator, Copy path, Pin to top
+      (Open file location shipped as *Open in Explorer*)
 
 ### v0.4 — "Extensible"
 
@@ -152,11 +197,16 @@ line in the config; disabled ones cost nothing.
   through to the shell and Apex can't take focus. Running Apex elevated
   avoids it; `run_as_admin` (v0.2) and a signed `uiAccess` build (v1.0)
   are the real fixes.
-- **Idle memory after first use** sits around 11 MB because icon
-  extraction loads Windows imaging DLLs that are never unloaded. The v0.2
-  helper-process icon cache addresses this.
+- **Idle memory** sits around 11.8 MB because icon extraction loads Windows
+  imaging DLLs that are never unloaded. The helper-process icon cache
+  addresses this.
 - **Aliases** are bare TOML keys, so they're normalized to lowercase
   `a-z 0-9 - _ .` (spaces become `-`).
+- **Aliases don't travel between machines.** Desktop apps get an
+  AppUserModelID of the form `Microsoft.AutoGenerated.{GUID}`, generated per
+  machine, so a shared config file resolves them on one box and not the
+  other. Quicklinks have no such problem. Per-machine config files are the
+  workaround today.
 
 ## Non-goals
 
