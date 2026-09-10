@@ -371,7 +371,7 @@ unsafe fn show(hwnd: HWND) {
 
         crate::dlog!("show: x={x} y={y} w={w} h={h} scale={scale}");
         let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_SHOWWINDOW);
-        let _ = SetForegroundWindow(hwnd);
+        force_foreground(hwnd);
         let _ = SetFocus(Some(hwnd));
 
         if let Some(app) = app_mut(hwnd) {
@@ -404,6 +404,44 @@ unsafe fn resize_to_content(hwnd: HWND) {
                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
+    }
+}
+
+/// Bring the window to the foreground reliably.
+///
+/// A background process may not steal foreground (SetForegroundWindow is
+/// blocked unless the process received the last input), and the keyboard
+/// hook posts to us from outside any input grant. Ladder:
+/// 1. plain SetForegroundWindow
+/// 2. AttachThreadInput to the current foreground thread, then retry
+/// 3. synthetic no-op Alt tap to earn the input grant, then retry
+unsafe fn force_foreground(hwnd: HWND) {
+    unsafe {
+        if SetForegroundWindow(hwnd).as_bool() && GetForegroundWindow() == hwnd {
+            return;
+        }
+
+        use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+        let fg = GetForegroundWindow();
+        let our_tid = GetCurrentThreadId();
+        if !fg.is_invalid() {
+            let fg_tid = GetWindowThreadProcessId(fg, None);
+            if fg_tid != 0 && fg_tid != our_tid {
+                let _ = AttachThreadInput(our_tid, fg_tid, true);
+                let _ = BringWindowToTop(hwnd);
+                let _ = SetForegroundWindow(hwnd);
+                let _ = AttachThreadInput(our_tid, fg_tid, false);
+                if GetForegroundWindow() == hwnd {
+                    return;
+                }
+            }
+        }
+
+        // Last resort: an Alt tap updates the last-input state to us,
+        // releasing the foreground lock for the next call.
+        keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_EXTENDEDKEY, 0);
+        keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0);
+        let _ = SetForegroundWindow(hwnd);
     }
 }
 

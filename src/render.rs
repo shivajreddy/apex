@@ -273,10 +273,11 @@ impl Renderer {
                 }
             }
 
-            let recreate = matches!(
-                rt.EndDraw(None, None),
-                Err(e) if e.code() == D2DERR_RECREATE_TARGET
-            );
+            let end = rt.EndDraw(None, None);
+            if let Err(e) = &end {
+                crate::dlog!("draw: EndDraw failed: {e}");
+            }
+            let recreate = matches!(end, Err(e) if e.code() == D2DERR_RECREATE_TARGET);
             if recreate {
                 self.target = None;
             }
