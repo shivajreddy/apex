@@ -26,16 +26,27 @@ use crate::render;
 
 const CARET_TIMER_ID: usize = 1;
 const CARET_BLINK_MS: u32 = 530;
+const HOTKEY_ID: i32 = 1;
 
 /// Posted by the keyboard hook when the hotkey combo fires.
 const WM_APP_TOGGLE: u32 = WM_APP + 1;
+/// Posted by either hook when the user interacts outside the window.
+const WM_APP_DISMISS: u32 = WM_APP + 2;
 
-// Hook state (the hook proc is a free function, so this lives in statics).
+// Hook state (the hook procs are free functions, so this lives in statics).
 static HOOK_HWND: AtomicIsize = AtomicIsize::new(0);
 static HOOK_MODS: AtomicU32 = AtomicU32::new(0);
 static HOOK_VK: AtomicU32 = AtomicU32::new(0);
 /// Suppresses autorepeat while the hotkey chord is held.
 static HOOK_HELD: AtomicBool = AtomicBool::new(false);
+/// Window is currently shown.
+static VISIBLE: AtomicBool = AtomicBool::new(false);
+/// Window is the active (foreground) window. Can be false while VISIBLE if
+/// activation was denied (e.g. shown over an elevated window, where UIPI
+/// blocks every foreground trick) - dismissal then falls to the hooks.
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Mouse hook handle; installed only while the window is visible.
+static MOUSE_HOOK: AtomicIsize = AtomicIsize::new(0);
 
 pub fn run(config: &crate::config::Config) -> Result<()> {
     unsafe {
@@ -123,7 +134,16 @@ pub fn run(config: &crate::config::Config) -> Result<()> {
         HOOK_MODS.store(config.hotkey_mods, Relaxed);
         HOOK_VK.store(config.hotkey_vk, Relaxed);
         let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), None, 0)?;
-        crate::dlog!("keyboard hook installed, entering message loop");
+
+        // Belt-and-suspenders: UIPI skips our hook while an elevated window
+        // (e.g. Task Manager) has focus, but registered hotkeys still fire.
+        // In the normal case the hook swallows the chord before hotkey
+        // matching runs, so both never fire together. Non-fatal if taken.
+        let mods = HOT_KEY_MODIFIERS(config.hotkey_mods) | MOD_NOREPEAT;
+        if RegisterHotKey(Some(hwnd), HOTKEY_ID, mods, config.hotkey_vk).is_err() {
+            crate::dlog!("RegisterHotKey fallback unavailable (combo in use elsewhere)");
+        }
+        crate::dlog!("hooks installed, entering message loop");
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -131,9 +151,31 @@ pub fn run(config: &crate::config::Config) -> Result<()> {
             DispatchMessageW(&msg);
         }
 
+        let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
         let _ = UnhookWindowsHookEx(hook);
+        let mouse = MOUSE_HOOK.swap(0, Relaxed);
+        if mouse != 0 {
+            let _ = UnhookWindowsHookEx(HHOOK(mouse as *mut core::ffi::c_void));
+        }
         Ok(())
     }
+}
+
+fn is_modifier_vk(vk: u32) -> bool {
+    matches!(
+        VIRTUAL_KEY(vk as u16),
+        VK_CONTROL
+            | VK_LCONTROL
+            | VK_RCONTROL
+            | VK_SHIFT
+            | VK_LSHIFT
+            | VK_RSHIFT
+            | VK_MENU
+            | VK_LMENU
+            | VK_RMENU
+            | VK_LWIN
+            | VK_RWIN
+    )
 }
 
 /// Exact-match the chord: every configured modifier down, every other
@@ -152,27 +194,62 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
     unsafe {
         if code == HC_ACTION as i32 {
             let info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+            let msg = wparam.0 as u32;
+            let is_down = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN);
+            let hwnd = HWND(HOOK_HWND.load(Relaxed) as *mut core::ffi::c_void);
+
             if info.vkCode == HOOK_VK.load(Relaxed) {
-                match wparam.0 as u32 {
-                    WM_KEYDOWN | WM_SYSKEYDOWN => {
-                        if chord_matches(HOOK_MODS.load(Relaxed)) {
-                            if !HOOK_HELD.swap(true, Relaxed) {
-                                let hwnd = HWND(HOOK_HWND.load(Relaxed) as *mut core::ffi::c_void);
-                                let _ = PostMessageW(
-                                    Some(hwnd),
-                                    WM_APP_TOGGLE,
-                                    WPARAM(0),
-                                    LPARAM(0),
-                                );
-                            }
-                            // Swallow so the shell never sees the combo
-                            // (e.g. Ctrl+Esc won't open the Start menu).
-                            return LRESULT(1);
+                if is_down {
+                    if chord_matches(HOOK_MODS.load(Relaxed)) {
+                        if !HOOK_HELD.swap(true, Relaxed) {
+                            let _ = PostMessageW(Some(hwnd), WM_APP_TOGGLE, WPARAM(0), LPARAM(0));
+                        }
+                        // Swallow so the shell never sees the combo
+                        // (e.g. Ctrl+Esc won't open the Start menu).
+                        return LRESULT(1);
+                    }
+                } else {
+                    HOOK_HELD.store(false, Relaxed);
+                }
+            }
+
+            // Typing that lands elsewhere while we're shown-but-inactive
+            // (activation denied over an elevated window) means the user is
+            // interacting outside Apex: dismiss. Modifier keys are ignored
+            // so the toggle chord itself doesn't dismiss-then-retoggle.
+            if is_down
+                && VISIBLE.load(Relaxed)
+                && !ACTIVE.load(Relaxed)
+                && !is_modifier_vk(info.vkCode)
+            {
+                let _ = PostMessageW(Some(hwnd), WM_APP_DISMISS, WPARAM(0), LPARAM(0));
+            }
+        }
+        CallNextHookEx(None, code, wparam, lparam)
+    }
+}
+
+/// Installed only while the window is visible: any click outside the window
+/// rect dismisses, independent of Win32 activation (which we may never get
+/// when shown over an elevated window).
+unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe {
+        if code == HC_ACTION as i32 {
+            match wparam.0 as u32 {
+                WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN => {
+                    let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+                    let hwnd = HWND(HOOK_HWND.load(Relaxed) as *mut core::ffi::c_void);
+                    let mut rc = RECT::default();
+                    if GetWindowRect(hwnd, &mut rc).is_ok() {
+                        let p = info.pt;
+                        let outside =
+                            p.x < rc.left || p.x >= rc.right || p.y < rc.top || p.y >= rc.bottom;
+                        if outside {
+                            let _ = PostMessageW(Some(hwnd), WM_APP_DISMISS, WPARAM(0), LPARAM(0));
                         }
                     }
-                    WM_KEYUP | WM_SYSKEYUP => HOOK_HELD.store(false, Relaxed),
-                    _ => {}
                 }
+                _ => {}
             }
         }
         CallNextHookEx(None, code, wparam, lparam)
@@ -205,6 +282,19 @@ unsafe extern "system" fn wndproc(
         match msg {
             WM_APP_TOGGLE => {
                 toggle(hwnd);
+                LRESULT(0)
+            }
+            WM_HOTKEY if wparam.0 as i32 == HOTKEY_ID => {
+                // Fallback path: fires when UIPI bypassed the keyboard hook
+                // (elevated window had focus); the hook swallows the chord
+                // otherwise, so this can't double-fire.
+                toggle(hwnd);
+                LRESULT(0)
+            }
+            WM_APP_DISMISS => {
+                if IsWindowVisible(hwnd).as_bool() {
+                    hide(hwnd);
+                }
                 LRESULT(0)
             }
             WM_KEYDOWN => {
@@ -257,8 +347,13 @@ unsafe extern "system" fn wndproc(
             }
             WM_ERASEBKGND => LRESULT(1),
             // Dismiss when the window loses focus (click elsewhere), Raycast-style.
-            WM_ACTIVATE if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE => {
-                hide(hwnd);
+            WM_ACTIVATE => {
+                if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
+                    ACTIVE.store(false, Relaxed);
+                    hide(hwnd);
+                } else {
+                    ACTIVE.store(true, Relaxed);
+                }
                 LRESULT(0)
             }
             WM_DESTROY => {
@@ -371,8 +466,17 @@ unsafe fn show(hwnd: HWND) {
 
         crate::dlog!("show: x={x} y={y} w={w} h={h} scale={scale}");
         let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_SHOWWINDOW);
+        VISIBLE.store(true, Relaxed);
         force_foreground(hwnd);
         let _ = SetFocus(Some(hwnd));
+        ACTIVE.store(GetForegroundWindow() == hwnd, Relaxed);
+
+        // Outside-click dismissal, active only while shown.
+        if MOUSE_HOOK.load(Relaxed) == 0 {
+            if let Ok(h) = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), None, 0) {
+                MOUSE_HOOK.store(h.0 as isize, Relaxed);
+            }
+        }
 
         if let Some(app) = app_mut(hwnd) {
             app.caret_visible = true;
@@ -447,6 +551,12 @@ unsafe fn force_foreground(hwnd: HWND) {
 
 unsafe fn hide(hwnd: HWND) {
     unsafe {
+        VISIBLE.store(false, Relaxed);
+        ACTIVE.store(false, Relaxed);
+        let mouse = MOUSE_HOOK.swap(0, Relaxed);
+        if mouse != 0 {
+            let _ = UnhookWindowsHookEx(HHOOK(mouse as *mut core::ffi::c_void));
+        }
         let _ = KillTimer(Some(hwnd), CARET_TIMER_ID);
         let _ = ShowWindow(hwnd, SW_HIDE);
         if let Some(app) = app_mut(hwnd) {
