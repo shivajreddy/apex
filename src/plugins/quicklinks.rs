@@ -81,6 +81,7 @@ impl Entry {
         ResultItem {
             plugin: ID,
             title: self.name.clone(),
+            badge: None,
             subtitle: "Quicklink".to_string(),
             payload: self.slug.clone(),
             score,
@@ -165,6 +166,7 @@ impl Quicklinks {
         ResultItem {
             plugin: ID,
             title: CREATE_LABEL.to_string(),
+            badge: None,
             subtitle: "Quicklink".to_string(),
             payload: CREATE_PAYLOAD.to_string(),
             score,

@@ -19,6 +19,10 @@ pub struct ResultItem {
     /// Id of the plugin that produced this item.
     pub plugin: &'static str,
     pub title: String,
+    /// Short label drawn as a pill immediately after the title, e.g. the
+    /// alias that reaches this item. Kept separate from `subtitle` so it can
+    /// sit next to the name rather than in the right-hand type column.
+    pub badge: Option<String>,
     pub subtitle: String,
     /// Plugin-specific payload (e.g. path of the shortcut to launch).
     pub payload: String,

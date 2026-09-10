@@ -25,6 +25,10 @@ const SEL_MARGIN: f32 = 8.0;
 const ICON_SIZE: f32 = 26.0;
 const ICON_GAP: f32 = 12.0;
 const BAR_H: f32 = 34.0;
+// Alias pill drawn immediately after a result's title.
+const BADGE_H: f32 = 19.0;
+const BADGE_PAD_X: f32 = 7.0;
+const BADGE_GAP: f32 = 9.0;
 const PANEL_W: f32 = 300.0;
 const PANEL_ROW: f32 = 32.0;
 const PANEL_PAD: f32 = 6.0;
@@ -100,6 +104,8 @@ const COL_DIM: D2D1_COLOR_F = rgba(0xF2F2F2, 0.35);
 const COL_FAINT: D2D1_COLOR_F = rgba(0xFFFFFF, 0.07);
 const COL_SELECT: D2D1_COLOR_F = rgba(0xFFFFFF, 0.08);
 const COL_PANEL: D2D1_COLOR_F = rgba(0x2A2A2E, 1.0);
+const COL_BADGE_BG: D2D1_COLOR_F = rgba(0xFFFFFF, 0.11);
+const COL_BADGE_FG: D2D1_COLOR_F = rgba(0xF2F2F2, 0.60);
 
 pub struct Renderer {
     dwrite: IDWriteFactory,
@@ -109,6 +115,7 @@ pub struct Renderer {
     fmt_subtitle: IDWriteTextFormat,
     fmt_subtitle_left: IDWriteTextFormat,
     fmt_panel: IDWriteTextFormat,
+    fmt_badge: IDWriteTextFormat,
     target: Option<Target>,
 }
 
@@ -120,6 +127,8 @@ struct Target {
     faint: ID2D1SolidColorBrush,
     select: ID2D1SolidColorBrush,
     panel: ID2D1SolidColorBrush,
+    badge_bg: ID2D1SolidColorBrush,
+    badge_fg: ID2D1SolidColorBrush,
     /// D2D copies of plugin icons, keyed by the Arc's data address.
     /// Dropped with the target (i.e. every hide), so it stays small.
     icons: HashMap<usize, ID2D1Bitmap>,
@@ -154,6 +163,10 @@ impl Renderer {
             fmt_subtitle_left.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
             let fmt_panel = make(14.0, DWRITE_FONT_WEIGHT_NORMAL)?;
             fmt_panel.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            // Centred both ways so the text sits in the middle of the pill.
+            let fmt_badge = make(11.5, DWRITE_FONT_WEIGHT_NORMAL)?;
+            fmt_badge.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            fmt_badge.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
 
             Ok(Self {
                 d2d,
@@ -163,6 +176,7 @@ impl Renderer {
                 fmt_subtitle,
                 fmt_subtitle_left,
                 fmt_panel,
+                fmt_badge,
                 target: None,
             })
         }
@@ -211,6 +225,8 @@ impl Renderer {
                 faint: brush(&COL_FAINT)?,
                 select: brush(&COL_SELECT)?,
                 panel: brush(&COL_PANEL)?,
+                badge_bg: brush(&COL_BADGE_BG)?,
+                badge_fg: brush(&COL_BADGE_FG)?,
                 icons: HashMap::new(),
                 rt,
             });
@@ -286,6 +302,19 @@ impl Renderer {
                     .map(|f| self.measure(&self.fmt_panel, &f.value)),
                 _ => None,
             };
+            // Badge geometry per row: (title width, badge text width). Rows
+            // without a badge measure nothing.
+            let badges: Vec<Option<(f32, f32)>> = results
+                .iter()
+                .map(|item| {
+                    item.badge.as_ref().map(|b| {
+                        (
+                            self.measure(&self.fmt_title, &item.title),
+                            self.measure(&self.fmt_badge, b),
+                        )
+                    })
+                })
+                .collect();
             let hint = match panel {
                 Some(PanelView::Form { .. }) => "Save \u{21b5}      Field Tab",
                 Some(PanelView::TextInput { .. }) => "Confirm \u{21b5}",
@@ -381,6 +410,29 @@ impl Renderer {
                         bottom: y + ROW_H,
                     };
                     draw_text(rt, &item.title, &self.fmt_title, &title_rect, &t.text);
+
+                    // Alias pill, immediately after the title.
+                    if let Some(badge) = &item.badge
+                        && let Some((title_w, badge_w)) = badges[i]
+                    {
+                        let left = title_rect.left + title_w + BADGE_GAP;
+                        let pill = D2D_RECT_F {
+                            left,
+                            top: y + (ROW_H - BADGE_H) / 2.0,
+                            right: left + badge_w + BADGE_PAD_X * 2.0,
+                            bottom: y + (ROW_H + BADGE_H) / 2.0,
+                        };
+                        rt.FillRoundedRectangle(
+                            &D2D1_ROUNDED_RECT {
+                                rect: pill,
+                                radiusX: 5.0,
+                                radiusY: 5.0,
+                            },
+                            &t.badge_bg,
+                        );
+                        draw_text(rt, badge, &self.fmt_badge, &pill, &t.badge_fg);
+                    }
+
                     if !item.subtitle.is_empty() {
                         let row = D2D_RECT_F {
                             left: PAD_X,

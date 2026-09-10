@@ -67,6 +67,7 @@ impl Plugin for Commands {
                 out.push(ResultItem {
                     plugin: ID,
                     title: c.label.to_string(),
+                    badge: None,
                     subtitle: "Command".to_string(),
                     payload: c.id.to_string(),
                     score,
@@ -133,6 +134,7 @@ mod tests {
         let item = ResultItem {
             plugin: ID,
             title: "Reload Apex".into(),
+            badge: None,
             subtitle: "Command".into(),
             payload: "reload".into(),
             score: 0,
