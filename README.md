@@ -21,5 +21,9 @@ cargo build --release
 
 ## Usage
 
-- `Alt+Space` — toggle the launcher
+- `Ctrl+Esc` — toggle the launcher
 - `Esc` — dismiss
+- `↑/↓` — move selection, `Enter` — launch
+
+Note: `Ctrl+Esc` normally opens the Start menu; apex takes it over while
+running (the Win key still opens Start).

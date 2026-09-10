@@ -98,11 +98,13 @@ pub fn run() -> Result<()> {
         let app = Box::new(App::new(crate::plugins()));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
 
+        // Ctrl+Esc. RegisterHotKey claims it before the shell's legacy
+        // Start-menu handling sees it (Win key still opens Start).
         RegisterHotKey(
             Some(hwnd),
             HOTKEY_ID,
-            MOD_ALT | MOD_NOREPEAT,
-            VK_SPACE.0 as u32,
+            MOD_CONTROL | MOD_NOREPEAT,
+            VK_ESCAPE.0 as u32,
         )?;
         crate::dlog!("hotkey registered, entering message loop");
 
