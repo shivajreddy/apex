@@ -3,8 +3,8 @@ fn main() {
     if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
         let mut res = winresource::WindowsResource::new();
         res.set_icon("assets/apex.ico");
-        res.set("ProductName", "apex");
-        res.set("FileDescription", "apex - ultra-fast launcher");
+        res.set("ProductName", "Apex");
+        res.set("FileDescription", "Apex - ultra-fast launcher");
         res.compile().expect("failed to embed Windows resources");
     }
 }

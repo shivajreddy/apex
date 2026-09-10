@@ -20,7 +20,7 @@ use windows::core::{Interface, PCWSTR, w};
 use crate::config::Config;
 
 const RUN_KEY: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
-const RUN_VALUE: PCWSTR = w!("apex");
+const RUN_VALUE: PCWSTR = w!("Apex");
 
 pub fn ensure(config: &Config) {
     let Ok(exe) = std::env::current_exe() else {
@@ -32,13 +32,15 @@ pub fn ensure(config: &Config) {
 
 fn start_menu_lnk() -> Option<PathBuf> {
     let appdata = std::env::var_os("APPDATA")?;
-    Some(PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs\apex.lnk"))
+    Some(PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs\Apex.lnk"))
 }
 
 fn ensure_start_menu(enabled: bool, exe: &Path) {
     let Some(lnk) = start_menu_lnk() else { return };
     if enabled {
-        // Rewrite unconditionally: self-heals if the exe moved.
+        // Delete-then-write: the filesystem is case-insensitive, so this also
+        // migrates an old "apex.lnk" to the properly-cased "Apex.lnk".
+        let _ = std::fs::remove_file(&lnk);
         if let Err(e) = write_shortcut(&lnk, exe) {
             crate::dlog!("setup: start menu shortcut failed: {e}");
         }
@@ -52,7 +54,7 @@ fn write_shortcut(lnk: &Path, exe: &Path) -> windows::core::Result<()> {
         let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
         let exe_w = wide(exe.as_os_str());
         link.SetPath(PCWSTR(exe_w.as_ptr()))?;
-        link.SetDescription(w!("apex - ultra-fast launcher"))?;
+        link.SetDescription(w!("Apex - ultra-fast launcher"))?;
         let persist: IPersistFile = link.cast()?;
         let lnk_w = wide(lnk.as_os_str());
         persist.Save(PCWSTR(lnk_w.as_ptr()), true)?;
@@ -63,6 +65,9 @@ fn write_shortcut(lnk: &Path, exe: &Path) -> windows::core::Result<()> {
 fn ensure_run_at_login(enabled: bool, exe: &Path) {
     unsafe {
         if enabled {
+            // Registry value names are case-insensitive; delete-then-set
+            // migrates an old lowercase "apex" value to "Apex".
+            let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE);
             let exe_w = wide(exe.as_os_str());
             let status = RegSetKeyValueW(
                 HKEY_CURRENT_USER,

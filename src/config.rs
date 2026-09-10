@@ -12,7 +12,7 @@ use std::path::PathBuf;
 pub const DEFAULT_HOTKEY_MODS: u32 = 0x0002;
 pub const DEFAULT_HOTKEY_VK: u32 = 0x1B;
 
-const DEFAULT_FILE: &str = r#"# apex configuration
+const DEFAULT_FILE: &str = r#"# Apex configuration
 # Changes take effect on restart.
 
 [general]

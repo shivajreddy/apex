@@ -7,7 +7,7 @@
 macro_rules! dlog {
     ($($arg:tt)*) => {{
         #[cfg(debug_assertions)]
-        eprintln!("[apex] {}", format!($($arg)*));
+        eprintln!("[Apex] {}", format!($($arg)*));
         #[cfg(not(debug_assertions))]
         {
             let _ = format_args!($($arg)*);
@@ -37,7 +37,7 @@ fn plugins(config: &config::Config) -> Vec<Box<dyn plugin::Plugin>> {
 fn main() {
     let config = config::Config::load();
     if let Err(err) = window::run(&config) {
-        fatal(&format!("apex failed to start:\n{err}"));
+        fatal(&format!("Apex failed to start:\n{err}"));
     }
 }
 
@@ -45,6 +45,6 @@ fn fatal(msg: &str) {
     use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
     use windows::core::{HSTRING, w};
     unsafe {
-        MessageBoxW(None, &HSTRING::from(msg), w!("apex"), MB_OK | MB_ICONERROR);
+        MessageBoxW(None, &HSTRING::from(msg), w!("Apex"), MB_OK | MB_ICONERROR);
     }
 }

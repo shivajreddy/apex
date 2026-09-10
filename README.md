@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="assets/logo.png" width="128" alt="apex logo">
+  <img src="assets/logo.png" width="128" alt="Apex logo">
 </p>
 
-# apex
+# Apex
 
 Ultra-fast, ultra-lightweight launcher for Windows. Raycast, but native.
 
@@ -25,8 +25,9 @@ cargo build --release
 - `Esc` — dismiss
 - `↑/↓` — move selection, `Enter` — launch
 
-Note: `Ctrl+Esc` normally opens the Start menu; apex takes it over while
-running (the Win key still opens Start).
+Note: `Ctrl+Esc` normally opens the Start menu. Apex claims it with a
+low-level keyboard hook - before the shell sees it - so it wins even over
+reserved combos (the Win key still opens Start).
 
 ## Configuration
 
@@ -36,7 +37,7 @@ first run. Symlink it into your dotfiles if that's how you roll.
 ```toml
 [general]
 start_menu = true        # Start menu entry, refreshed each launch
-start_on_startup = true  # run apex at sign-in (HKCU Run key)
+start_on_startup = true  # run Apex at sign-in (HKCU Run key)
 
 [hotkey]
 modifiers = "ctrl"       # ctrl, alt, shift, win, joined with '+'; or "none"

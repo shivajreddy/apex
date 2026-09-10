@@ -1,4 +1,12 @@
 //! Window creation, global hotkey, input routing, and the message loop.
+//!
+//! The global hotkey uses a low-level keyboard hook (WH_KEYBOARD_LL) rather
+//! than RegisterHotKey: the hook sees the combo before the shell does, which
+//! lets Apex claim system-reserved combos like Ctrl+Esc (Start menu) exactly
+//! the way Raycast does - and it can never fail with "hotkey already
+//! registered".
+
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering::Relaxed};
 
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::*;
@@ -16,9 +24,18 @@ use windows::core::*;
 use crate::app::App;
 use crate::render;
 
-const HOTKEY_ID: i32 = 1;
 const CARET_TIMER_ID: usize = 1;
 const CARET_BLINK_MS: u32 = 530;
+
+/// Posted by the keyboard hook when the hotkey combo fires.
+const WM_APP_TOGGLE: u32 = WM_APP + 1;
+
+// Hook state (the hook proc is a free function, so this lives in statics).
+static HOOK_HWND: AtomicIsize = AtomicIsize::new(0);
+static HOOK_MODS: AtomicU32 = AtomicU32::new(0);
+static HOOK_VK: AtomicU32 = AtomicU32::new(0);
+/// Suppresses autorepeat while the hotkey chord is held.
+static HOOK_HELD: AtomicBool = AtomicBool::new(false);
 
 pub fn run(config: &crate::config::Config) -> Result<()> {
     unsafe {
@@ -69,7 +86,7 @@ pub fn run(config: &crate::config::Config) -> Result<()> {
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             class_name,
-            w!("apex"),
+            w!("Apex"),
             WS_POPUP,
             0,
             0,
@@ -101,20 +118,12 @@ pub fn run(config: &crate::config::Config) -> Result<()> {
         let app = Box::new(App::new(crate::plugins(config)));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
 
-        // Hotkey from config (default Ctrl+Esc; RegisterHotKey claims it
-        // before the shell's legacy Start-menu handling sees it). If the
-        // configured combo is taken, fall back to the default.
-        let mods = HOT_KEY_MODIFIERS(config.hotkey_mods) | MOD_NOREPEAT;
-        if RegisterHotKey(Some(hwnd), HOTKEY_ID, mods, config.hotkey_vk).is_err() {
-            crate::dlog!("configured hotkey unavailable; falling back to Ctrl+Esc");
-            RegisterHotKey(
-                Some(hwnd),
-                HOTKEY_ID,
-                MOD_CONTROL | MOD_NOREPEAT,
-                VK_ESCAPE.0 as u32,
-            )?;
-        }
-        crate::dlog!("hotkey registered, entering message loop");
+        // Global hotkey via low-level keyboard hook (see module docs).
+        HOOK_HWND.store(hwnd.0 as isize, Relaxed);
+        HOOK_MODS.store(config.hotkey_mods, Relaxed);
+        HOOK_VK.store(config.hotkey_vk, Relaxed);
+        let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), None, 0)?;
+        crate::dlog!("keyboard hook installed, entering message loop");
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -122,8 +131,51 @@ pub fn run(config: &crate::config::Config) -> Result<()> {
             DispatchMessageW(&msg);
         }
 
-        let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+        let _ = UnhookWindowsHookEx(hook);
         Ok(())
+    }
+}
+
+/// Exact-match the chord: every configured modifier down, every other
+/// modifier up. Exactness matters - with Ctrl+Esc configured, Ctrl+Shift+Esc
+/// (Task Manager) must pass through untouched.
+fn chord_matches(mods: u32) -> bool {
+    let down = |vk: VIRTUAL_KEY| unsafe { (GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000) != 0 };
+    let win = down(VK_LWIN) || down(VK_RWIN);
+    down(VK_MENU) == (mods & 0x1 != 0)
+        && down(VK_CONTROL) == (mods & 0x2 != 0)
+        && down(VK_SHIFT) == (mods & 0x4 != 0)
+        && win == (mods & 0x8 != 0)
+}
+
+unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe {
+        if code == HC_ACTION as i32 {
+            let info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+            if info.vkCode == HOOK_VK.load(Relaxed) {
+                match wparam.0 as u32 {
+                    WM_KEYDOWN | WM_SYSKEYDOWN => {
+                        if chord_matches(HOOK_MODS.load(Relaxed)) {
+                            if !HOOK_HELD.swap(true, Relaxed) {
+                                let hwnd = HWND(HOOK_HWND.load(Relaxed) as *mut core::ffi::c_void);
+                                let _ = PostMessageW(
+                                    Some(hwnd),
+                                    WM_APP_TOGGLE,
+                                    WPARAM(0),
+                                    LPARAM(0),
+                                );
+                            }
+                            // Swallow so the shell never sees the combo
+                            // (e.g. Ctrl+Esc won't open the Start menu).
+                            return LRESULT(1);
+                        }
+                    }
+                    WM_KEYUP | WM_SYSKEYUP => HOOK_HELD.store(false, Relaxed),
+                    _ => {}
+                }
+            }
+        }
+        CallNextHookEx(None, code, wparam, lparam)
     }
 }
 
@@ -151,7 +203,7 @@ unsafe extern "system" fn wndproc(
 ) -> LRESULT {
     unsafe {
         match msg {
-            WM_HOTKEY if wparam.0 as i32 == HOTKEY_ID => {
+            WM_APP_TOGGLE => {
                 toggle(hwnd);
                 LRESULT(0)
             }
