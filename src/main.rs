@@ -1,13 +1,18 @@
 // No console window in release; keep one in debug for logs.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-/// Debug-only logging to stderr; compiled out entirely in release.
+/// Debug-only logging to stderr; compiled out entirely in release
+/// (arguments are still name-checked so builds stay warning-free).
 #[macro_export]
 macro_rules! dlog {
-    ($($arg:tt)*) => {
+    ($($arg:tt)*) => {{
         #[cfg(debug_assertions)]
-        eprintln!("[apex] {}", format!($($arg)*))
-    };
+        eprintln!("[apex] {}", format!($($arg)*));
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = format_args!($($arg)*);
+        }
+    }};
 }
 
 mod app;

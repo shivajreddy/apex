@@ -89,7 +89,7 @@ pub fn run() -> Result<()> {
         );
 
         // Attach application state to the window.
-        let app = Box::new(App::new(crate::plugins())?);
+        let app = Box::new(App::new(crate::plugins()));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
 
         RegisterHotKey(
@@ -156,15 +156,19 @@ unsafe extern "system" fn wndproc(
             }
             WM_SIZE => {
                 if let Some(app) = app_mut(hwnd) {
-                    let w = (lparam.0 & 0xFFFF) as u32;
-                    let h = ((lparam.0 >> 16) & 0xFFFF) as u32;
-                    app.renderer.resize(w, h);
+                    if let Some(r) = app.renderer.as_mut() {
+                        let w = (lparam.0 & 0xFFFF) as u32;
+                        let h = ((lparam.0 >> 16) & 0xFFFF) as u32;
+                        r.resize(w, h);
+                    }
                 }
                 LRESULT(0)
             }
             WM_DPICHANGED => {
                 if let Some(app) = app_mut(hwnd) {
-                    app.renderer.update_dpi((wparam.0 & 0xFFFF) as f32);
+                    if let Some(r) = app.renderer.as_mut() {
+                        r.update_dpi((wparam.0 & 0xFFFF) as f32);
+                    }
                 }
                 LRESULT(0)
             }
@@ -172,13 +176,13 @@ unsafe extern "system" fn wndproc(
                 let mut ps = PAINTSTRUCT::default();
                 let _ = BeginPaint(hwnd, &mut ps);
                 if let Some(app) = app_mut(hwnd) {
-                    app.renderer.draw(
-                        hwnd,
-                        &app.query,
-                        app.caret_visible,
-                        &app.results,
-                        app.selected,
-                    );
+                    if app.ensure_renderer().is_some() {
+                        let (query, caret, selected) =
+                            (&app.query, app.caret_visible, app.selected);
+                        if let Some(r) = app.renderer.as_mut() {
+                            r.draw(hwnd, query, caret, &app.results, selected);
+                        }
+                    }
                 }
                 let _ = EndPaint(hwnd, &ps);
                 LRESULT(0)
@@ -339,9 +343,12 @@ unsafe fn hide(hwnd: HWND) {
     unsafe {
         let _ = KillTimer(Some(hwnd), CARET_TIMER_ID);
         let _ = ShowWindow(hwnd, SW_HIDE);
-        // Fresh query next time the launcher opens.
         if let Some(app) = app_mut(hwnd) {
+            // Fresh query next time the launcher opens.
             app.clear_query();
+            // Drop the whole renderer (factories included) so the process
+            // returns to baseline memory while hidden.
+            app.renderer = None;
         }
     }
 }

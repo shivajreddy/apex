@@ -111,8 +111,11 @@ impl Renderer {
                 width: (rc.right - rc.left).max(1) as u32,
                 height: (rc.bottom - rc.top).max(1) as u32,
             };
+            // Software rasterizer: our scene is trivial (one small window,
+            // redraws only on input) and skipping D3D/DXGI device creation
+            // saves ~50MB of process memory. CPU cost per frame is <1ms.
             let props = D2D1_RENDER_TARGET_PROPERTIES {
-                r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
                 pixelFormat: D2D1_PIXEL_FORMAT {
                     format: DXGI_FORMAT_B8G8R8A8_UNORM,
                     alphaMode: D2D1_ALPHA_MODE_IGNORE,

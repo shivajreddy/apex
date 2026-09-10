@@ -6,7 +6,9 @@ use crate::render::Renderer;
 pub const MAX_RESULTS: usize = 8;
 
 pub struct App {
-    pub renderer: Renderer,
+    /// Present only while the window is visible; dropped on hide so the
+    /// process returns to baseline memory. Recreated lazily (~1ms) on show.
+    pub renderer: Option<Renderer>,
     pub query: String,
     /// High surrogate waiting for its pair (WM_CHAR delivers UTF-16 units).
     pending_surrogate: Option<u16>,
@@ -17,16 +19,30 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(plugins: Vec<Box<dyn Plugin>>) -> windows::core::Result<Self> {
-        Ok(Self {
-            renderer: Renderer::new()?,
+    pub fn new(plugins: Vec<Box<dyn Plugin>>) -> Self {
+        Self {
+            renderer: None,
             query: String::new(),
             pending_surrogate: None,
             caret_visible: true,
             plugins,
             results: Vec::new(),
             selected: 0,
-        })
+        }
+    }
+
+    /// Get the renderer, creating it if needed (first show or after hide).
+    pub fn ensure_renderer(&mut self) -> Option<&mut Renderer> {
+        if self.renderer.is_none() {
+            match Renderer::new() {
+                Ok(r) => self.renderer = Some(r),
+                Err(e) => {
+                    crate::dlog!("renderer creation failed: {e}");
+                    return None;
+                }
+            }
+        }
+        self.renderer.as_mut()
     }
 
     /// Handle a UTF-16 unit from WM_CHAR. Returns true if the query changed.
