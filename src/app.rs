@@ -105,7 +105,8 @@ impl App {
         for p in &mut self.plugins {
             p.query(&self.query, &mut self.results);
         }
-        self.results.sort_by(|a, b| b.score.cmp(&a.score));
+        self.results
+            .sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.title.cmp(&b.title)));
         self.results.truncate(MAX_RESULTS);
     }
 

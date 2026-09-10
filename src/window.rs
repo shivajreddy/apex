@@ -304,6 +304,7 @@ unsafe fn resize_to_content(hwnd: HWND) {
         let content_h = app.content_height();
         let dpi = GetDpiForWindow(hwnd) as f32;
         let h = (content_h * dpi / 96.0) as i32;
+        crate::dlog!("resize_to_content: dpi={dpi} content_h={content_h} h={h}");
 
         let mut rc = RECT::default();
         let _ = GetWindowRect(hwnd, &mut rc);

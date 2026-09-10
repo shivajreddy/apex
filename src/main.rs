@@ -11,14 +11,16 @@ macro_rules! dlog {
 }
 
 mod app;
+mod fuzzy;
 mod plugin;
+mod plugins;
 mod render;
 mod window;
 
 /// Construct the set of enabled plugins. Later this reads the user config;
 /// disabled plugins are never built, so they cost nothing.
 fn plugins() -> Vec<Box<dyn plugin::Plugin>> {
-    Vec::new()
+    vec![Box::new(plugins::search::Search::new())]
 }
 
 fn main() {
