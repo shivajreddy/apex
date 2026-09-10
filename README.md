@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" width="128" alt="apex logo">
+</p>
+
 # apex
 
 Ultra-fast, ultra-lightweight launcher for Windows. Raycast, but native.

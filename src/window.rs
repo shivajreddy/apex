@@ -30,11 +30,24 @@ pub fn run() -> Result<()> {
         let instance: HINSTANCE = GetModuleHandleW(None)?.into();
         let class_name = w!("ApexWindow");
 
+        // Embedded app icon (id 1, from build.rs / assets/apex.ico).
+        let icon = LoadImageW(
+            Some(instance),
+            PCWSTR(1 as *const u16),
+            IMAGE_ICON,
+            0,
+            0,
+            LR_DEFAULTSIZE,
+        )
+        .map(|h| HICON(h.0))
+        .unwrap_or_default();
+
         let wc = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(wndproc),
             hInstance: instance,
+            hIcon: icon,
             hCursor: LoadCursorW(None, IDC_ARROW)?,
             lpszClassName: class_name,
             ..Default::default()
