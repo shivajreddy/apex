@@ -14,7 +14,9 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
 };
+use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -64,9 +66,10 @@ pub fn run(config: &crate::config::Config) -> Result<()> {
         let class_name = w!("ApexWindow");
 
         // Embedded app icon (id 1, from build.rs / assets/apex.ico).
+        // MAKEINTRESOURCE(1): the integer *is* the "pointer".
         let icon = LoadImageW(
             Some(instance),
-            PCWSTR(1 as *const u16),
+            PCWSTR(std::ptr::without_provenance(1)),
             IMAGE_ICON,
             0,
             0,
@@ -346,6 +349,16 @@ unsafe extern "system" fn wndproc(
                             Mode::TextInput { prompt, buffer, .. } => {
                                 Some(render::PanelView::TextInput { prompt, buffer })
                             }
+                            Mode::Form {
+                                title,
+                                fields,
+                                focused,
+                                ..
+                            } => Some(render::PanelView::Form {
+                                title,
+                                fields,
+                                focused: *focused,
+                            }),
                         };
                         let frame = render::Frame {
                             query: &app.query,
@@ -389,6 +402,7 @@ enum ModeKind {
     Search,
     Actions,
     TextInput,
+    Form,
 }
 
 unsafe fn mode_kind(hwnd: HWND) -> ModeKind {
@@ -396,18 +410,82 @@ unsafe fn mode_kind(hwnd: HWND) -> ModeKind {
         match app_mut(hwnd).map(|a| &a.mode) {
             Some(Mode::Actions { .. }) => ModeKind::Actions,
             Some(Mode::TextInput { .. }) => ModeKind::TextInput,
+            Some(Mode::Form { .. }) => ModeKind::Form,
             _ => ModeKind::Search,
         }
+    }
+}
+
+/// Apply a mode-level outcome: dismiss, or refit the window and repaint.
+unsafe fn settle(hwnd: HWND, outcome: UiOutcome) {
+    unsafe {
+        if outcome == UiOutcome::Hide {
+            hide(hwnd);
+        } else {
+            resize_to_content(hwnd);
+            invalidate(hwnd);
+        }
+    }
+}
+
+/// Clipboard text as a single line.
+///
+/// Control characters are dropped rather than replaced with spaces: the
+/// common case is a URL copied with a trailing newline, where a space would
+/// corrupt it.
+unsafe fn clipboard_text(hwnd: HWND) -> Option<String> {
+    // CF_UNICODETEXT, spelled out to avoid pulling in the Ole feature.
+    const CF_UNICODETEXT: u32 = 13;
+    /// Cap: these are all one-line fields, not a document editor.
+    const MAX_CHARS: usize = 4096;
+
+    unsafe {
+        if OpenClipboard(Some(hwnd)).is_err() {
+            return None;
+        }
+        let text = (|| {
+            let handle = GetClipboardData(CF_UNICODETEXT).ok()?;
+            let hglobal = HGLOBAL(handle.0);
+            let ptr = GlobalLock(hglobal) as *const u16;
+            if ptr.is_null() {
+                return None;
+            }
+            let mut len = 0usize;
+            while len < MAX_CHARS && *ptr.add(len) != 0 {
+                len += 1;
+            }
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
+            let _ = GlobalUnlock(hglobal);
+            Some(s)
+        })();
+        // Always close, even if reading failed: leaving the clipboard open
+        // blocks every other process from using it.
+        let _ = CloseClipboard();
+        text.map(|s| s.chars().filter(|c| !c.is_control()).collect())
     }
 }
 
 unsafe fn on_keydown(hwnd: HWND, key: VIRTUAL_KEY) {
     unsafe {
         let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
+        let shift = (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
 
         // Ctrl+Q quits entirely (dev convenience until a tray icon exists).
         if key == VK_Q && ctrl {
             let _ = DestroyWindow(hwnd);
+            return;
+        }
+
+        // Paste, in whichever text field has focus. Handled here rather than
+        // in on_char because Ctrl+V arrives as WM_CHAR 0x16, a control code
+        // the text handlers correctly ignore.
+        if (key == VK_V && ctrl) || (key == VK_INSERT && shift) {
+            if let Some(text) = clipboard_text(hwnd)
+                && app_mut(hwnd).map(|a| a.paste(&text)).unwrap_or(false)
+            {
+                resize_to_content(hwnd);
+                invalidate(hwnd);
+            }
             return;
         }
 
@@ -432,10 +510,10 @@ unsafe fn on_keydown(hwnd: HWND, key: VIRTUAL_KEY) {
                     invalidate(hwnd);
                 }
                 VK_RETURN => {
-                    let close = app_mut(hwnd).map(|a| a.activate_selected()).unwrap_or(false);
-                    if close {
-                        hide(hwnd);
-                    }
+                    let outcome = app_mut(hwnd)
+                        .map(|a| a.activate_selected())
+                        .unwrap_or(UiOutcome::Stay);
+                    settle(hwnd, outcome);
                 }
                 _ => {}
             },
@@ -468,12 +546,7 @@ unsafe fn on_keydown(hwnd: HWND, key: VIRTUAL_KEY) {
                     let outcome = app_mut(hwnd)
                         .map(|a| a.run_panel_action())
                         .unwrap_or(UiOutcome::Stay);
-                    if outcome == UiOutcome::Hide {
-                        hide(hwnd);
-                    } else {
-                        resize_to_content(hwnd);
-                        invalidate(hwnd);
-                    }
+                    settle(hwnd, outcome);
                 }
                 _ => {}
             },
@@ -482,18 +555,49 @@ unsafe fn on_keydown(hwnd: HWND, key: VIRTUAL_KEY) {
                     if let Some(app) = app_mut(hwnd) {
                         app.close_panel();
                     }
+                    resize_to_content(hwnd);
                     invalidate(hwnd);
                 }
                 VK_RETURN => {
                     let outcome = app_mut(hwnd)
                         .map(|a| a.submit_text_input())
                         .unwrap_or(UiOutcome::Stay);
-                    if outcome == UiOutcome::Hide {
-                        hide(hwnd);
-                    } else {
-                        resize_to_content(hwnd);
-                        invalidate(hwnd);
+                    settle(hwnd, outcome);
+                }
+                _ => {}
+            },
+            ModeKind::Form => match key {
+                VK_ESCAPE => {
+                    if let Some(app) = app_mut(hwnd) {
+                        app.close_panel();
                     }
+                    resize_to_content(hwnd);
+                    invalidate(hwnd);
+                }
+                // Tab and the arrows both move between fields; Shift+Tab and
+                // Up go back.
+                VK_TAB => {
+                    let shift = (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
+                    if let Some(app) = app_mut(hwnd) {
+                        app.form_move(if shift { -1 } else { 1 });
+                    }
+                    invalidate(hwnd);
+                }
+                VK_DOWN => {
+                    if let Some(app) = app_mut(hwnd) {
+                        app.form_move(1);
+                    }
+                    invalidate(hwnd);
+                }
+                VK_UP => {
+                    if let Some(app) = app_mut(hwnd) {
+                        app.form_move(-1);
+                    }
+                    invalidate(hwnd);
+                }
+                VK_RETURN => {
+                    let outcome = app_mut(hwnd).map(|a| a.submit_form()).unwrap_or(UiOutcome::Stay);
+                    settle(hwnd, outcome);
                 }
                 _ => {}
             },
@@ -525,6 +629,16 @@ unsafe fn on_char(hwnd: HWND, unit: u16) {
                     app.text_input_char(unit);
                 }
                 invalidate(hwnd);
+            }
+            ModeKind::Form => {
+                // Tab arrives as WM_CHAR 0x09 too; field movement is handled
+                // in on_keydown, so swallow it here rather than inserting it.
+                if unit != 0x09 {
+                    if let Some(app) = app_mut(hwnd) {
+                        app.form_char(unit);
+                    }
+                    invalidate(hwnd);
+                }
             }
             ModeKind::Actions => {}
         }
@@ -567,9 +681,15 @@ unsafe fn show(hwnd: HWND) {
     unsafe {
         let (scale, work) = cursor_monitor_metrics();
 
-        let content_h = app_mut(hwnd)
-            .map(|a| a.content_height())
-            .unwrap_or(render::INPUT_H);
+        // Rebuild the most-used list before measuring: the app index may have
+        // finished loading, and the last launch may have reordered it.
+        let content_h = match app_mut(hwnd) {
+            Some(a) => {
+                a.refresh_on_show();
+                a.content_height()
+            }
+            None => render::INPUT_H,
+        };
         let w = (render::WINDOW_WIDTH * scale) as i32;
         let h = (content_h * scale) as i32;
         let x = work.left + (work.right - work.left - w) / 2;

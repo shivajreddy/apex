@@ -13,7 +13,7 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::core::*;
 
-use crate::plugin::{Action, Icon, ResultItem};
+use crate::plugin::{Action, FormField, Icon, ResultItem};
 
 // ---- layout (logical DIPs) ----
 pub const WINDOW_WIDTH: f32 = 680.0;
@@ -30,6 +30,13 @@ const PANEL_ROW: f32 = 32.0;
 const PANEL_PAD: f32 = 6.0;
 const PANEL_MARGIN: f32 = 8.0;
 
+// Forms stack a dim label over an editable value, so they need more width
+// than the actions panel - links in particular are long.
+const FORM_W: f32 = 460.0;
+const FORM_ROW: f32 = 50.0;
+const FORM_TITLE_H: f32 = 28.0;
+const FORM_LABEL_H: f32 = 18.0;
+
 /// Total window height for `n` result rows.
 pub fn content_height(n: usize) -> f32 {
     if n == 0 {
@@ -37,6 +44,18 @@ pub fn content_height(n: usize) -> f32 {
     } else {
         INPUT_H + 1.0 + LIST_PAD * 2.0 + ROW_H * n as f32 + BAR_H
     }
+}
+
+fn form_panel_height(fields: usize) -> f32 {
+    FORM_TITLE_H + fields as f32 * FORM_ROW + PANEL_PAD * 2.0
+}
+
+/// Window height needed to show a form with `fields` rows without clipping.
+///
+/// The overlay draws inside the existing window, so a form opened over a
+/// short result list would otherwise be cut off at the bottom.
+pub fn form_window_height(fields: usize) -> f32 {
+    INPUT_H + 1.0 + PANEL_MARGIN * 2.0 + form_panel_height(fields) + BAR_H
 }
 
 /// Everything the renderer needs for one frame.
@@ -57,6 +76,11 @@ pub enum PanelView<'a> {
     TextInput {
         prompt: &'a str,
         buffer: &'a str,
+    },
+    Form {
+        title: &'a str,
+        fields: &'a [FormField],
+        focused: usize,
     },
 }
 
@@ -245,12 +269,28 @@ impl Renderer {
                 return;
             }
             let caret_x = PAD_X + self.measure_input(query) + 1.0;
+            // Text measurement needs &self, so do it before borrowing the
+            // target mutably below.
             let text_input_caret = match panel {
                 Some(PanelView::TextInput { prompt, buffer }) => Some((
                     self.measure(&self.fmt_title, prompt),
                     self.measure(&self.fmt_title, buffer),
                 )),
                 _ => None,
+            };
+            let form_caret = match panel {
+                Some(PanelView::Form {
+                    fields, focused, ..
+                }) => fields
+                    .get(*focused)
+                    .map(|f| self.measure(&self.fmt_panel, &f.value)),
+                _ => None,
+            };
+            let hint = match panel {
+                Some(PanelView::Form { .. }) => "Save \u{21b5}      Field Tab",
+                Some(PanelView::TextInput { .. }) => "Confirm \u{21b5}",
+                Some(PanelView::Actions { .. }) => "Run \u{21b5}",
+                None => "Open \u{21b5}      Actions Ctrl+K",
             };
             let t = self.target.as_mut().unwrap();
             let rt = &t.rt;
@@ -371,92 +411,162 @@ impl Renderer {
                     bottom: height,
                 };
                 draw_text(rt, "Apex", &self.fmt_subtitle_left, &bar_rect, &t.dim);
-                draw_text(
-                    rt,
-                    "Open \u{21b5}      Actions Ctrl+K",
-                    &self.fmt_subtitle,
-                    &bar_rect,
-                    &t.dim,
+                draw_text(rt, hint, &self.fmt_subtitle, &bar_rect, &t.dim);
+            }
+
+            // Overlay panel (actions / text input / form), bottom-right.
+            // Outside the results block: a form can be taller than a short
+            // result list, and the window is sized to fit it.
+            if let Some(view) = panel {
+                let (panel_w, panel_h) = match view {
+                    PanelView::Actions { actions, .. } => (
+                        PANEL_W,
+                        actions.len().max(1) as f32 * PANEL_ROW + PANEL_PAD * 2.0,
+                    ),
+                    PanelView::TextInput { .. } => (PANEL_W, PANEL_ROW + PANEL_PAD * 2.0),
+                    PanelView::Form { fields, .. } => (FORM_W, form_panel_height(fields.len())),
+                };
+                let rect = D2D_RECT_F {
+                    left: width - PANEL_MARGIN - panel_w,
+                    top: height - BAR_H - PANEL_MARGIN - panel_h,
+                    right: width - PANEL_MARGIN,
+                    bottom: height - BAR_H - PANEL_MARGIN,
+                };
+                rt.FillRoundedRectangle(
+                    &D2D1_ROUNDED_RECT {
+                        rect,
+                        radiusX: 10.0,
+                        radiusY: 10.0,
+                    },
+                    &t.panel,
                 );
 
-                // Overlay panel (actions / text input), bottom-right.
-                if let Some(view) = panel {
-                    let rows = match view {
-                        PanelView::Actions { actions, .. } => actions.len().max(1) as f32,
-                        PanelView::TextInput { .. } => 1.0,
-                    };
-                    let panel_h = rows * PANEL_ROW + PANEL_PAD * 2.0;
-                    let rect = D2D_RECT_F {
-                        left: width - PANEL_MARGIN - PANEL_W,
-                        top: height - BAR_H - PANEL_MARGIN - panel_h,
-                        right: width - PANEL_MARGIN,
-                        bottom: height - BAR_H - PANEL_MARGIN,
-                    };
-                    rt.FillRoundedRectangle(
-                        &D2D1_ROUNDED_RECT {
-                            rect,
-                            radiusX: 10.0,
-                            radiusY: 10.0,
-                        },
-                        &t.panel,
-                    );
-
-                    match view {
-                        PanelView::Actions { actions, selected } => {
-                            let mut ay = rect.top + PANEL_PAD;
-                            for (i, action) in actions.iter().enumerate() {
-                                let row = D2D_RECT_F {
-                                    left: rect.left + PANEL_PAD,
-                                    top: ay,
-                                    right: rect.right - PANEL_PAD,
-                                    bottom: ay + PANEL_ROW,
-                                };
-                                if i == *selected {
-                                    rt.FillRoundedRectangle(
-                                        &D2D1_ROUNDED_RECT {
-                                            rect: row,
-                                            radiusX: 6.0,
-                                            radiusY: 6.0,
-                                        },
-                                        &t.select,
-                                    );
-                                }
-                                let label_rect = D2D_RECT_F {
-                                    left: row.left + 10.0,
-                                    right: row.right - 10.0,
-                                    ..row
-                                };
-                                draw_text(rt, &action.label, &self.fmt_panel, &label_rect, &t.text);
-                                ay += PANEL_ROW;
-                            }
-                        }
-                        PanelView::TextInput { prompt, buffer } => {
+                match view {
+                    PanelView::Actions { actions, selected } => {
+                        let mut ay = rect.top + PANEL_PAD;
+                        for (i, action) in actions.iter().enumerate() {
                             let row = D2D_RECT_F {
-                                left: rect.left + PANEL_PAD + 10.0,
-                                top: rect.top + PANEL_PAD,
-                                right: rect.right - PANEL_PAD - 10.0,
-                                bottom: rect.bottom - PANEL_PAD,
+                                left: rect.left + PANEL_PAD,
+                                top: ay,
+                                right: rect.right - PANEL_PAD,
+                                bottom: ay + PANEL_ROW,
                             };
-                            let prompt_text = format!("{prompt}: ");
-                            draw_text(rt, &prompt_text, &self.fmt_panel, &row, &t.dim);
-                            if let Some((pw, bw)) = text_input_caret {
-                                let text_rect = D2D_RECT_F {
-                                    left: row.left + pw + 8.0,
-                                    ..row
-                                };
-                                draw_text(rt, buffer, &self.fmt_panel, &text_rect, &t.text);
-                                let cx = text_rect.left + bw + 1.0;
-                                let mid = (row.top + row.bottom) / 2.0;
+                            if i == *selected {
+                                rt.FillRoundedRectangle(
+                                    &D2D1_ROUNDED_RECT {
+                                        rect: row,
+                                        radiusX: 6.0,
+                                        radiusY: 6.0,
+                                    },
+                                    &t.select,
+                                );
+                            }
+                            let label_rect = D2D_RECT_F {
+                                left: row.left + 10.0,
+                                right: row.right - 10.0,
+                                ..row
+                            };
+                            draw_text(rt, &action.label, &self.fmt_panel, &label_rect, &t.text);
+                            ay += PANEL_ROW;
+                        }
+                    }
+                    PanelView::TextInput { prompt, buffer } => {
+                        let row = D2D_RECT_F {
+                            left: rect.left + PANEL_PAD + 10.0,
+                            top: rect.top + PANEL_PAD,
+                            right: rect.right - PANEL_PAD - 10.0,
+                            bottom: rect.bottom - PANEL_PAD,
+                        };
+                        let prompt_text = format!("{prompt}: ");
+                        draw_text(rt, &prompt_text, &self.fmt_panel, &row, &t.dim);
+                        if let Some((pw, bw)) = text_input_caret {
+                            let text_rect = D2D_RECT_F {
+                                left: row.left + pw + 8.0,
+                                ..row
+                            };
+                            draw_text(rt, buffer, &self.fmt_panel, &text_rect, &t.text);
+                            let cx = text_rect.left + bw + 1.0;
+                            let mid = (row.top + row.bottom) / 2.0;
+                            rt.FillRectangle(
+                                &D2D_RECT_F {
+                                    left: cx,
+                                    top: mid - 9.0,
+                                    right: cx + 1.5,
+                                    bottom: mid + 9.0,
+                                },
+                                &t.text,
+                            );
+                        }
+                    }
+                    PanelView::Form {
+                        title,
+                        fields,
+                        focused,
+                    } => {
+                        let title_rect = D2D_RECT_F {
+                            left: rect.left + PANEL_PAD + 10.0,
+                            top: rect.top + PANEL_PAD,
+                            right: rect.right - PANEL_PAD - 10.0,
+                            bottom: rect.top + PANEL_PAD + FORM_TITLE_H,
+                        };
+                        draw_text(rt, title, &self.fmt_panel, &title_rect, &t.dim);
+
+                        let mut fy = rect.top + PANEL_PAD + FORM_TITLE_H;
+                        for (i, field) in fields.iter().enumerate() {
+                            let row = D2D_RECT_F {
+                                left: rect.left + PANEL_PAD,
+                                top: fy,
+                                right: rect.right - PANEL_PAD,
+                                bottom: fy + FORM_ROW,
+                            };
+                            if i == *focused {
+                                rt.FillRoundedRectangle(
+                                    &D2D1_ROUNDED_RECT {
+                                        rect: row,
+                                        radiusX: 6.0,
+                                        radiusY: 6.0,
+                                    },
+                                    &t.select,
+                                );
+                            }
+                            let label_rect = D2D_RECT_F {
+                                left: row.left + 10.0,
+                                top: row.top + 3.0,
+                                right: row.right - 10.0,
+                                bottom: row.top + 3.0 + FORM_LABEL_H,
+                            };
+                            draw_text(
+                                rt,
+                                &field.label,
+                                &self.fmt_subtitle_left,
+                                &label_rect,
+                                &t.dim,
+                            );
+
+                            let value_rect = D2D_RECT_F {
+                                left: row.left + 10.0,
+                                top: row.top + FORM_LABEL_H,
+                                right: row.right - 10.0,
+                                bottom: row.bottom,
+                            };
+                            draw_text(rt, &field.value, &self.fmt_panel, &value_rect, &t.text);
+
+                            if i == *focused
+                                && let Some(vw) = form_caret
+                            {
+                                let cx = value_rect.left + vw + 1.0;
+                                let mid = (value_rect.top + value_rect.bottom) / 2.0;
                                 rt.FillRectangle(
                                     &D2D_RECT_F {
                                         left: cx,
-                                        top: mid - 9.0,
+                                        top: mid - 8.0,
                                         right: cx + 1.5,
-                                        bottom: mid + 9.0,
+                                        bottom: mid + 8.0,
                                     },
                                     &t.text,
                                 );
                             }
+                            fy += FORM_ROW;
                         }
                     }
                 }

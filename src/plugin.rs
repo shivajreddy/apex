@@ -33,17 +33,46 @@ pub struct Action {
     pub label: String,
 }
 
+/// One editable line in a [`ActionResult::RequestForm`] form.
+pub struct FormField {
+    pub label: String,
+    pub value: String,
+}
+
+impl FormField {
+    pub fn new(label: &str, value: &str) -> Self {
+        Self {
+            label: label.to_string(),
+            value: value.to_string(),
+        }
+    }
+}
+
 /// What the UI should do after a plugin handled an action.
 pub enum ActionResult {
     /// Back to search mode; results are re-queried.
     Done,
-    /// Hide the window.
+    /// The item was launched: hide the window and record it in launch
+    /// history, so it ranks higher next time.
     Close,
+    /// Hide the window without recording anything. For side-actions such as
+    /// revealing a file, which shouldn't inflate the item's ranking.
+    Dismiss,
+    /// Reload every plugin from disk and return to the default list. Not
+    /// recorded: reloading is not launching anything.
+    Refresh,
     /// Open a one-line text input (e.g. "set alias"); the entered text is
     /// delivered to [`Plugin::submit_text`] with `action_id`.
     RequestText {
         prompt: String,
         action_id: &'static str,
+    },
+    /// Open a multi-field form (e.g. create/edit a quicklink). The edited
+    /// fields are delivered to [`Plugin::submit_form`] with `action_id`.
+    RequestForm {
+        title: String,
+        action_id: &'static str,
+        fields: Vec<FormField>,
     },
 }
 
@@ -52,10 +81,43 @@ pub trait Plugin {
     fn id(&self) -> &'static str;
 
     /// Append matches for `q` to `out`. Called on every keystroke - must be fast.
+    /// Never called with an empty query; see [`Plugin::item_for`].
     fn query(&mut self, q: &str, out: &mut Vec<ResultItem>);
 
-    /// Run the default action for `item`. Return `true` to dismiss the window.
-    fn activate(&mut self, item: &ResultItem) -> bool;
+    /// Rebuild a result for a payload this plugin produced earlier.
+    ///
+    /// The shell keeps frecency keyed by `(plugin, payload)` and uses this to
+    /// materialise the most-used entries while the query is empty, so only
+    /// the handful actually shown are ever built. Return `None` if the
+    /// payload no longer exists - an uninstalled app, a deleted quicklink -
+    /// and the row is simply skipped. Plugins that opt out never appear on an
+    /// empty query.
+    fn item_for(&mut self, _payload: &str) -> Option<ResultItem> {
+        None
+    }
+
+    /// Append up to `limit` of this plugin's own entries, in whatever order
+    /// it considers natural.
+    ///
+    /// Used to pad the empty-query list once launch history runs out, so a
+    /// fresh install still looks like a launcher rather than a blank box.
+    /// Implementations must skip payloads already present in `out` to avoid
+    /// repeating a row that history already placed above.
+    fn browse(&mut self, _limit: usize, _out: &mut Vec<ResultItem>) {}
+
+    /// Reload whatever this plugin caches from disk.
+    ///
+    /// Triggered by [`ActionResult::Refresh`] and applied to every plugin, so
+    /// one command picks up newly installed apps *and* hand-edits to the
+    /// config file. Anything slow belongs on a background thread: this runs
+    /// on the UI thread.
+    fn refresh(&mut self) {}
+
+    /// Run the default action for `item` - the Enter key.
+    ///
+    /// Returns the same [`ActionResult`] as a panel action, so Enter can open
+    /// a prompt or a form rather than only launching something.
+    fn activate(&mut self, item: &ResultItem) -> ActionResult;
 
     /// Entries for the actions panel. Empty = no panel for this item.
     fn actions(&self, _item: &ResultItem) -> Vec<Action> {
@@ -69,6 +131,17 @@ pub trait Plugin {
 
     /// Commit text entered after [`ActionResult::RequestText`].
     fn submit_text(&mut self, _action_id: &str, _item: &ResultItem, _text: &str) -> ActionResult {
+        ActionResult::Done
+    }
+
+    /// Commit a form filled in after [`ActionResult::RequestForm`]. Fields
+    /// arrive in the order they were requested.
+    fn submit_form(
+        &mut self,
+        _action_id: &str,
+        _item: &ResultItem,
+        _fields: &[FormField],
+    ) -> ActionResult {
         ActionResult::Done
     }
 }

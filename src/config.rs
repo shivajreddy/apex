@@ -31,6 +31,23 @@ key = "escape"
 # Set to false to disable a plugin entirely; a disabled plugin is never
 # constructed and uses zero memory.
 search = true
+quicklinks = true
+# Apex's own commands, e.g. "Reload Apex" - which re-reads this file and
+# rescans installed applications without a restart.
+commands = true
+
+# Quicklinks open a link, folder or program by name. Create and edit them
+# from inside apex with Ctrl+K, or write them here by hand:
+#
+#   [quicklinks.github]
+#   name = 'Search GitHub'
+#   link = 'https://github.com/search?q={query}'
+#   open_with = 'chrome'        # optional; defaults to the system handler
+#
+# A {token} in the link makes the quicklink take an argument: running it
+# asks for a value using the token's name, then substitutes it in.
+# Prefer 'single quotes' - they keep Windows paths like C:\tools\x.exe
+# literal, with no escaping.
 "#;
 
 pub struct Config {
@@ -79,6 +96,31 @@ impl Config {
             .filter(|((section, _), _)| section == "aliases")
             .map(|((_, alias), app_id)| (alias.clone(), app_id.clone()))
             .collect()
+    }
+
+    /// One-level sub-tables under `prefix`, e.g. `[quicklinks.github]` for
+    /// prefix `quicklinks` yields `("github", {name: .., link: ..})`.
+    ///
+    /// Sorted by slug so the order is stable across runs - `values` is a
+    /// HashMap, whose iteration order is randomised.
+    pub fn subtables(&self, prefix: &str) -> Vec<(String, HashMap<String, String>)> {
+        let head = format!("{prefix}.");
+        let mut grouped: HashMap<String, HashMap<String, String>> = HashMap::new();
+        for ((section, key), value) in &self.values {
+            let Some(slug) = section.strip_prefix(&head) else {
+                continue;
+            };
+            if slug.is_empty() || slug.contains('.') {
+                continue;
+            }
+            grouped
+                .entry(slug.to_string())
+                .or_default()
+                .insert(key.clone(), value.clone());
+        }
+        let mut out: Vec<_> = grouped.into_iter().collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 }
 
@@ -158,6 +200,72 @@ fn join_lines(lines: Vec<String>) -> String {
     s
 }
 
+// ---- whole-section write-back -----------------------------------------
+//
+// Quicklinks are sub-tables rather than single lines, so they are edited a
+// block at a time. Same rule as aliases: everything outside the block,
+// comments included, is preserved byte-for-byte.
+
+/// The section name of a `[header]` line, if this line is one.
+fn header_name(line: &str) -> Option<&str> {
+    line.trim()
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .map(str::trim)
+}
+
+/// Lines of `text` with the whole `[section]` block removed.
+fn drop_section_lines(text: &str, section: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_target = false;
+    for line in text.lines() {
+        if let Some(name) = header_name(line) {
+            in_target = name.eq_ignore_ascii_case(section);
+        }
+        if !in_target {
+            out.push(line.to_string());
+        }
+    }
+    out
+}
+
+fn trim_trailing_blanks(lines: &mut Vec<String>) {
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+}
+
+/// Replace a `[section]` block, or append it if absent. Appending at the end
+/// is always safe: a table header closes whatever section preceded it.
+fn upsert_section_text(text: &str, section: &str, entries: &[(&str, &str)]) -> String {
+    let mut lines = drop_section_lines(text, section);
+    trim_trailing_blanks(&mut lines);
+    lines.push(String::new());
+    lines.push(format!("[{section}]"));
+    for (key, value) in entries {
+        if !value.is_empty() {
+            lines.push(format!("{key} = {}", quote(value)));
+        }
+    }
+    join_lines(lines)
+}
+
+fn remove_section_text(text: &str, section: &str) -> String {
+    let mut lines = drop_section_lines(text, section);
+    trim_trailing_blanks(&mut lines);
+    join_lines(lines)
+}
+
+pub fn upsert_quicklink_file(slug: &str, entries: &[(&str, &str)]) {
+    let section = format!("quicklinks.{slug}");
+    edit_config_file(|text| upsert_section_text(text, &section, entries));
+}
+
+pub fn remove_quicklink_file(slug: &str) {
+    let section = format!("quicklinks.{slug}");
+    edit_config_file(|text| remove_section_text(text, &section));
+}
+
 fn edit_config_file(edit: impl Fn(&str) -> String) {
     let Some(path) = config_path() else { return };
     let text = std::fs::read_to_string(&path).unwrap_or_else(|_| DEFAULT_FILE.to_string());
@@ -170,6 +278,32 @@ pub fn upsert_alias_file(alias: &str, app_id: &str) {
 
 pub fn remove_alias_file(app_id: &str) {
     edit_config_file(|text| remove_alias_text(text, app_id));
+}
+
+/// Reduce free text to a bare TOML key: lowercase, spaces to `-`, keep only
+/// `a-z 0-9 - _ .`. Used for both alias names and quicklink slugs, which are
+/// written as bare keys and section names respectively.
+pub fn sanitize_key(text: &str) -> String {
+    text.trim()
+        .to_lowercase()
+        .chars()
+        .filter_map(|c| match c {
+            'a'..='z' | '0'..='9' | '-' | '_' | '.' => Some(c),
+            ' ' => Some('-'),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Strip characters that the writer cannot represent. [`quote`] falls back to
+/// a basic string when a value contains `'`, so a value containing both quote
+/// styles would be unrepresentable; double quotes are the rarer of the two in
+/// names and links, so they lose.
+pub fn sanitize_value(text: &str) -> String {
+    text.trim()
+        .chars()
+        .filter(|c| *c != '"' && !c.is_control())
+        .collect()
 }
 
 pub fn config_path() -> Option<PathBuf> {
@@ -210,23 +344,48 @@ fn parse(text: &str) -> HashMap<(String, String), String> {
     out
 }
 
-/// Cut a `#` comment, respecting double-quoted strings.
+/// Cut a `#` comment, respecting both quote styles so a `#` inside a link
+/// (a URL fragment, say) survives.
 fn strip_comment(line: &str) -> &str {
-    let mut in_quotes = false;
+    let mut quote: Option<char> = None;
     for (i, c) in line.char_indices() {
         match c {
-            '"' => in_quotes = !in_quotes,
-            '#' if !in_quotes => return &line[..i],
+            '"' | '\'' => match quote {
+                Some(q) if q == c => quote = None,
+                Some(_) => {}
+                None => quote = Some(c),
+            },
+            '#' if quote.is_none() => return &line[..i],
             _ => {}
         }
     }
     line
 }
 
+/// Strip matched surrounding quotes. No escape processing, in either style -
+/// see [`quote`] for why that is deliberate.
 fn unquote(v: &str) -> &str {
-    v.strip_prefix('"')
-        .and_then(|s| s.strip_suffix('"'))
-        .unwrap_or(v)
+    for q in ['"', '\''] {
+        if let Some(s) = v.strip_prefix(q).and_then(|s| s.strip_suffix(q)) {
+            return s;
+        }
+    }
+    v
+}
+
+/// Quote a value for writing back to the file.
+///
+/// Prefers TOML *literal* strings (single quotes), which process no escape
+/// sequences - exactly matching this parser, and the only form in which a
+/// Windows path like `C:\Users\me` is both valid TOML and round-trips
+/// unchanged. Falls back to a basic string when the value contains a single
+/// quote; callers strip double quotes beforehand so the two can never clash.
+fn quote(v: &str) -> String {
+    if v.contains('\'') {
+        format!("\"{v}\"")
+    } else {
+        format!("'{v}'")
+    }
 }
 
 fn hotkey_from(values: &HashMap<(String, String), String>) -> Option<(u32, u32)> {
@@ -308,6 +467,77 @@ mod tests {
         assert!(cfg.plugin_enabled("search"));
         assert!(cfg.general_flag("start_menu", true));
         assert!(cfg.general_flag("start_on_startup", true));
+    }
+
+    #[test]
+    fn reads_quicklink_subtables() {
+        let cfg = Config::from_text(
+            "[general]\nstart_menu = true\n\n\
+             [quicklinks.github]\nname = 'Search GitHub'\nlink = 'https://github.com/search?q={query}'\n\n\
+             [quicklinks.dl]\nname = 'Downloads'\nlink = 'C:\\Users\\me\\Downloads'\n\n\
+             [quicklinks.deep.nope]\nname = 'ignored'\n",
+        );
+        let qls = cfg.subtables("quicklinks");
+        // Sorted by slug, and the two-level section is not a quicklink.
+        assert_eq!(qls.len(), 2);
+        assert_eq!(qls[0].0, "dl");
+        assert_eq!(qls[1].0, "github");
+        assert_eq!(qls[1].1["link"], "https://github.com/search?q={query}");
+        // Literal strings keep backslashes intact.
+        assert_eq!(qls[0].1["link"], r"C:\Users\me\Downloads");
+    }
+
+    #[test]
+    fn hash_inside_a_quoted_link_is_not_a_comment() {
+        let cfg = Config::from_text("[quicklinks.x]\nlink = 'https://a.dev/docs#install'\n");
+        assert_eq!(cfg.subtables("quicklinks")[0].1["link"], "https://a.dev/docs#install");
+    }
+
+    #[test]
+    fn quicklink_upsert_replaces_only_its_own_block() {
+        let text = "# keep me\n[general]\nstart_menu = true\n\n\
+                    [quicklinks.gh]\nname = 'Old'\nlink = 'https://old'\n\n\
+                    [aliases]\nc = \"Chrome\"\n";
+        let out = upsert_section_text(
+            text,
+            "quicklinks.gh",
+            &[("name", "New"), ("link", r"C:\tools\x.exe"), ("open_with", "")],
+        );
+        assert!(out.contains("# keep me"), "comments outside the block survive");
+        assert!(out.contains("c = \"Chrome\""), "other sections survive");
+        assert!(!out.contains("Old"));
+        assert!(out.contains("name = 'New'"));
+        // Empty optional fields are omitted rather than written blank.
+        assert!(!out.contains("open_with"));
+
+        let cfg = Config::from_text(&out);
+        let qls = cfg.subtables("quicklinks");
+        assert_eq!(qls.len(), 1);
+        assert_eq!(qls[0].1["link"], r"C:\tools\x.exe");
+        assert!(cfg.general_flag("start_menu", false));
+        assert_eq!(cfg.aliases_map()["c"], "Chrome");
+    }
+
+    #[test]
+    fn quicklink_upsert_appends_when_absent_and_remove_deletes() {
+        let text = "[general]\nstart_menu = true\n";
+        let added = upsert_section_text(text, "quicklinks.new", &[("name", "N"), ("link", "L")]);
+        assert_eq!(Config::from_text(&added).subtables("quicklinks").len(), 1);
+
+        let removed = remove_section_text(&added, "quicklinks.new");
+        assert!(Config::from_text(&removed).subtables("quicklinks").is_empty());
+        assert!(Config::from_text(&removed).general_flag("start_menu", false));
+    }
+
+    #[test]
+    fn quoting_prefers_literal_strings_and_round_trips() {
+        assert_eq!(quote(r"C:\Users\me"), r"'C:\Users\me'");
+        assert_eq!(quote("Bob's Site"), "\"Bob's Site\"");
+        for v in [r"C:\a\b", "Bob's", "https://x.dev/a#b", "plain"] {
+            let line = format!("[s]\nk = {}\n", quote(v));
+            assert_eq!(Config::from_text(&line).subtables("").len(), 0);
+            assert_eq!(parse(&line)[&("s".to_string(), "k".to_string())], v);
+        }
     }
 
     #[test]

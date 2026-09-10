@@ -17,7 +17,9 @@ macro_rules! dlog {
 
 mod app;
 mod config;
+mod frecency;
 mod fuzzy;
+mod icon;
 mod plugin;
 mod plugins;
 mod render;
@@ -30,6 +32,14 @@ fn plugins(config: &config::Config) -> Vec<Box<dyn plugin::Plugin>> {
     let mut list: Vec<Box<dyn plugin::Plugin>> = Vec::new();
     if config.plugin_enabled(plugins::search::ID) {
         list.push(Box::new(plugins::search::Search::new(config.aliases_map())));
+    }
+    if config.plugin_enabled(plugins::quicklinks::ID) {
+        list.push(Box::new(plugins::quicklinks::Quicklinks::new(
+            config.subtables(plugins::quicklinks::ID),
+        )));
+    }
+    if config.plugin_enabled(plugins::commands::ID) {
+        list.push(Box::new(plugins::commands::Commands::new()));
     }
     list
 }

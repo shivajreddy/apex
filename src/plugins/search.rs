@@ -8,35 +8,27 @@
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
-use windows::Win32::Foundation::SIZE;
-use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, GetDC, GetDIBits, GetObjectW,
-    HBITMAP, ReleaseDC,
-};
 use windows::Win32::System::Com::{
     COINIT_DISABLE_OLE1DDE, COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree,
 };
 use windows::Win32::UI::Shell::{
-    BHID_EnumItems, FOLDERID_AppsFolder, IEnumShellItems, IShellItem, IShellItemImageFactory,
-    KF_FLAG_DEFAULT, SHGetKnownFolderItem, SIGDN, SIGDN_NORMALDISPLAY,
-    SIGDN_PARENTRELATIVEPARSING, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY, ShellExecuteW,
+    BHID_EnumItems, FOLDERID_AppsFolder, IEnumShellItems, IShellItem, KF_FLAG_DEFAULT,
+    SHGetKnownFolderItem, SIGDN, SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING, SIID_APPLICATION,
+    ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-use windows::core::{Interface, PCWSTR, w};
+use windows::core::{PCWSTR, w};
 
 use std::collections::HashMap;
 
-use crate::fuzzy;
+use crate::icon;
 use crate::plugin::{Action, ActionResult, Icon, Plugin, ResultItem};
+use crate::fuzzy;
 
 pub const ID: &str = "search";
 
 /// Score boost for an exact alias hit; large enough to always rank first.
 const ALIAS_BOOST: i32 = 2000;
-
-/// Icon extraction size in physical pixels (drawn at 26 DIPs, so 48px stays
-/// crisp up to ~185% scaling).
-const ICON_PX: i32 = 48;
 
 struct AppEntry {
     /// Display name as shown in the Start menu.
@@ -58,22 +50,29 @@ pub struct Search {
     aliases: HashMap<String, String>,
 }
 
+/// Scan the AppsFolder on a background thread so startup - and reloads -
+/// never block the UI.
+fn spawn_index() -> Receiver<Vec<AppEntry>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let entries = index_apps();
+        crate::dlog!(
+            "search: indexed {} apps in {:.1?}",
+            entries.len(),
+            started.elapsed()
+        );
+        // Ignored if the receiver is gone: a second reload supersedes this one.
+        let _ = tx.send(entries);
+    });
+    rx
+}
+
 impl Search {
     pub fn new(aliases: HashMap<String, String>) -> Self {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let started = std::time::Instant::now();
-            let entries = index_apps();
-            crate::dlog!(
-                "search: indexed {} apps in {:.1?}",
-                entries.len(),
-                started.elapsed()
-            );
-            let _ = tx.send(entries);
-        });
         Self {
             entries: Vec::new(),
-            pending: Some(rx),
+            pending: Some(spawn_index()),
             aliases,
         }
     }
@@ -104,6 +103,15 @@ impl Plugin for Search {
         ID
     }
 
+    fn refresh(&mut self) {
+        // Aliases come back from disk too, so editing the config by hand and
+        // reloading is enough - no restart.
+        self.aliases = crate::config::Config::load().aliases_map();
+        // The current index stays in place until the rescan lands, so the
+        // list never blinks empty.
+        self.pending = Some(spawn_index());
+    }
+
     fn query(&mut self, q: &str, out: &mut Vec<ResultItem>) {
         self.poll_index();
         let query: Vec<char> = fuzzy::fold_case(q);
@@ -116,23 +124,46 @@ impl Plugin for Search {
                 continue;
             }
             let score = fuzzy_score.unwrap_or(0) + if alias_hit { ALIAS_BOOST } else { 0 };
-            let subtitle = match alias {
-                Some(a) => format!("Application · {a}"),
-                None => "Application".to_string(),
-            };
-            out.push(ResultItem {
-                plugin: ID,
-                title: e.name.clone(),
-                subtitle,
-                payload: e.app_id.clone(),
-                score,
-                icon: e.icon.clone(),
-            });
+            out.push(make_item(e, alias, score));
         }
     }
 
-    fn activate(&mut self, item: &ResultItem) -> bool {
-        launch(&item.payload)
+    fn item_for(&mut self, payload: &str) -> Option<ResultItem> {
+        self.poll_index();
+        let e = self.entries.iter().find(|e| e.app_id == payload)?;
+        // Score is irrelevant here: the shell orders these by frecency.
+        Some(make_item(e, self.alias_of(&e.app_id), 0))
+    }
+
+    fn browse(&mut self, limit: usize, out: &mut Vec<ResultItem>) {
+        self.poll_index();
+        // `entries` is sorted by name at index time, so this pads the list
+        // alphabetically - stable and predictable, and it disappears as
+        // launch history fills the rows above it.
+        let mut added = 0;
+        for e in &self.entries {
+            if added == limit {
+                break;
+            }
+            if out
+                .iter()
+                .any(|i| i.plugin == ID && i.payload == e.app_id)
+            {
+                continue;
+            }
+            out.push(make_item(e, self.alias_of(&e.app_id), 0));
+            added += 1;
+        }
+    }
+
+    fn activate(&mut self, item: &ResultItem) -> ActionResult {
+        if launch(&item.payload) {
+            ActionResult::Close
+        } else {
+            // Leave the window up so the failure is visible rather than
+            // looking like a successful launch.
+            ActionResult::Done
+        }
     }
 
     fn actions(&self, item: &ResultItem) -> Vec<Action> {
@@ -140,6 +171,10 @@ impl Plugin for Search {
             id: "open",
             label: "Open".to_string(),
         }];
+        actions.push(Action {
+            id: "reveal",
+            label: "Open in Explorer".to_string(),
+        });
         if let Some(alias) = self.alias_of(&item.payload) {
             actions.push(Action {
                 id: "remove_alias",
@@ -159,6 +194,12 @@ impl Plugin for Search {
                 launch(&item.payload);
                 ActionResult::Close
             }
+            "reveal" => {
+                reveal(&item.payload);
+                // Dismiss, not Close: looking at where an app lives is not
+                // launching it, and shouldn't inflate its ranking.
+                ActionResult::Dismiss
+            }
             "set_alias" => ActionResult::RequestText {
                 prompt: format!("Alias for {}", item.title),
                 action_id: "set_alias",
@@ -174,7 +215,7 @@ impl Plugin for Search {
 
     fn submit_text(&mut self, action_id: &str, item: &ResultItem, text: &str) -> ActionResult {
         if action_id == "set_alias" {
-            let alias = sanitize_alias(text);
+            let alias = crate::config::sanitize_key(text);
             if !alias.is_empty() {
                 self.aliases.retain(|_, id| id != &item.payload);
                 self.aliases.insert(alias.clone(), item.payload.clone());
@@ -185,18 +226,20 @@ impl Plugin for Search {
     }
 }
 
-/// Aliases live as bare TOML keys: lowercase, spaces -> '-', keep
-/// `a-z 0-9 - _ .`, drop the rest.
-fn sanitize_alias(text: &str) -> String {
-    text.trim()
-        .to_lowercase()
-        .chars()
-        .filter_map(|c| match c {
-            'a'..='z' | '0'..='9' | '-' | '_' | '.' => Some(c),
-            ' ' => Some('-'),
-            _ => None,
-        })
-        .collect()
+/// Build a result row for an indexed app. Takes the alias rather than
+/// looking it up so callers that already resolved it don't pay twice.
+fn make_item(e: &AppEntry, alias: Option<&str>, score: i32) -> ResultItem {
+    ResultItem {
+        plugin: ID,
+        title: e.name.clone(),
+        subtitle: match alias {
+            Some(a) => format!("Application \u{b7} {a}"),
+            None => "Application".to_string(),
+        },
+        payload: e.app_id.clone(),
+        score,
+        icon: e.icon.clone(),
+    }
 }
 
 fn index_apps() -> Vec<AppEntry> {
@@ -204,8 +247,11 @@ fn index_apps() -> Vec<AppEntry> {
         // MTA: this worker never pumps messages, and STA COM without a pump
         // can deadlock inside shell calls (icon extraction did exactly that).
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE);
+        // Extracted once and shared by every entry that has no icon of its
+        // own, so the fallback costs one bitmap rather than one per app.
+        let fallback = icon::stock(SIID_APPLICATION).map(Arc::new);
         let mut out = Vec::new();
-        if let Err(e) = enum_apps_folder(&mut out) {
+        if let Err(e) = enum_apps_folder(&mut out, fallback.as_ref()) {
             crate::dlog!("search: AppsFolder enumeration failed: {e}");
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -214,7 +260,10 @@ fn index_apps() -> Vec<AppEntry> {
     }
 }
 
-unsafe fn enum_apps_folder(out: &mut Vec<AppEntry>) -> windows::core::Result<()> {
+unsafe fn enum_apps_folder(
+    out: &mut Vec<AppEntry>,
+    fallback: Option<&Arc<Icon>>,
+) -> windows::core::Result<()> {
     unsafe {
         let folder: IShellItem = SHGetKnownFolderItem(&FOLDERID_AppsFolder, KF_FLAG_DEFAULT, None)?;
         let items: IEnumShellItems = folder.BindToHandler(None, &BHID_EnumItems)?;
@@ -239,83 +288,14 @@ unsafe fn enum_apps_folder(out: &mut Vec<AppEntry>) -> windows::core::Result<()>
                     name_folded: fuzzy::fold_case(&name),
                     bonus: fuzzy::bonuses(&name),
                     app_id,
-                    icon: extract_icon(item).map(Arc::new),
+                    icon: icon::from_shell_item(item)
+                        .map(Arc::new)
+                        .or_else(|| fallback.cloned()),
                     name,
                 });
             }
         }
         Ok(())
-    }
-}
-
-/// Shell-provided icon for an AppsFolder item (works for both desktop and
-/// packaged apps). Returns premultiplied BGRA pixels.
-fn extract_icon(item: &IShellItem) -> Option<Icon> {
-    unsafe {
-        let factory: IShellItemImageFactory = item.cast().ok()?;
-        let hbmp = factory
-            .GetImage(
-                SIZE {
-                    cx: ICON_PX,
-                    cy: ICON_PX,
-                },
-                SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK,
-            )
-            .ok()?;
-        let icon = hbitmap_to_icon(hbmp);
-        let _ = windows::Win32::Graphics::Gdi::DeleteObject(hbmp.into());
-        icon
-    }
-}
-
-unsafe fn hbitmap_to_icon(hbmp: HBITMAP) -> Option<Icon> {
-    unsafe {
-        let mut bm = BITMAP::default();
-        if GetObjectW(
-            hbmp.into(),
-            size_of::<BITMAP>() as i32,
-            Some(&mut bm as *mut _ as *mut core::ffi::c_void),
-        ) == 0
-        {
-            return None;
-        }
-        let (w, h) = (bm.bmWidth, bm.bmHeight);
-        if w <= 0 || h <= 0 {
-            return None;
-        }
-
-        let mut info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: w,
-                biHeight: -h, // top-down
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut bgra = vec![0u8; (w * h * 4) as usize];
-        let hdc = GetDC(None);
-        let lines = GetDIBits(
-            hdc,
-            hbmp,
-            0,
-            h as u32,
-            Some(bgra.as_mut_ptr() as *mut core::ffi::c_void),
-            &mut info,
-            DIB_RGB_COLORS,
-        );
-        ReleaseDC(None, hdc);
-        if lines == 0 {
-            return None;
-        }
-        Some(Icon {
-            width: w as u32,
-            height: h as u32,
-            bgra,
-        })
     }
 }
 
@@ -325,6 +305,50 @@ unsafe fn display_name(item: &IShellItem, kind: SIGDN) -> windows::core::Result<
         let s = pw.to_string().unwrap_or_default();
         CoTaskMemFree(Some(pw.0 as *const _));
         Ok(s)
+    }
+}
+
+/// Show in Explorer where an entry came from.
+///
+/// Desktop apps carry a real filesystem path as their AppsFolder parsing
+/// name, so the file gets selected in its folder. Packaged apps only have an
+/// AppUserModelID and no file to point at, so fall back to the shell's
+/// Applications folder - the very list apex indexes.
+fn reveal(app_id: &str) -> bool {
+    let is_path = std::path::Path::new(app_id).exists();
+    let param: Vec<u16> = if is_path {
+        format!("/select,\"{app_id}\"")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    unsafe {
+        let inst = if is_path {
+            ShellExecuteW(
+                None,
+                w!("open"),
+                w!("explorer.exe"),
+                PCWSTR(param.as_ptr()),
+                None,
+                SW_SHOWNORMAL,
+            )
+        } else {
+            ShellExecuteW(
+                None,
+                w!("open"),
+                w!("shell:AppsFolder"),
+                None,
+                None,
+                SW_SHOWNORMAL,
+            )
+        };
+        let ok = inst.0 as isize > 32;
+        if !ok {
+            crate::dlog!("search: failed to reveal {app_id}");
+        }
+        ok
     }
 }
 
