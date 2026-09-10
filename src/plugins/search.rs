@@ -24,10 +24,15 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{Interface, PCWSTR, w};
 
+use std::collections::HashMap;
+
 use crate::fuzzy;
-use crate::plugin::{Icon, Plugin, ResultItem};
+use crate::plugin::{Action, ActionResult, Icon, Plugin, ResultItem};
 
 pub const ID: &str = "search";
+
+/// Score boost for an exact alias hit; large enough to always rank first.
+const ALIAS_BOOST: i32 = 2000;
 
 /// Icon extraction size in physical pixels (drawn at 26 DIPs, so 48px stays
 /// crisp up to ~185% scaling).
@@ -48,10 +53,13 @@ struct AppEntry {
 pub struct Search {
     entries: Vec<AppEntry>,
     pending: Option<Receiver<Vec<AppEntry>>>,
+    /// alias (case-folded) -> app id. Loaded from `[aliases]`, updated by
+    /// the Set/Remove Alias actions (which also write the config file).
+    aliases: HashMap<String, String>,
 }
 
 impl Search {
-    pub fn new() -> Self {
+    pub fn new(aliases: HashMap<String, String>) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let started = std::time::Instant::now();
@@ -66,7 +74,15 @@ impl Search {
         Self {
             entries: Vec::new(),
             pending: Some(rx),
+            aliases,
         }
+    }
+
+    fn alias_of(&self, app_id: &str) -> Option<&str> {
+        self.aliases
+            .iter()
+            .find(|(_, id)| id.as_str() == app_id)
+            .map(|(a, _)| a.as_str())
     }
 
     /// Swap in the index once the background scan finishes.
@@ -91,23 +107,96 @@ impl Plugin for Search {
     fn query(&mut self, q: &str, out: &mut Vec<ResultItem>) {
         self.poll_index();
         let query: Vec<char> = fuzzy::fold_case(q);
+        let query_str: String = query.iter().collect();
         for e in &self.entries {
-            if let Some(score) = fuzzy::score(&query, &e.name_folded, &e.bonus) {
-                out.push(ResultItem {
-                    plugin: ID,
-                    title: e.name.clone(),
-                    subtitle: "Application".into(),
-                    payload: e.app_id.clone(),
-                    score,
-                    icon: e.icon.clone(),
-                });
+            let alias = self.alias_of(&e.app_id);
+            let alias_hit = alias == Some(query_str.as_str());
+            let fuzzy_score = fuzzy::score(&query, &e.name_folded, &e.bonus);
+            if fuzzy_score.is_none() && !alias_hit {
+                continue;
             }
+            let score = fuzzy_score.unwrap_or(0) + if alias_hit { ALIAS_BOOST } else { 0 };
+            let subtitle = match alias {
+                Some(a) => format!("Application · {a}"),
+                None => "Application".to_string(),
+            };
+            out.push(ResultItem {
+                plugin: ID,
+                title: e.name.clone(),
+                subtitle,
+                payload: e.app_id.clone(),
+                score,
+                icon: e.icon.clone(),
+            });
         }
     }
 
     fn activate(&mut self, item: &ResultItem) -> bool {
         launch(&item.payload)
     }
+
+    fn actions(&self, item: &ResultItem) -> Vec<Action> {
+        let mut actions = vec![Action {
+            id: "open",
+            label: "Open".to_string(),
+        }];
+        if let Some(alias) = self.alias_of(&item.payload) {
+            actions.push(Action {
+                id: "remove_alias",
+                label: format!("Remove Alias \u{201c}{alias}\u{201d}"),
+            });
+        }
+        actions.push(Action {
+            id: "set_alias",
+            label: "Set Alias\u{2026}".to_string(),
+        });
+        actions
+    }
+
+    fn run_action(&mut self, action_id: &str, item: &ResultItem) -> ActionResult {
+        match action_id {
+            "open" => {
+                launch(&item.payload);
+                ActionResult::Close
+            }
+            "set_alias" => ActionResult::RequestText {
+                prompt: format!("Alias for {}", item.title),
+                action_id: "set_alias",
+            },
+            "remove_alias" => {
+                self.aliases.retain(|_, id| id != &item.payload);
+                crate::config::remove_alias_file(&item.payload);
+                ActionResult::Done
+            }
+            _ => ActionResult::Done,
+        }
+    }
+
+    fn submit_text(&mut self, action_id: &str, item: &ResultItem, text: &str) -> ActionResult {
+        if action_id == "set_alias" {
+            let alias = sanitize_alias(text);
+            if !alias.is_empty() {
+                self.aliases.retain(|_, id| id != &item.payload);
+                self.aliases.insert(alias.clone(), item.payload.clone());
+                crate::config::upsert_alias_file(&alias, &item.payload);
+            }
+        }
+        ActionResult::Done
+    }
+}
+
+/// Aliases live as bare TOML keys: lowercase, spaces -> '-', keep
+/// `a-z 0-9 - _ .`, drop the rest.
+fn sanitize_alias(text: &str) -> String {
+    text.trim()
+        .to_lowercase()
+        .chars()
+        .filter_map(|c| match c {
+            'a'..='z' | '0'..='9' | '-' | '_' | '.' => Some(c),
+            ' ' => Some('-'),
+            _ => None,
+        })
+        .collect()
 }
 
 fn index_apps() -> Vec<AppEntry> {

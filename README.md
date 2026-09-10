@@ -49,3 +49,11 @@ search = true            # disabled plugins are never constructed: zero cost
 
 Changes take effect on restart. Disabling a `[general]` flag removes its
 registration (shortcut / Run key) on the next launch.
+
+## Known limitations
+
+While an **elevated** window (e.g. Task Manager) has focus, Windows UIPI
+hides keyboard input from non-elevated apps: the hotkey falls through to
+the shell and Apex cannot take focus. Running Apex elevated avoids this
+entirely; an opt-in `run_as_admin` setting (elevated logon task) is
+planned.

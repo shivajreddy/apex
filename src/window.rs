@@ -21,7 +21,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 
-use crate::app::App;
+use crate::app::{App, Mode, UiOutcome};
 use crate::render;
 
 const CARET_TIMER_ID: usize = 1;
@@ -41,10 +41,6 @@ static HOOK_VK: AtomicU32 = AtomicU32::new(0);
 static HOOK_HELD: AtomicBool = AtomicBool::new(false);
 /// Window is currently shown.
 static VISIBLE: AtomicBool = AtomicBool::new(false);
-/// Window is the active (foreground) window. Can be false while VISIBLE if
-/// activation was denied (e.g. shown over an elevated window, where UIPI
-/// blocks every foreground trick) - dismissal then falls to the hooks.
-static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Mouse hook handle; installed only while the window is visible.
 static MOUSE_HOOK: AtomicIsize = AtomicIsize::new(0);
 
@@ -213,16 +209,20 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
                 }
             }
 
-            // Typing that lands elsewhere while we're shown-but-inactive
-            // (activation denied over an elevated window) means the user is
-            // interacting outside Apex: dismiss. Modifier keys are ignored
-            // so the toggle chord itself doesn't dismiss-then-retoggle.
+            // Typing that lands elsewhere while we're shown means the user is
+            // interacting outside Apex (activation can be denied over an
+            // elevated window): dismiss. Foreground is checked live rather
+            // than cached - activation state updates asynchronously, and a
+            // stale flag here silently dismissed the window mid-typing.
+            // Modifier keys are ignored so the toggle chord doesn't
+            // dismiss-then-retoggle.
             if is_down
                 && VISIBLE.load(Relaxed)
-                && !ACTIVE.load(Relaxed)
                 && !is_modifier_vk(info.vkCode)
+                && GetForegroundWindow() != hwnd
             {
-                let _ = PostMessageW(Some(hwnd), WM_APP_DISMISS, WPARAM(0), LPARAM(0));
+                crate::dlog!("dismiss: key {:#x} went elsewhere", info.vkCode);
+                let _ = PostMessageW(Some(hwnd), WM_APP_DISMISS, WPARAM(1), LPARAM(0));
             }
         }
         CallNextHookEx(None, code, wparam, lparam)
@@ -245,7 +245,8 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
                         let outside =
                             p.x < rc.left || p.x >= rc.right || p.y < rc.top || p.y >= rc.bottom;
                         if outside {
-                            let _ = PostMessageW(Some(hwnd), WM_APP_DISMISS, WPARAM(0), LPARAM(0));
+                            crate::dlog!("dismiss: click outside at ({},{})", p.x, p.y);
+                            let _ = PostMessageW(Some(hwnd), WM_APP_DISMISS, WPARAM(2), LPARAM(0));
                         }
                     }
                 }
@@ -292,6 +293,7 @@ unsafe extern "system" fn wndproc(
                 LRESULT(0)
             }
             WM_APP_DISMISS => {
+                crate::dlog!("WM_APP_DISMISS (visible={})", IsWindowVisible(hwnd).as_bool());
                 if IsWindowVisible(hwnd).as_bool() {
                     hide(hwnd);
                 }
@@ -335,10 +337,25 @@ unsafe extern "system" fn wndproc(
                 let _ = BeginPaint(hwnd, &mut ps);
                 if let Some(app) = app_mut(hwnd) {
                     if app.ensure_renderer().is_some() {
-                        let (query, caret, selected) =
-                            (&app.query, app.caret_visible, app.selected);
+                        let panel = match &app.mode {
+                            Mode::Search => None,
+                            Mode::Actions { actions, selected } => Some(render::PanelView::Actions {
+                                actions,
+                                selected: *selected,
+                            }),
+                            Mode::TextInput { prompt, buffer, .. } => {
+                                Some(render::PanelView::TextInput { prompt, buffer })
+                            }
+                        };
+                        let frame = render::Frame {
+                            query: &app.query,
+                            caret_visible: app.caret_visible,
+                            results: &app.results,
+                            selected: app.selected,
+                            panel,
+                        };
                         if let Some(r) = app.renderer.as_mut() {
-                            r.draw(hwnd, query, caret, &app.results, selected);
+                            r.draw(hwnd, &frame);
                         }
                     }
                 }
@@ -349,10 +366,7 @@ unsafe extern "system" fn wndproc(
             // Dismiss when the window loses focus (click elsewhere), Raycast-style.
             WM_ACTIVATE => {
                 if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
-                    ACTIVE.store(false, Relaxed);
                     hide(hwnd);
-                } else {
-                    ACTIVE.store(true, Relaxed);
                 }
                 LRESULT(0)
             }
@@ -369,53 +383,150 @@ unsafe extern "system" fn wndproc(
     }
 }
 
+/// Which mode the app is in, without holding a borrow.
+#[derive(PartialEq, Clone, Copy)]
+enum ModeKind {
+    Search,
+    Actions,
+    TextInput,
+}
+
+unsafe fn mode_kind(hwnd: HWND) -> ModeKind {
+    unsafe {
+        match app_mut(hwnd).map(|a| &a.mode) {
+            Some(Mode::Actions { .. }) => ModeKind::Actions,
+            Some(Mode::TextInput { .. }) => ModeKind::TextInput,
+            _ => ModeKind::Search,
+        }
+    }
+}
+
 unsafe fn on_keydown(hwnd: HWND, key: VIRTUAL_KEY) {
     unsafe {
         let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
-        match key {
-            VK_ESCAPE => hide(hwnd),
-            // Ctrl+Q quits entirely (dev convenience until a tray icon exists).
-            VK_Q if ctrl => {
-                let _ = DestroyWindow(hwnd);
-            }
-            VK_DOWN => {
-                if let Some(app) = app_mut(hwnd) {
-                    app.move_selection(1);
+
+        // Ctrl+Q quits entirely (dev convenience until a tray icon exists).
+        if key == VK_Q && ctrl {
+            let _ = DestroyWindow(hwnd);
+            return;
+        }
+
+        match mode_kind(hwnd) {
+            ModeKind::Search => match key {
+                VK_ESCAPE => hide(hwnd),
+                VK_K if ctrl => {
+                    if app_mut(hwnd).map(|a| a.open_actions()).unwrap_or(false) {
+                        invalidate(hwnd);
+                    }
                 }
-                invalidate(hwnd);
-            }
-            VK_UP => {
-                if let Some(app) = app_mut(hwnd) {
-                    app.move_selection(-1);
+                VK_DOWN => {
+                    if let Some(app) = app_mut(hwnd) {
+                        app.move_selection(1);
+                    }
+                    invalidate(hwnd);
                 }
-                invalidate(hwnd);
-            }
-            VK_RETURN => {
-                let close = app_mut(hwnd).map(|a| a.activate_selected()).unwrap_or(false);
-                if close {
-                    hide(hwnd);
+                VK_UP => {
+                    if let Some(app) = app_mut(hwnd) {
+                        app.move_selection(-1);
+                    }
+                    invalidate(hwnd);
                 }
-            }
-            _ => {}
+                VK_RETURN => {
+                    let close = app_mut(hwnd).map(|a| a.activate_selected()).unwrap_or(false);
+                    if close {
+                        hide(hwnd);
+                    }
+                }
+                _ => {}
+            },
+            ModeKind::Actions => match key {
+                VK_ESCAPE => {
+                    if let Some(app) = app_mut(hwnd) {
+                        app.close_panel();
+                    }
+                    invalidate(hwnd);
+                }
+                VK_K if ctrl => {
+                    if let Some(app) = app_mut(hwnd) {
+                        app.close_panel();
+                    }
+                    invalidate(hwnd);
+                }
+                VK_DOWN => {
+                    if let Some(app) = app_mut(hwnd) {
+                        app.panel_move(1);
+                    }
+                    invalidate(hwnd);
+                }
+                VK_UP => {
+                    if let Some(app) = app_mut(hwnd) {
+                        app.panel_move(-1);
+                    }
+                    invalidate(hwnd);
+                }
+                VK_RETURN => {
+                    let outcome = app_mut(hwnd)
+                        .map(|a| a.run_panel_action())
+                        .unwrap_or(UiOutcome::Stay);
+                    if outcome == UiOutcome::Hide {
+                        hide(hwnd);
+                    } else {
+                        resize_to_content(hwnd);
+                        invalidate(hwnd);
+                    }
+                }
+                _ => {}
+            },
+            ModeKind::TextInput => match key {
+                VK_ESCAPE => {
+                    if let Some(app) = app_mut(hwnd) {
+                        app.close_panel();
+                    }
+                    invalidate(hwnd);
+                }
+                VK_RETURN => {
+                    let outcome = app_mut(hwnd)
+                        .map(|a| a.submit_text_input())
+                        .unwrap_or(UiOutcome::Stay);
+                    if outcome == UiOutcome::Hide {
+                        hide(hwnd);
+                    } else {
+                        resize_to_content(hwnd);
+                        invalidate(hwnd);
+                    }
+                }
+                _ => {}
+            },
         }
     }
 }
 
 unsafe fn on_char(hwnd: HWND, unit: u16) {
     unsafe {
-        let changed = match unit {
-            0x08 => app_mut(hwnd).map(|a| a.backspace(false)).unwrap_or(false),
-            0x7F => app_mut(hwnd).map(|a| a.backspace(true)).unwrap_or(false),
-            u if u >= 0x20 => app_mut(hwnd).map(|a| a.insert_utf16(u)).unwrap_or(false),
-            _ => false,
-        };
-        if changed {
-            if let Some(app) = app_mut(hwnd) {
-                app.caret_visible = true;
+        match mode_kind(hwnd) {
+            ModeKind::Search => {
+                let changed = match unit {
+                    0x08 => app_mut(hwnd).map(|a| a.backspace(false)).unwrap_or(false),
+                    0x7F => app_mut(hwnd).map(|a| a.backspace(true)).unwrap_or(false),
+                    u if u >= 0x20 => app_mut(hwnd).map(|a| a.insert_utf16(u)).unwrap_or(false),
+                    _ => false,
+                };
+                if changed {
+                    if let Some(app) = app_mut(hwnd) {
+                        app.caret_visible = true;
+                    }
+                    SetTimer(Some(hwnd), CARET_TIMER_ID, CARET_BLINK_MS, None);
+                    resize_to_content(hwnd);
+                    invalidate(hwnd);
+                }
             }
-            SetTimer(Some(hwnd), CARET_TIMER_ID, CARET_BLINK_MS, None);
-            resize_to_content(hwnd);
-            invalidate(hwnd);
+            ModeKind::TextInput => {
+                if let Some(app) = app_mut(hwnd) {
+                    app.text_input_char(unit);
+                }
+                invalidate(hwnd);
+            }
+            ModeKind::Actions => {}
         }
     }
 }
@@ -469,7 +580,6 @@ unsafe fn show(hwnd: HWND) {
         VISIBLE.store(true, Relaxed);
         force_foreground(hwnd);
         let _ = SetFocus(Some(hwnd));
-        ACTIVE.store(GetForegroundWindow() == hwnd, Relaxed);
 
         // Outside-click dismissal, active only while shown.
         if MOUSE_HOOK.load(Relaxed) == 0 {
@@ -517,8 +627,13 @@ unsafe fn resize_to_content(hwnd: HWND) {
 /// blocked unless the process received the last input), and the keyboard
 /// hook posts to us from outside any input grant. Ladder:
 /// 1. plain SetForegroundWindow
-/// 2. AttachThreadInput to the current foreground thread, then retry
-/// 3. synthetic no-op Alt tap to earn the input grant, then retry
+/// 2. drop the foreground lock timeout, then AttachThreadInput to the
+///    current foreground thread and retry (restoring the timeout after)
+///
+/// Deliberately never injects synthetic keystrokes: the classic "tap Alt to
+/// earn focus" trick fires a real key event that lands in whatever window is
+/// focused - with Ctrl held (as during Ctrl+Esc) it reads as AltGr and can
+/// emit a stray character into the query.
 unsafe fn force_foreground(hwnd: HWND) {
     unsafe {
         if SetForegroundWindow(hwnd).as_bool() && GetForegroundWindow() == hwnd {
@@ -526,33 +641,55 @@ unsafe fn force_foreground(hwnd: HWND) {
         }
 
         use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+
+        // Remember and clear the foreground lock timeout.
+        let mut prev: u32 = 0;
+        let _ = SystemParametersInfoW(
+            SPI_GETFOREGROUNDLOCKTIMEOUT,
+            0,
+            Some(&mut prev as *mut u32 as *mut core::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+        let _ = SystemParametersInfoW(
+            SPI_SETFOREGROUNDLOCKTIMEOUT,
+            0,
+            Some(std::ptr::null_mut()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+
         let fg = GetForegroundWindow();
         let our_tid = GetCurrentThreadId();
-        if !fg.is_invalid() {
-            let fg_tid = GetWindowThreadProcessId(fg, None);
-            if fg_tid != 0 && fg_tid != our_tid {
-                let _ = AttachThreadInput(our_tid, fg_tid, true);
-                let _ = BringWindowToTop(hwnd);
-                let _ = SetForegroundWindow(hwnd);
-                let _ = AttachThreadInput(our_tid, fg_tid, false);
-                if GetForegroundWindow() == hwnd {
-                    return;
-                }
-            }
+        let fg_tid = if fg.is_invalid() {
+            0
+        } else {
+            GetWindowThreadProcessId(fg, None)
+        };
+        let attached = fg_tid != 0 && fg_tid != our_tid;
+        if attached {
+            let _ = AttachThreadInput(our_tid, fg_tid, true);
+        }
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetForegroundWindow(hwnd);
+        if attached {
+            let _ = AttachThreadInput(our_tid, fg_tid, false);
         }
 
-        // Last resort: an Alt tap updates the last-input state to us,
-        // releasing the foreground lock for the next call.
-        keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_EXTENDEDKEY, 0);
-        keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0);
-        let _ = SetForegroundWindow(hwnd);
+        let _ = SystemParametersInfoW(
+            SPI_SETFOREGROUNDLOCKTIMEOUT,
+            0,
+            Some(prev as usize as *mut core::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+        crate::dlog!(
+            "force_foreground: lock_timeout={prev} attached={attached} fg_tid={fg_tid} our_tid={our_tid} won={}",
+            GetForegroundWindow() == hwnd
+        );
     }
 }
 
 unsafe fn hide(hwnd: HWND) {
     unsafe {
         VISIBLE.store(false, Relaxed);
-        ACTIVE.store(false, Relaxed);
         let mouse = MOUSE_HOOK.swap(0, Relaxed);
         if mouse != 0 {
             let _ = UnhookWindowsHookEx(HHOOK(mouse as *mut core::ffi::c_void));

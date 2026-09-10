@@ -13,7 +13,7 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::core::*;
 
-use crate::plugin::{Icon, ResultItem};
+use crate::plugin::{Action, Icon, ResultItem};
 
 // ---- layout (logical DIPs) ----
 pub const WINDOW_WIDTH: f32 = 680.0;
@@ -24,14 +24,40 @@ const PAD_X: f32 = 20.0;
 const SEL_MARGIN: f32 = 8.0;
 const ICON_SIZE: f32 = 26.0;
 const ICON_GAP: f32 = 12.0;
+const BAR_H: f32 = 34.0;
+const PANEL_W: f32 = 300.0;
+const PANEL_ROW: f32 = 32.0;
+const PANEL_PAD: f32 = 6.0;
+const PANEL_MARGIN: f32 = 8.0;
 
 /// Total window height for `n` result rows.
 pub fn content_height(n: usize) -> f32 {
     if n == 0 {
         INPUT_H
     } else {
-        INPUT_H + 1.0 + LIST_PAD * 2.0 + ROW_H * n as f32
+        INPUT_H + 1.0 + LIST_PAD * 2.0 + ROW_H * n as f32 + BAR_H
     }
+}
+
+/// Everything the renderer needs for one frame.
+pub struct Frame<'a> {
+    pub query: &'a str,
+    pub caret_visible: bool,
+    pub results: &'a [ResultItem],
+    pub selected: usize,
+    pub panel: Option<PanelView<'a>>,
+}
+
+/// Overlay state (actions panel or text input), anchored bottom-right.
+pub enum PanelView<'a> {
+    Actions {
+        actions: &'a [Action],
+        selected: usize,
+    },
+    TextInput {
+        prompt: &'a str,
+        buffer: &'a str,
+    },
 }
 
 // ---- theme ----
@@ -49,6 +75,7 @@ const COL_TEXT: D2D1_COLOR_F = rgba(0xF2F2F2, 1.0);
 const COL_DIM: D2D1_COLOR_F = rgba(0xF2F2F2, 0.35);
 const COL_FAINT: D2D1_COLOR_F = rgba(0xFFFFFF, 0.07);
 const COL_SELECT: D2D1_COLOR_F = rgba(0xFFFFFF, 0.08);
+const COL_PANEL: D2D1_COLOR_F = rgba(0x2A2A2E, 1.0);
 
 pub struct Renderer {
     dwrite: IDWriteFactory,
@@ -56,6 +83,8 @@ pub struct Renderer {
     fmt_input: IDWriteTextFormat,
     fmt_title: IDWriteTextFormat,
     fmt_subtitle: IDWriteTextFormat,
+    fmt_subtitle_left: IDWriteTextFormat,
+    fmt_panel: IDWriteTextFormat,
     target: Option<Target>,
 }
 
@@ -66,6 +95,7 @@ struct Target {
     dim: ID2D1SolidColorBrush,
     faint: ID2D1SolidColorBrush,
     select: ID2D1SolidColorBrush,
+    panel: ID2D1SolidColorBrush,
     /// D2D copies of plugin icons, keyed by the Arc's data address.
     /// Dropped with the target (i.e. every hide), so it stays small.
     icons: HashMap<usize, ID2D1Bitmap>,
@@ -96,6 +126,10 @@ impl Renderer {
             let fmt_subtitle = make(12.0, DWRITE_FONT_WEIGHT_NORMAL)?;
             fmt_subtitle.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
             fmt_subtitle.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
+            let fmt_subtitle_left = make(12.0, DWRITE_FONT_WEIGHT_NORMAL)?;
+            fmt_subtitle_left.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            let fmt_panel = make(14.0, DWRITE_FONT_WEIGHT_NORMAL)?;
+            fmt_panel.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
 
             Ok(Self {
                 d2d,
@@ -103,6 +137,8 @@ impl Renderer {
                 fmt_input,
                 fmt_title,
                 fmt_subtitle,
+                fmt_subtitle_left,
+                fmt_panel,
                 target: None,
             })
         }
@@ -150,6 +186,7 @@ impl Renderer {
                 dim: brush(&COL_DIM)?,
                 faint: brush(&COL_FAINT)?,
                 select: brush(&COL_SELECT)?,
+                panel: brush(&COL_PANEL)?,
                 icons: HashMap::new(),
                 rt,
             });
@@ -173,15 +210,17 @@ impl Renderer {
 
     /// Width of `text` in DIPs when rendered with the input font.
     fn measure_input(&self, text: &str) -> f32 {
+        self.measure(&self.fmt_input, text)
+    }
+
+    /// Width of `text` in DIPs when rendered with `format`.
+    fn measure(&self, format: &IDWriteTextFormat, text: &str) -> f32 {
         if text.is_empty() {
             return 0.0;
         }
         unsafe {
             let units: Vec<u16> = text.encode_utf16().collect();
-            let Ok(layout) = self
-                .dwrite
-                .CreateTextLayout(&units, &self.fmt_input, 8192.0, INPUT_H)
-            else {
+            let Ok(layout) = self.dwrite.CreateTextLayout(&units, format, 8192.0, 512.0) else {
                 return 0.0;
             };
             let mut m = DWRITE_TEXT_METRICS::default();
@@ -192,25 +231,35 @@ impl Renderer {
         }
     }
 
-    pub fn draw(
-        &mut self,
-        hwnd: HWND,
-        query: &str,
-        caret_visible: bool,
-        results: &[ResultItem],
-        selected: usize,
-    ) {
+    pub fn draw(&mut self, hwnd: HWND, frame: &Frame) {
+        let Frame {
+            query,
+            caret_visible,
+            results,
+            selected,
+            panel,
+        } = frame;
+        let (query, selected) = (*query, *selected);
         unsafe {
             if self.ensure_target(hwnd).is_err() {
                 return;
             }
             let caret_x = PAD_X + self.measure_input(query) + 1.0;
+            let text_input_caret = match panel {
+                Some(PanelView::TextInput { prompt, buffer }) => Some((
+                    self.measure(&self.fmt_title, prompt),
+                    self.measure(&self.fmt_title, buffer),
+                )),
+                _ => None,
+            };
             let t = self.target.as_mut().unwrap();
             let rt = &t.rt;
 
             rt.BeginDraw();
             rt.Clear(Some(&COL_BG));
-            let width = rt.GetSize().width;
+            let size = rt.GetSize();
+            let width = size.width;
+            let height = size.height;
 
             // Search input (query text or placeholder).
             let input_rect = D2D_RECT_F {
@@ -226,7 +275,7 @@ impl Renderer {
             }
 
             // Caret.
-            if caret_visible {
+            if *caret_visible && panel.is_none() {
                 let mid = INPUT_H / 2.0;
                 rt.FillRectangle(
                     &D2D_RECT_F {
@@ -302,6 +351,114 @@ impl Renderer {
                         draw_text(rt, &item.subtitle, &self.fmt_subtitle, &row, &t.dim);
                     }
                     y += ROW_H;
+                }
+
+                // Bottom bar with key hints.
+                let bar_top = height - BAR_H;
+                rt.FillRectangle(
+                    &D2D_RECT_F {
+                        left: 0.0,
+                        top: bar_top,
+                        right: width,
+                        bottom: bar_top + 1.0,
+                    },
+                    &t.faint,
+                );
+                let bar_rect = D2D_RECT_F {
+                    left: PAD_X,
+                    top: bar_top,
+                    right: width - PAD_X,
+                    bottom: height,
+                };
+                draw_text(rt, "Apex", &self.fmt_subtitle_left, &bar_rect, &t.dim);
+                draw_text(
+                    rt,
+                    "Open \u{21b5}      Actions Ctrl+K",
+                    &self.fmt_subtitle,
+                    &bar_rect,
+                    &t.dim,
+                );
+
+                // Overlay panel (actions / text input), bottom-right.
+                if let Some(view) = panel {
+                    let rows = match view {
+                        PanelView::Actions { actions, .. } => actions.len().max(1) as f32,
+                        PanelView::TextInput { .. } => 1.0,
+                    };
+                    let panel_h = rows * PANEL_ROW + PANEL_PAD * 2.0;
+                    let rect = D2D_RECT_F {
+                        left: width - PANEL_MARGIN - PANEL_W,
+                        top: height - BAR_H - PANEL_MARGIN - panel_h,
+                        right: width - PANEL_MARGIN,
+                        bottom: height - BAR_H - PANEL_MARGIN,
+                    };
+                    rt.FillRoundedRectangle(
+                        &D2D1_ROUNDED_RECT {
+                            rect,
+                            radiusX: 10.0,
+                            radiusY: 10.0,
+                        },
+                        &t.panel,
+                    );
+
+                    match view {
+                        PanelView::Actions { actions, selected } => {
+                            let mut ay = rect.top + PANEL_PAD;
+                            for (i, action) in actions.iter().enumerate() {
+                                let row = D2D_RECT_F {
+                                    left: rect.left + PANEL_PAD,
+                                    top: ay,
+                                    right: rect.right - PANEL_PAD,
+                                    bottom: ay + PANEL_ROW,
+                                };
+                                if i == *selected {
+                                    rt.FillRoundedRectangle(
+                                        &D2D1_ROUNDED_RECT {
+                                            rect: row,
+                                            radiusX: 6.0,
+                                            radiusY: 6.0,
+                                        },
+                                        &t.select,
+                                    );
+                                }
+                                let label_rect = D2D_RECT_F {
+                                    left: row.left + 10.0,
+                                    right: row.right - 10.0,
+                                    ..row
+                                };
+                                draw_text(rt, &action.label, &self.fmt_panel, &label_rect, &t.text);
+                                ay += PANEL_ROW;
+                            }
+                        }
+                        PanelView::TextInput { prompt, buffer } => {
+                            let row = D2D_RECT_F {
+                                left: rect.left + PANEL_PAD + 10.0,
+                                top: rect.top + PANEL_PAD,
+                                right: rect.right - PANEL_PAD - 10.0,
+                                bottom: rect.bottom - PANEL_PAD,
+                            };
+                            let prompt_text = format!("{prompt}: ");
+                            draw_text(rt, &prompt_text, &self.fmt_panel, &row, &t.dim);
+                            if let Some((pw, bw)) = text_input_caret {
+                                let text_rect = D2D_RECT_F {
+                                    left: row.left + pw + 8.0,
+                                    ..row
+                                };
+                                draw_text(rt, buffer, &self.fmt_panel, &text_rect, &t.text);
+                                let cx = text_rect.left + bw + 1.0;
+                                let mid = (row.top + row.bottom) / 2.0;
+                                rt.FillRectangle(
+                                    &D2D_RECT_F {
+                                        left: cx,
+                                        top: mid - 9.0,
+                                        right: cx + 1.5,
+                                        bottom: mid + 9.0,
+                                    },
+                                    &t.text,
+                                );
+                            }
+                        }
+                    }
                 }
             }
 

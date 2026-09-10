@@ -29,7 +29,7 @@ mod window;
 fn plugins(config: &config::Config) -> Vec<Box<dyn plugin::Plugin>> {
     let mut list: Vec<Box<dyn plugin::Plugin>> = Vec::new();
     if config.plugin_enabled(plugins::search::ID) {
-        list.push(Box::new(plugins::search::Search::new()));
+        list.push(Box::new(plugins::search::Search::new(config.aliases_map())));
     }
     list
 }

@@ -71,6 +71,105 @@ impl Config {
             None => default,
         }
     }
+
+    /// `[aliases]` entries: alias (lowercased by the parser) -> app id.
+    pub fn aliases_map(&self) -> HashMap<String, String> {
+        self.values
+            .iter()
+            .filter(|((section, _), _)| section == "aliases")
+            .map(|((_, alias), app_id)| (alias.clone(), app_id.clone()))
+            .collect()
+    }
+}
+
+// ---- alias write-back -------------------------------------------------
+//
+// The config file is user-owned (often symlinked into dotfiles), so writes
+// are line-surgery on the `[aliases]` section only; everything else,
+// including comments, is preserved byte-for-byte.
+
+/// Insert or replace an alias line. Removes any previous line with the same
+/// alias or the same app id (one alias per app).
+fn upsert_alias_text(text: &str, alias: &str, app_id: &str) -> String {
+    let mut lines = drop_alias_lines(text, |k, v| k == alias || v == app_id);
+    let new_line = format!("{alias} = \"{app_id}\"");
+    match alias_section_end(&lines) {
+        Some(idx) => lines.insert(idx, new_line),
+        None => {
+            if !lines.last().is_none_or(|l| l.trim().is_empty()) {
+                lines.push(String::new());
+            }
+            lines.push("[aliases]".to_string());
+            lines.push(new_line);
+        }
+    }
+    join_lines(lines)
+}
+
+/// Remove every alias pointing at `app_id`.
+fn remove_alias_text(text: &str, app_id: &str) -> String {
+    join_lines(drop_alias_lines(text, |_, v| v == app_id))
+}
+
+/// Lines of `text` minus `[aliases]` entries matching `drop(key, value)`.
+fn drop_alias_lines(text: &str, drop: impl Fn(&str, &str) -> bool) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_aliases = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(name) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            in_aliases = name.trim().eq_ignore_ascii_case("aliases");
+        } else if in_aliases {
+            if let Some((k, v)) = trimmed.split_once('=') {
+                if drop(&k.trim().to_lowercase(), unquote(v.trim())) {
+                    continue;
+                }
+            }
+        }
+        out.push(line.to_string());
+    }
+    out
+}
+
+/// Index just past the last line of the `[aliases]` section, if present.
+fn alias_section_end(lines: &[String]) -> Option<usize> {
+    let mut in_aliases = false;
+    let mut end = None;
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if let Some(name) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            if in_aliases {
+                break;
+            }
+            in_aliases = name.trim().eq_ignore_ascii_case("aliases");
+            if in_aliases {
+                end = Some(i + 1);
+            }
+        } else if in_aliases && !trimmed.is_empty() {
+            end = Some(i + 1);
+        }
+    }
+    end
+}
+
+fn join_lines(lines: Vec<String>) -> String {
+    let mut s = lines.join("\n");
+    s.push('\n');
+    s
+}
+
+fn edit_config_file(edit: impl Fn(&str) -> String) {
+    let Some(path) = config_path() else { return };
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|_| DEFAULT_FILE.to_string());
+    let _ = std::fs::write(&path, edit(&text));
+}
+
+pub fn upsert_alias_file(alias: &str, app_id: &str) {
+    edit_config_file(|text| upsert_alias_text(text, alias, app_id));
+}
+
+pub fn remove_alias_file(app_id: &str) {
+    edit_config_file(|text| remove_alias_text(text, app_id));
 }
 
 pub fn config_path() -> Option<PathBuf> {
@@ -229,6 +328,41 @@ mod tests {
         assert_eq!(parse_key("f25"), None);
         assert_eq!(parse_key("space"), Some(0x20));
         assert_eq!(parse_key("nope"), None);
+    }
+
+    #[test]
+    fn alias_upsert_creates_section() {
+        let text = "# header\n[general]\nstart_menu = true\n";
+        let out = upsert_alias_text(text, "tt", "Terminal.App");
+        assert!(out.contains("# header"));
+        assert!(out.contains("[aliases]"));
+        assert!(out.contains("tt = \"Terminal.App\""));
+        let cfg = Config::from_text(&out);
+        assert_eq!(cfg.aliases_map().get("tt").unwrap(), "Terminal.App");
+    }
+
+    #[test]
+    fn alias_upsert_replaces_same_alias_and_same_app() {
+        let text = "[aliases]\ntt = \"Old.App\"\nvs = \"Code.App\"\n\n[plugins]\nsearch = true\n";
+        let out = upsert_alias_text(text, "tt", "New.App");
+        assert!(out.contains("tt = \"New.App\""));
+        assert!(!out.contains("Old.App"));
+        assert!(out.contains("vs = \"Code.App\""));
+        // re-aliasing the same app under a new name drops the old alias
+        let out2 = upsert_alias_text(&out, "code", "Code.App");
+        assert!(!out2.contains("vs = "));
+        assert!(out2.contains("code = \"Code.App\""));
+        // untouched sections survive
+        assert!(out2.contains("[plugins]"));
+        assert!(out2.contains("search = true"));
+    }
+
+    #[test]
+    fn alias_remove() {
+        let text = "[aliases]\ntt = \"Terminal.App\"\nvs = \"Code.App\"\n";
+        let out = remove_alias_text(text, "Terminal.App");
+        assert!(!out.contains("tt"));
+        assert!(out.contains("vs = \"Code.App\""));
     }
 
     #[test]

@@ -27,6 +27,26 @@ pub struct ResultItem {
     pub icon: Option<std::sync::Arc<Icon>>,
 }
 
+/// An entry in the actions panel (Ctrl+K) for a selected result.
+pub struct Action {
+    pub id: &'static str,
+    pub label: String,
+}
+
+/// What the UI should do after a plugin handled an action.
+pub enum ActionResult {
+    /// Back to search mode; results are re-queried.
+    Done,
+    /// Hide the window.
+    Close,
+    /// Open a one-line text input (e.g. "set alias"); the entered text is
+    /// delivered to [`Plugin::submit_text`] with `action_id`.
+    RequestText {
+        prompt: String,
+        action_id: &'static str,
+    },
+}
+
 pub trait Plugin {
     /// Stable identifier, also used in the config file.
     fn id(&self) -> &'static str;
@@ -34,6 +54,21 @@ pub trait Plugin {
     /// Append matches for `q` to `out`. Called on every keystroke - must be fast.
     fn query(&mut self, q: &str, out: &mut Vec<ResultItem>);
 
-    /// Run the action for `item`. Return `true` to dismiss the window.
+    /// Run the default action for `item`. Return `true` to dismiss the window.
     fn activate(&mut self, item: &ResultItem) -> bool;
+
+    /// Entries for the actions panel. Empty = no panel for this item.
+    fn actions(&self, _item: &ResultItem) -> Vec<Action> {
+        Vec::new()
+    }
+
+    /// Run a panel action.
+    fn run_action(&mut self, _action_id: &str, _item: &ResultItem) -> ActionResult {
+        ActionResult::Done
+    }
+
+    /// Commit text entered after [`ActionResult::RequestText`].
+    fn submit_text(&mut self, _action_id: &str, _item: &ResultItem, _text: &str) -> ActionResult {
+        ActionResult::Done
+    }
 }
