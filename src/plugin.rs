@@ -5,6 +5,15 @@
 //! constructed: zero memory, zero threads, zero startup cost. The core stays
 //! a thin shell around whatever plugins the user enabled.
 
+/// Decoded icon pixels: premultiplied BGRA, row-major, `width * 4` pitch.
+/// Device-independent so it survives render-target recreation; shared via
+/// `Arc` between the plugin's cache and result items.
+pub struct Icon {
+    pub width: u32,
+    pub height: u32,
+    pub bgra: Vec<u8>,
+}
+
 /// A single search result row.
 pub struct ResultItem {
     /// Id of the plugin that produced this item.
@@ -15,6 +24,7 @@ pub struct ResultItem {
     pub payload: String,
     /// Relevance; higher sorts first.
     pub score: i32,
+    pub icon: Option<std::sync::Arc<Icon>>,
 }
 
 pub trait Plugin {

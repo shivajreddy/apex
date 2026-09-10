@@ -1,6 +1,9 @@
 //! Direct2D + DirectWrite rendering. All layout is in logical DIPs; the
 //! render target is DPI-aware so drawing scales per-monitor automatically.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
@@ -10,7 +13,7 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::core::*;
 
-use crate::plugin::ResultItem;
+use crate::plugin::{Icon, ResultItem};
 
 // ---- layout (logical DIPs) ----
 pub const WINDOW_WIDTH: f32 = 680.0;
@@ -19,6 +22,8 @@ pub const ROW_H: f32 = 44.0;
 pub const LIST_PAD: f32 = 6.0;
 const PAD_X: f32 = 20.0;
 const SEL_MARGIN: f32 = 8.0;
+const ICON_SIZE: f32 = 26.0;
+const ICON_GAP: f32 = 12.0;
 
 /// Total window height for `n` result rows.
 pub fn content_height(n: usize) -> f32 {
@@ -61,6 +66,9 @@ struct Target {
     dim: ID2D1SolidColorBrush,
     faint: ID2D1SolidColorBrush,
     select: ID2D1SolidColorBrush,
+    /// D2D copies of plugin icons, keyed by the Arc's data address.
+    /// Dropped with the target (i.e. every hide), so it stays small.
+    icons: HashMap<usize, ID2D1Bitmap>,
 }
 
 impl Renderer {
@@ -142,6 +150,7 @@ impl Renderer {
                 dim: brush(&COL_DIM)?,
                 faint: brush(&COL_FAINT)?,
                 select: brush(&COL_SELECT)?,
+                icons: HashMap::new(),
                 rt,
             });
             Ok(())
@@ -196,7 +205,7 @@ impl Renderer {
                 return;
             }
             let caret_x = PAD_X + self.measure_input(query) + 1.0;
-            let t = self.target.as_ref().unwrap();
+            let t = self.target.as_mut().unwrap();
             let rt = &t.rt;
 
             rt.BeginDraw();
@@ -259,14 +268,37 @@ impl Renderer {
                             &t.select,
                         );
                     }
-                    let row = D2D_RECT_F {
-                        left: PAD_X,
+                    if let Some(icon) = &item.icon {
+                        if let Some(bmp) = icon_bitmap(rt, &mut t.icons, icon) {
+                            let top = y + (ROW_H - ICON_SIZE) / 2.0;
+                            rt.DrawBitmap(
+                                &bmp,
+                                Some(&D2D_RECT_F {
+                                    left: PAD_X,
+                                    top,
+                                    right: PAD_X + ICON_SIZE,
+                                    bottom: top + ICON_SIZE,
+                                }),
+                                1.0,
+                                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                                None,
+                            );
+                        }
+                    }
+                    let title_rect = D2D_RECT_F {
+                        left: PAD_X + ICON_SIZE + ICON_GAP,
                         top: y,
                         right: width - PAD_X,
                         bottom: y + ROW_H,
                     };
-                    draw_text(rt, &item.title, &self.fmt_title, &row, &t.text);
+                    draw_text(rt, &item.title, &self.fmt_title, &title_rect, &t.text);
                     if !item.subtitle.is_empty() {
+                        let row = D2D_RECT_F {
+                            left: PAD_X,
+                            top: y,
+                            right: width - PAD_X,
+                            bottom: y + ROW_H,
+                        };
                         draw_text(rt, &item.subtitle, &self.fmt_subtitle, &row, &t.dim);
                     }
                     y += ROW_H;
@@ -282,6 +314,41 @@ impl Renderer {
                 self.target = None;
             }
         }
+    }
+}
+
+/// Get (or create) the per-target D2D bitmap for an icon.
+unsafe fn icon_bitmap(
+    rt: &ID2D1HwndRenderTarget,
+    cache: &mut HashMap<usize, ID2D1Bitmap>,
+    icon: &Arc<Icon>,
+) -> Option<ID2D1Bitmap> {
+    let key = Arc::as_ptr(icon) as usize;
+    if let Some(b) = cache.get(&key) {
+        return Some(b.clone());
+    }
+    unsafe {
+        let props = D2D1_BITMAP_PROPERTIES {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+        };
+        let bmp = rt
+            .CreateBitmap(
+                D2D_SIZE_U {
+                    width: icon.width,
+                    height: icon.height,
+                },
+                Some(icon.bgra.as_ptr() as *const core::ffi::c_void),
+                icon.width * 4,
+                &props,
+            )
+            .ok()?;
+        cache.insert(key, bmp.clone());
+        Some(bmp)
     }
 }
 

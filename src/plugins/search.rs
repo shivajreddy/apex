@@ -5,22 +5,33 @@
 //! apps). Indexing runs on a background thread so startup stays instant;
 //! results are swapped in on the first query that finds them ready.
 
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
+use windows::Win32::Foundation::SIZE;
+use windows::Win32::Graphics::Gdi::{
+    BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, GetDC, GetDIBits, GetObjectW,
+    HBITMAP, ReleaseDC,
+};
 use windows::Win32::System::Com::{
-    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoTaskMemFree,
+    COINIT_DISABLE_OLE1DDE, COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree,
 };
 use windows::Win32::UI::Shell::{
-    BHID_EnumItems, FOLDERID_AppsFolder, IEnumShellItems, IShellItem, KF_FLAG_DEFAULT,
-    SHGetKnownFolderItem, SIGDN, SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING, ShellExecuteW,
+    BHID_EnumItems, FOLDERID_AppsFolder, IEnumShellItems, IShellItem, IShellItemImageFactory,
+    KF_FLAG_DEFAULT, SHGetKnownFolderItem, SIGDN, SIGDN_NORMALDISPLAY,
+    SIGDN_PARENTRELATIVEPARSING, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-use windows::core::{PCWSTR, w};
+use windows::core::{Interface, PCWSTR, w};
 
 use crate::fuzzy;
-use crate::plugin::{Plugin, ResultItem};
+use crate::plugin::{Icon, Plugin, ResultItem};
 
 pub const ID: &str = "search";
+
+/// Icon extraction size in physical pixels (drawn at 26 DIPs, so 48px stays
+/// crisp up to ~185% scaling).
+const ICON_PX: i32 = 48;
 
 struct AppEntry {
     /// Display name as shown in the Start menu.
@@ -31,6 +42,7 @@ struct AppEntry {
     bonus: Vec<i32>,
     /// AppsFolder parsing name; launched as `shell:AppsFolder\<id>`.
     app_id: String,
+    icon: Option<Arc<Icon>>,
 }
 
 pub struct Search {
@@ -87,6 +99,7 @@ impl Plugin for Search {
                     subtitle: "Application".into(),
                     payload: e.app_id.clone(),
                     score,
+                    icon: e.icon.clone(),
                 });
             }
         }
@@ -99,7 +112,9 @@ impl Plugin for Search {
 
 fn index_apps() -> Vec<AppEntry> {
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        // MTA: this worker never pumps messages, and STA COM without a pump
+        // can deadlock inside shell calls (icon extraction did exactly that).
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE);
         let mut out = Vec::new();
         if let Err(e) = enum_apps_folder(&mut out) {
             crate::dlog!("search: AppsFolder enumeration failed: {e}");
@@ -135,11 +150,83 @@ unsafe fn enum_apps_folder(out: &mut Vec<AppEntry>) -> windows::core::Result<()>
                     name_folded: fuzzy::fold_case(&name),
                     bonus: fuzzy::bonuses(&name),
                     app_id,
+                    icon: extract_icon(item).map(Arc::new),
                     name,
                 });
             }
         }
         Ok(())
+    }
+}
+
+/// Shell-provided icon for an AppsFolder item (works for both desktop and
+/// packaged apps). Returns premultiplied BGRA pixels.
+fn extract_icon(item: &IShellItem) -> Option<Icon> {
+    unsafe {
+        let factory: IShellItemImageFactory = item.cast().ok()?;
+        let hbmp = factory
+            .GetImage(
+                SIZE {
+                    cx: ICON_PX,
+                    cy: ICON_PX,
+                },
+                SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK,
+            )
+            .ok()?;
+        let icon = hbitmap_to_icon(hbmp);
+        let _ = windows::Win32::Graphics::Gdi::DeleteObject(hbmp.into());
+        icon
+    }
+}
+
+unsafe fn hbitmap_to_icon(hbmp: HBITMAP) -> Option<Icon> {
+    unsafe {
+        let mut bm = BITMAP::default();
+        if GetObjectW(
+            hbmp.into(),
+            size_of::<BITMAP>() as i32,
+            Some(&mut bm as *mut _ as *mut core::ffi::c_void),
+        ) == 0
+        {
+            return None;
+        }
+        let (w, h) = (bm.bmWidth, bm.bmHeight);
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+
+        let mut info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h, // top-down
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bgra = vec![0u8; (w * h * 4) as usize];
+        let hdc = GetDC(None);
+        let lines = GetDIBits(
+            hdc,
+            hbmp,
+            0,
+            h as u32,
+            Some(bgra.as_mut_ptr() as *mut core::ffi::c_void),
+            &mut info,
+            DIB_RGB_COLORS,
+        );
+        ReleaseDC(None, hdc);
+        if lines == 0 {
+            return None;
+        }
+        Some(Icon {
+            width: w as u32,
+            height: h as u32,
+            bgra,
+        })
     }
 }
 
