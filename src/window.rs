@@ -64,6 +64,8 @@ static INSTANCE_MUTEX: AtomicIsize = AtomicIsize::new(0);
 static APP_ICON: AtomicIsize = AtomicIsize::new(0);
 /// Whether the tray icon is currently registered.
 static TRAY_SHOWN: AtomicBool = AtomicBool::new(false);
+/// Last WM_MOUSEMOVE lparam, so a stationary pointer is not treated as hover.
+static LAST_MOUSE: AtomicIsize = AtomicIsize::new(-1);
 
 pub fn run(config: &crate::config::Config) -> Result<()> {
     unsafe {
@@ -329,7 +331,7 @@ unsafe extern "system" fn wndproc(
                 LRESULT(0)
             }
             WM_COMMAND => {
-                match (wparam.0 & 0xFFFF) as usize {
+                match wparam.0 & 0xFFFF {
                     IDM_OPEN => show(hwnd),
                     IDM_RELOAD => reload_plugins(hwnd),
                     IDM_CONFIG => crate::plugins::commands::open_config_file(),
@@ -410,6 +412,8 @@ unsafe extern "system" fn wndproc(
                             caret_visible: app.caret_visible,
                             results: &app.results,
                             selected: app.selected,
+                            sections: &app.sections,
+                            scroll: app.scroll,
                             panel,
                         };
                         if let Some(r) = app.renderer.as_mut() {
@@ -418,6 +422,50 @@ unsafe extern "system" fn wndproc(
                     }
                 }
                 let _ = EndPaint(hwnd, &ps);
+                LRESULT(0)
+            }
+            // Hover to highlight. Guarded on the cursor actually having
+            // moved: showing the window under a stationary pointer emits
+            // WM_MOUSEMOVE, which would otherwise yank the selection away
+            // from the top row before the user has touched anything.
+            WM_MOUSEMOVE => {
+                let pos = lparam.0 as u32;
+                if LAST_MOUSE.swap(pos as isize, Relaxed) != pos as isize
+                    && mode_kind(hwnd) == ModeKind::Search
+                {
+                    let y = client_dip_y(hwnd, ((pos >> 16) & 0xFFFF) as i16 as f32);
+                    if let Some(app) = app_mut(hwnd)
+                        && let Some(row) = app.row_at(y)
+                        && app.select(row)
+                    {
+                        invalidate(hwnd);
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_LBUTTONUP => {
+                if mode_kind(hwnd) == ModeKind::Search {
+                    let y = client_dip_y(hwnd, ((lparam.0 as u32 >> 16) & 0xFFFF) as i16 as f32);
+                    let hit = app_mut(hwnd).and_then(|a| {
+                        let row = a.row_at(y)?;
+                        a.select(row);
+                        Some(a.activate_selected())
+                    });
+                    if let Some(outcome) = hit {
+                        settle(hwnd, outcome);
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_MOUSEWHEEL => {
+                let delta = ((wparam.0 >> 16) & 0xFFFF) as i16 as f32;
+                // Three rows per notch, the usual Windows convention.
+                let dips = delta / WHEEL_DELTA as f32 * render::ROW_H * 3.0;
+                if let Some(app) = app_mut(hwnd)
+                    && app.scroll_by(dips)
+                {
+                    invalidate(hwnd);
+                }
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),
@@ -440,6 +488,12 @@ unsafe extern "system" fn wndproc(
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
     }
+}
+
+/// Convert a client-space y in physical pixels to logical DIPs, which is what
+/// all the layout maths uses.
+unsafe fn client_dip_y(hwnd: HWND, y: f32) -> f32 {
+    unsafe { y * 96.0 / GetDpiForWindow(hwnd) as f32 }
 }
 
 /// Which mode the app is in, without holding a borrow.

@@ -6,7 +6,7 @@
 
 Where Apex is, how it got here, and where it's going.
 
-**Status:** `v0.2.0` — pre-release, in active development.
+**Status:** `v0.2.1` — pre-release, in active development.
 **Working today:** global hotkey, app search with icons, frecency ranking,
 quicklinks, apex commands, tray icon, aliases.
 
@@ -34,8 +34,8 @@ feature loses.
 
 | | |
 |---|---|
-| Binary size | 530 KB |
-| Memory, idle | ~11.8 MB private |
+| Binary size | 533 KB |
+| Memory, idle | ~12 MB private |
 | App index | ~150 apps in ~1 s (background thread) |
 | Tests | 57 unit tests |
 
@@ -65,6 +65,12 @@ icon cache below is the fix.
   ~50 MB) — the scene is small and redraws only on input
 - Renderer released entirely while hidden
 - Dark theme, blinking caret, selection highlight, result rows with icons
+- Sectioned default list: `Suggestions` from launch history, then `Commands`
+  holding every app, quicklink and apex command. The heading is omitted when
+  there is no history to show.
+- Scrolling list with a fixed viewport, so the default view can hold every
+  installed entry without filling the screen. Rows outside it are culled.
+- Mouse: hover to highlight, click to launch, wheel to scroll
 
 **Search plugin** (the first plugin)
 - Indexes the shell `AppsFolder`: desktop **and** UWP/Store apps, the same
@@ -123,7 +129,8 @@ icon cache below is the fix.
 
 | Version | Contents |
 |---|---|
-| `v0.2.0` (current) | Frecency ranking, quicklinks, apex commands, tray icon, clipboard paste, alias pills, icon fallback. |
+| `v0.2.1` (current) | Sectioned and scrolling result list, mouse support. |
+| `v0.2.0` | Frecency ranking, quicklinks, apex commands, tray icon, clipboard paste, alias pills, icon fallback. |
 | `v0.1.0` | Global hotkey, app search with icons, launch, aliases, actions panel. First usable launcher. |
 
 ---
@@ -144,7 +151,7 @@ Polish the launcher until it's the fastest path to any app.
 - [ ] **Icon cache on disk** — skip re-extraction at every start, and move
       extraction into a helper process so the shell imaging DLLs stay out
       of the resident set (the ~11.8 MB idle figure above is entirely this)
-- [ ] **Mouse support** — hover to highlight, click to launch
+- [x] **Mouse support** — hover to highlight, click to launch, wheel to scroll
 - [ ] **Blur / acrylic backdrop** — needs per-pixel alpha, which the current
       `ID2D1HwndRenderTarget` cannot do; a layered window driven by
       `UpdateLayeredWindow` is the likely route

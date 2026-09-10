@@ -12,7 +12,7 @@ Ultra-fast, ultra-lightweight launcher for Windows. Raycast, but native.
 
 ## Status
 
-`v0.2.0`, pre-release. Working today: global hotkey, fuzzy app search with
+`v0.2.1`, pre-release. Working today: global hotkey, fuzzy app search with
 icons (desktop + Store apps), frecency ranking, quicklinks, apex commands, a
 tray icon, aliases, and an actions panel. See [ROADMAP.md](ROADMAP.md) for
 what's shipped and what's next.
@@ -76,7 +76,13 @@ Start-Process "$env:LOCALAPPDATA\Programs\Apex\apex.exe"
 | `Ctrl+V` | paste, in the query and in any field |
 | `Tab` | next field, in forms |
 
-Summoning apex with an empty query lists your most-used entries first.
+The mouse works too: hover to highlight, click to launch, wheel to scroll.
+
+Summoning apex with an empty query lists your most-used entries under
+`Suggestions`, then everything else - every app, quicklink and command -
+under `Commands`. The list scrolls, so the window stays the same height
+whether you have ten entries or three hundred. `Suggestions` is omitted
+entirely until you have launched something.
 
 Note: `Ctrl+Esc` normally opens the Start menu. Apex claims it with a
 low-level keyboard hook - before the shell sees it - so it wins even over

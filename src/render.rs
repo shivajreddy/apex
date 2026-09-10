@@ -25,6 +25,7 @@ const SEL_MARGIN: f32 = 8.0;
 const ICON_SIZE: f32 = 26.0;
 const ICON_GAP: f32 = 12.0;
 const BAR_H: f32 = 34.0;
+pub const HEADER_H: f32 = 26.0;
 // Alias pill drawn immediately after a result's title.
 const BADGE_H: f32 = 19.0;
 const BADGE_PAD_X: f32 = 7.0;
@@ -41,12 +42,37 @@ const FORM_ROW: f32 = 50.0;
 const FORM_TITLE_H: f32 = 28.0;
 const FORM_LABEL_H: f32 = 18.0;
 
-/// Total window height for `n` result rows.
-pub fn content_height(n: usize) -> f32 {
-    if n == 0 {
+/// Rows visible at once. The list scrolls past this rather than growing the
+/// window, so the default view can list every entry without filling the
+/// screen.
+pub const MAX_VISIBLE_ROWS: usize = 8;
+
+/// Full height of the list, headers included. May exceed the viewport.
+pub fn list_content_height(rows: usize, headers: usize) -> f32 {
+    LIST_PAD * 2.0 + headers as f32 * HEADER_H + rows as f32 * ROW_H
+}
+
+/// Height actually given to the list: the content, capped.
+pub fn list_viewport_height(rows: usize, headers: usize) -> f32 {
+    let cap = LIST_PAD * 2.0 + MAX_VISIBLE_ROWS as f32 * ROW_H;
+    list_content_height(rows, headers).min(cap)
+}
+
+/// Offset of row `index` within the list content.
+///
+/// A section header occupies `HEADER_H` immediately above the row it starts
+/// at, so a row's offset depends on how many headers precede it.
+pub fn row_offset(sections: &[(usize, &'static str)], index: usize) -> f32 {
+    let headers = sections.iter().filter(|(start, _)| *start <= index).count();
+    LIST_PAD + headers as f32 * HEADER_H + index as f32 * ROW_H
+}
+
+/// Total window height for `rows` results under `headers` section headings.
+pub fn content_height(rows: usize, headers: usize) -> f32 {
+    if rows == 0 {
         INPUT_H
     } else {
-        INPUT_H + 1.0 + LIST_PAD * 2.0 + ROW_H * n as f32 + BAR_H
+        INPUT_H + 1.0 + list_viewport_height(rows, headers) + BAR_H
     }
 }
 
@@ -68,6 +94,10 @@ pub struct Frame<'a> {
     pub caret_visible: bool,
     pub results: &'a [ResultItem],
     pub selected: usize,
+    /// `(first row index, heading)`, ascending. Empty for a typed query.
+    pub sections: &'a [(usize, &'static str)],
+    /// How far the list is scrolled, in DIPs.
+    pub scroll: f32,
     pub panel: Option<PanelView<'a>>,
 }
 
@@ -116,6 +146,7 @@ pub struct Renderer {
     fmt_subtitle_left: IDWriteTextFormat,
     fmt_panel: IDWriteTextFormat,
     fmt_badge: IDWriteTextFormat,
+    fmt_header: IDWriteTextFormat,
     target: Option<Target>,
 }
 
@@ -167,6 +198,8 @@ impl Renderer {
             let fmt_badge = make(11.5, DWRITE_FONT_WEIGHT_NORMAL)?;
             fmt_badge.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
             fmt_badge.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            let fmt_header = make(11.5, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
+            fmt_header.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
 
             Ok(Self {
                 d2d,
@@ -177,6 +210,7 @@ impl Renderer {
                 fmt_subtitle_left,
                 fmt_panel,
                 fmt_badge,
+                fmt_header,
                 target: None,
             })
         }
@@ -277,9 +311,11 @@ impl Renderer {
             caret_visible,
             results,
             selected,
+            sections,
+            scroll,
             panel,
         } = frame;
-        let (query, selected) = (*query, *selected);
+        let (query, selected, scroll) = (*query, *selected, *scroll);
         unsafe {
             if self.ensure_target(hwnd).is_err() {
                 return;
@@ -369,8 +405,46 @@ impl Renderer {
                     &t.faint,
                 );
 
-                let mut y = INPUT_H + 1.0 + LIST_PAD;
+                let list_top = INPUT_H + 1.0;
+                let view_h = list_viewport_height(results.len(), sections.len());
+                // Clip so scrolled rows cannot bleed over the input or bar.
+                rt.PushAxisAlignedClip(
+                    &D2D_RECT_F {
+                        left: 0.0,
+                        top: list_top,
+                        right: width,
+                        bottom: list_top + view_h,
+                    },
+                    D2D1_ANTIALIAS_MODE_ALIASED,
+                );
+
+                for (start, title) in sections.iter() {
+                    // A header sits directly above the row it introduces.
+                    let hy = list_top + row_offset(sections, *start) - HEADER_H - scroll;
+                    if hy + HEADER_H < list_top || hy > list_top + view_h {
+                        continue;
+                    }
+                    draw_text(
+                        rt,
+                        title,
+                        &self.fmt_header,
+                        &D2D_RECT_F {
+                            left: PAD_X,
+                            top: hy,
+                            right: width - PAD_X,
+                            bottom: hy + HEADER_H,
+                        },
+                        &t.dim,
+                    );
+                }
+
                 for (i, item) in results.iter().enumerate() {
+                    let y = list_top + row_offset(sections, i) - scroll;
+                    // Cull rows outside the viewport: the default list can
+                    // hold every installed app.
+                    if y + ROW_H < list_top || y > list_top + view_h {
+                        continue;
+                    }
                     if i == selected {
                         rt.FillRoundedRectangle(
                             &D2D1_ROUNDED_RECT {
@@ -442,8 +516,8 @@ impl Renderer {
                         };
                         draw_text(rt, &item.subtitle, &self.fmt_subtitle, &row, &t.dim);
                     }
-                    y += ROW_H;
                 }
+                rt.PopAxisAlignedClip();
 
                 // Bottom bar with key hints.
                 let bar_top = height - BAR_H;

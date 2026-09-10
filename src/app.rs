@@ -5,7 +5,17 @@ use crate::frecency::{self, Frecency};
 use crate::plugin::{Action, ActionResult, FormField, Plugin, ResultItem, ShellCommand};
 use crate::render::Renderer;
 
-pub const MAX_RESULTS: usize = 8;
+/// Hard cap on materialised rows. Generous: the default list holds every
+/// installed app, and the list scrolls. Plugins already build a `ResultItem`
+/// per match before this is applied, so raising it costs nothing per
+/// keystroke.
+pub const MAX_RESULTS: usize = 400;
+
+/// Most-used entries offered under "Suggestions" before the full list.
+const MAX_SUGGESTIONS: usize = 5;
+
+const SUGGESTIONS: &str = "Suggestions";
+const COMMANDS: &str = "Commands";
 
 pub enum Mode {
     Search,
@@ -47,6 +57,11 @@ pub struct App {
     pub plugins: Vec<Box<dyn Plugin>>,
     pub results: Vec<ResultItem>,
     pub selected: usize,
+    /// `(first row index, heading)`. Only the default list is sectioned; a
+    /// typed query is one ranked list, so headings would be arbitrary.
+    pub sections: Vec<(usize, &'static str)>,
+    /// List scroll offset in DIPs.
+    pub scroll: f32,
     /// Launch history, applied across all plugins. Lives here rather than in
     /// any one plugin: ranking by past use is a property of the shell, so
     /// every plugin gets it without reimplementing it.
@@ -64,6 +79,8 @@ impl App {
             plugins,
             results: Vec::new(),
             selected: 0,
+            sections: Vec::new(),
+            scroll: 0.0,
             frecency: Frecency::load(),
         }
     }
@@ -407,7 +424,7 @@ impl App {
         self.selected = keep.min(self.results.len().saturating_sub(1));
     }
 
-    /// Move selection by `delta`, wrapping around.
+    /// Move selection by `delta`, wrapping around, scrolling to follow.
     pub fn move_selection(&mut self, delta: i32) {
         if self.results.is_empty() {
             self.selected = 0;
@@ -415,17 +432,20 @@ impl App {
         }
         let len = self.results.len() as i32;
         self.selected = (self.selected as i32 + delta).rem_euclid(len) as usize;
+        self.ensure_visible();
     }
 
     fn refresh_results(&mut self) {
         self.results.clear();
+        self.sections.clear();
         self.selected = 0;
+        self.scroll = 0.0;
         let now = frecency::now();
 
         // Empty query: show the most-used entries instead of nothing. These
         // arrive already ranked, so they bypass the scoring sort below.
         if self.query.is_empty() {
-            self.fill_most_used(now);
+            self.fill_default(now);
             return;
         }
 
@@ -445,13 +465,15 @@ impl App {
         self.results.truncate(MAX_RESULTS);
     }
 
-    /// Fill the result list for an empty query: launch history first, best
-    /// first, then padded from the plugins' own catalogues.
+    /// Build the default list for an empty query: "Suggestions" from launch
+    /// history, then "Commands" holding everything else.
     ///
-    /// Only the rows actually shown are materialised. Payloads whose plugin
-    /// is gone, or whose target no longer exists, are skipped.
-    fn fill_most_used(&mut self, now: u64) {
-        for (plugin_id, payload) in self.frecency.top(MAX_RESULTS, now) {
+    /// Suggestions is omitted entirely on a fresh install, or after the
+    /// history is cleared - an empty heading is worse than no heading.
+    /// Payloads whose plugin is gone, or whose target no longer exists, are
+    /// skipped.
+    fn fill_default(&mut self, now: u64) {
+        for (plugin_id, payload) in self.frecency.top(MAX_SUGGESTIONS, now) {
             let Some(p) = self.plugins.iter_mut().find(|p| p.id() == plugin_id) else {
                 continue;
             };
@@ -459,8 +481,13 @@ impl App {
                 self.results.push(item);
             }
         }
-        // Pad to a full list. A launcher showing one row reads as though it
-        // only knows one app, even when that row is the right one.
+        if !self.results.is_empty() {
+            self.sections.push((0, SUGGESTIONS));
+        }
+
+        // Everything else, in each plugin's own order. `browse` skips
+        // payloads already placed above, so nothing appears twice.
+        let commands_start = self.results.len();
         for p in &mut self.plugins {
             let free = MAX_RESULTS.saturating_sub(self.results.len());
             if free == 0 {
@@ -468,7 +495,74 @@ impl App {
             }
             p.browse(free, &mut self.results);
         }
+        if self.results.len() > commands_start {
+            self.sections.push((commands_start, COMMANDS));
+        }
         self.results.truncate(MAX_RESULTS);
+    }
+
+    // ---- scrolling and hit-testing --------------------------------------
+
+    fn list_metrics(&self) -> (f32, f32) {
+        let (rows, headers) = (self.results.len(), self.sections.len());
+        (
+            crate::render::list_viewport_height(rows, headers),
+            crate::render::list_content_height(rows, headers),
+        )
+    }
+
+    fn max_scroll(&self) -> f32 {
+        let (view, content) = self.list_metrics();
+        (content - view).max(0.0)
+    }
+
+    /// Scroll so the selected row sits fully inside the viewport.
+    fn ensure_visible(&mut self) {
+        let (view, _) = self.list_metrics();
+        let row_top = crate::render::row_offset(&self.sections, self.selected);
+        let bottom = row_top + crate::render::ROW_H;
+        // A row that begins a section should bring its heading along.
+        let top = if self.sections.iter().any(|(s, _)| *s == self.selected) {
+            row_top - crate::render::HEADER_H
+        } else {
+            row_top
+        };
+        if top < self.scroll {
+            self.scroll = top;
+        } else if bottom > self.scroll + view {
+            self.scroll = bottom - view;
+        }
+        self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+    }
+
+    /// Scroll by a wheel delta in DIPs. True if anything moved.
+    pub fn scroll_by(&mut self, delta: f32) -> bool {
+        let before = self.scroll;
+        self.scroll = (self.scroll - delta).clamp(0.0, self.max_scroll());
+        self.scroll != before
+    }
+
+    /// Row under a client-space y coordinate, in DIPs.
+    pub fn row_at(&self, y: f32) -> Option<usize> {
+        let list_top = crate::render::INPUT_H + 1.0;
+        let (view, _) = self.list_metrics();
+        if y < list_top || y > list_top + view {
+            return None;
+        }
+        let target = y - list_top + self.scroll;
+        (0..self.results.len()).find(|&i| {
+            let top = crate::render::row_offset(&self.sections, i);
+            target >= top && target < top + crate::render::ROW_H
+        })
+    }
+
+    /// Point the selection at a row, e.g. from a hover. True if it moved.
+    pub fn select(&mut self, index: usize) -> bool {
+        if index >= self.results.len() || index == self.selected {
+            return false;
+        }
+        self.selected = index;
+        true
     }
 
     /// Forget all launch history, in memory and on disk, and show the result.
@@ -505,7 +599,7 @@ impl App {
     /// A form panel is taller than the actions panel and can exceed the
     /// result list, so the window grows to fit it rather than clipping.
     pub fn content_height(&self) -> f32 {
-        let base = crate::render::content_height(self.results.len());
+        let base = crate::render::content_height(self.results.len(), self.sections.len());
         match &self.mode {
             Mode::Form { fields, .. } => base.max(crate::render::form_window_height(fields.len())),
             _ => base,
