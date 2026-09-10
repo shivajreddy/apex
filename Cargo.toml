@@ -1,10 +1,21 @@
 [package]
-name = "apex"
+# The crate name `apex` was already taken on crates.io. The binary below is
+# still `apex`, so nothing about using it changes.
+name = "apex-launcher"
 version = "0.1.0"
 edition = "2024"
-description = "Ultra-fast, ultra-lightweight launcher for Windows"
+description = "Ultra-fast, ultra-lightweight launcher for Windows. Raycast, but native."
 repository = "https://github.com/shivajreddy/apex"
+readme = "README.md"
 license = "MIT"
+keywords = ["launcher", "windows", "spotlight", "productivity", "win32"]
+categories = ["gui", "os::windows-apis"]
+# The logos are README chrome only; apex.ico is the one asset build.rs needs.
+exclude = ["assets/logo.png", "assets/logo-text.png"]
+
+[[bin]]
+name = "apex"
+path = "src/main.rs"
 
 [dependencies.windows]
 version = "0.62"

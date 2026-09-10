@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" width="128" alt="Apex logo">
+  <img src="https://raw.githubusercontent.com/shivajreddy/apex/main/assets/logo.png" width="128" alt="Apex logo">
 </p>
 
 # Apex
@@ -8,37 +8,108 @@ Ultra-fast, ultra-lightweight launcher for Windows. Raycast, but native.
 
 - Pure Win32 + Direct2D. No Electron, no webview, no runtime.
 - Single small binary. Minimal RAM. Instant startup.
+- One dependency: the `windows` crate.
 
 ## Status
 
 `v0.1.0`, pre-release. Working today: global hotkey, fuzzy app search with
-icons (desktop + Store apps), launching, and aliases. See
-[ROADMAP.md](ROADMAP.md) for what's shipped and what's next.
+icons (desktop + Store apps), frecency ranking, quicklinks, aliases, and an
+actions panel. See [ROADMAP.md](ROADMAP.md) for what's shipped and what's next.
 
-## Build
+## Install
 
+```powershell
+cargo install apex-launcher
 ```
+
+The crate is `apex-launcher` because `apex` was taken; the binary is `apex`.
+
+### From source
+
+```powershell
 cargo build --release
+
+New-Item -ItemType Directory -Path "$env:LOCALAPPDATA\Programs\Apex" -Force
+Copy-Item .\target\release\apex.exe "$env:LOCALAPPDATA\Programs\Apex\apex.exe" -Force
+Start-Process "$env:LOCALAPPDATA\Programs\Apex\apex.exe"
+```
+
+Install somewhere stable rather than running from `target\release\`: `cargo
+clean` wipes that directory, and a running apex holds a lock on its own exe
+that makes the next build fail.
+
+Running apex is what installs it. `setup::ensure` runs on every launch and
+registers, idempotently, from the `[general]` flags:
+
+| Flag | Effect |
+|---|---|
+| `start_menu` | Start menu shortcut, pointing at the running exe |
+| `start_on_startup` | `Apex` value under the `HKCU` `Run` key |
+
+Both point at wherever the exe currently is, and both are removed on the next
+launch if you set the flag to `false`.
+
+### Upgrade
+
+```powershell
+cargo build --release
+Get-Process apex -ErrorAction SilentlyContinue | Stop-Process -Force
+Copy-Item .\target\release\apex.exe "$env:LOCALAPPDATA\Programs\Apex\apex.exe" -Force
+Start-Process "$env:LOCALAPPDATA\Programs\Apex\apex.exe"
 ```
 
 ## Usage
 
-- `Ctrl+Esc` — toggle the launcher (configurable)
-- `Esc` — dismiss
-- `↑/↓` — move selection, `Enter` — launch
-- `Ctrl+K` — actions for the selected result (set/remove alias)
+| Key | |
+|---|---|
+| `Ctrl+Esc` | toggle the launcher (configurable) |
+| `Esc` | dismiss |
+| `↑` `↓` | move selection |
+| `Enter` | open |
+| `Ctrl+K` | actions for the selected result |
+| `Ctrl+V` | paste, in the query and in any field |
+| `Tab` | next field, in forms |
 
-Aliases: press `Ctrl+K` on any app, choose `Set Alias…`, and type a short
-name. Typing that alias afterwards puts the app first.
+Summoning apex with an empty query lists your most-used entries first.
 
 Note: `Ctrl+Esc` normally opens the Start menu. Apex claims it with a
 low-level keyboard hook - before the shell sees it - so it wins even over
 reserved combos (the Win key still opens Start).
 
+### Aliases
+
+`Ctrl+K` on any app, `Set Alias…`, and type a short name. Typing that alias
+afterwards puts the app first.
+
+### Quicklinks
+
+A quicklink opens a link, folder or program by name. Type `create quicklink`
+to make one, or `Ctrl+K` on an existing one to edit or delete it.
+
+A `{token}` in the link makes the quicklink take an argument: running it asks
+for a value using the token's name, then substitutes it in, percent-encoding
+when the link is a URL.
+
+```toml
+[quicklinks.github]
+name = 'Search GitHub'
+link = 'https://github.com/search?q={query}'
+open_with = 'chrome'        # optional; defaults to the system handler
+```
+
+Prefer `'single quotes'`: they keep Windows paths like `C:\tools\x.exe`
+literal, with no escaping.
+
+### Reload
+
+Type `reload` to re-read everything from disk - newly installed applications,
+and hand-edits to `config.toml` such as new quicklinks or aliases - without
+restarting. `[general]` and `[hotkey]` still need a restart.
+
 ## Configuration
 
-`%APPDATA%\apex\config.toml` — auto-created with commented defaults on
-first run. Symlink it into your dotfiles if that's how you roll.
+`%APPDATA%\apex\config.toml` - auto-created with commented defaults on first
+run. Symlink it into your dotfiles if that's how you roll.
 
 ```toml
 [general]
@@ -51,15 +122,28 @@ key = "escape"           # a-z, 0-9, f1-f24, space, escape, tab, grave, enter
 
 [plugins]
 search = true            # disabled plugins are never constructed: zero cost
+quicklinks = true
+commands = true
 ```
 
-Changes take effect on restart. Disabling a `[general]` flag removes its
-registration (shortcut / Run key) on the next launch.
+Apex only ever rewrites the `[aliases]` and `[quicklinks.*]` sections, by line
+surgery; every other section, and every comment, is preserved byte-for-byte.
+
+Launch history is *not* kept here. It lives in
+`%LOCALAPPDATA%\apex\frecency.tsv`, because it rewrites on every launch and is
+machine-local - the config file is yours, and often lives in a git repo.
 
 ## Known limitations
 
-While an **elevated** window (e.g. Task Manager) has focus, Windows UIPI
-hides keyboard input from non-elevated apps: the hotkey falls through to
-the shell and Apex cannot take focus. Running Apex elevated avoids this
-entirely; an opt-in `run_as_admin` setting (elevated logon task) is
-planned.
+While an **elevated** window (e.g. Task Manager) has focus, Windows UIPI hides
+keyboard input from non-elevated apps: the hotkey falls through to the shell
+and Apex cannot take focus. Running Apex elevated avoids this entirely; an
+opt-in `run_as_admin` setting (elevated logon task) is planned.
+
+**Aliases are machine-specific.** Desktop apps get an AppUserModelID of the
+form `Microsoft.AutoGenerated.{GUID}`, generated per machine, so an alias set
+on one box will not resolve on another. Quicklinks have no such problem.
+
+## License
+
+MIT
