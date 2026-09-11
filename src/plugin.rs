@@ -60,6 +60,8 @@ pub enum ShellCommand {
     Restart,
     ToggleTray,
     ClearHistory,
+    /// List hidden entries so they can be restored.
+    ShowHidden,
 }
 
 /// What the UI should do after a plugin handled an action.

@@ -17,6 +17,31 @@ const MAX_SUGGESTIONS: usize = 5;
 const SUGGESTIONS: &str = "Suggestions";
 const COMMANDS: &str = "Commands";
 
+/// Config section holding hidden `plugin/payload` keys.
+const HIDDEN: &str = "hidden";
+
+// Shell-level action ids. Double underscores keep them clear of the plain
+// identifiers plugins use.
+const ACTION_HIDE: &str = "__hide";
+const ACTION_UNHIDE: &str = "__unhide";
+
+/// Identity of a result across plugins.
+///
+/// `/` is a safe separator: plugin ids are bare words, and payloads are
+/// Windows paths, AppUserModelIDs, quicklink slugs or command ids - none of
+/// which contain a forward slash.
+fn key(plugin: &str, payload: &str) -> String {
+    format!("{plugin}/{payload}")
+}
+
+/// Which catalogue the result list is showing.
+#[derive(PartialEq, Clone, Copy)]
+pub enum Listing {
+    Normal,
+    /// Hidden entries only, so they can be restored.
+    Hidden,
+}
+
 pub enum Mode {
     Search,
     Actions {
@@ -62,6 +87,10 @@ pub struct App {
     pub sections: Vec<(usize, &'static str)>,
     /// List scroll offset in DIPs.
     pub scroll: f32,
+    /// `plugin/payload` keys the user has hidden. Filtered out of every
+    /// listing, here rather than per-plugin so one action covers them all.
+    hidden: std::collections::HashSet<String>,
+    listing: Listing,
     /// Launch history, applied across all plugins. Lives here rather than in
     /// any one plugin: ranking by past use is a property of the shell, so
     /// every plugin gets it without reimplementing it.
@@ -69,7 +98,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(plugins: Vec<Box<dyn Plugin>>) -> Self {
+    pub fn new(plugins: Vec<Box<dyn Plugin>>, config: &crate::config::Config) -> Self {
         Self {
             mode: Mode::Search,
             renderer: None,
@@ -81,6 +110,8 @@ impl App {
             selected: 0,
             sections: Vec::new(),
             scroll: 0.0,
+            hidden: config.list_values(HIDDEN).into_iter().collect(),
+            listing: Listing::Normal,
             frecency: Frecency::load(),
         }
     }
@@ -178,10 +209,20 @@ impl App {
         let Some(plugin) = self.plugins.iter().find(|p| p.id() == item.plugin) else {
             return false;
         };
-        let actions = plugin.actions(item);
-        if actions.is_empty() {
-            return false;
-        }
+        let mut actions = plugin.actions(item);
+        // Shell-level, so it is offered on every row whatever produced it,
+        // rather than each plugin reimplementing the same entry.
+        actions.push(if self.listing == Listing::Hidden {
+            Action {
+                id: ACTION_UNHIDE,
+                label: "Unhide".to_string(),
+            }
+        } else {
+            Action {
+                id: ACTION_HIDE,
+                label: "Hide from Apex".to_string(),
+            }
+        });
         self.mode = Mode::Actions {
             actions,
             selected: 0,
@@ -206,6 +247,18 @@ impl App {
             Mode::Actions { actions, selected } => actions[*selected].id,
             _ => return UiOutcome::Stay,
         };
+        // Shell-level actions never reach a plugin.
+        match action_id {
+            ACTION_HIDE => {
+                self.set_hidden(true);
+                return UiOutcome::Stay;
+            }
+            ACTION_UNHIDE => {
+                self.set_hidden(false);
+                return UiOutcome::Stay;
+            }
+            _ => {}
+        }
         let result = self.dispatch(|p, item| p.run_action(action_id, item));
         self.apply(result)
     }
@@ -308,8 +361,14 @@ impl App {
                 self.mode = Mode::Search;
                 // Launch history lives here, so clearing it never needs to
                 // reach the window.
+                // Both are answered here: App owns the history and the
+                // hidden set, so neither needs the window.
                 if cmd == ShellCommand::ClearHistory {
                     self.clear_history();
+                    return UiOutcome::Stay;
+                }
+                if cmd == ShellCommand::ShowHidden {
+                    self.show_hidden();
                     return UiOutcome::Stay;
                 }
                 UiOutcome::Shell(cmd)
@@ -319,6 +378,12 @@ impl App {
                 for p in &mut self.plugins {
                     p.refresh();
                 }
+                // Hand-edits to [hidden] count as config too.
+                self.hidden = crate::config::Config::load()
+                    .list_values(HIDDEN)
+                    .into_iter()
+                    .collect();
+                self.listing = Listing::Normal;
                 // Clear back to the default list: the reload is otherwise
                 // invisible, since the query still matches the command row.
                 self.query.clear();
@@ -442,6 +507,16 @@ impl App {
         self.scroll = 0.0;
         let now = frecency::now();
 
+        // Typing leaves the hidden-entry view: it is a list to review, not
+        // something to search within.
+        if !self.query.is_empty() {
+            self.listing = Listing::Normal;
+        }
+        if self.listing == Listing::Hidden {
+            self.fill_hidden();
+            return;
+        }
+
         // Empty query: show the most-used entries instead of nothing. These
         // arrive already ranked, so they bypass the scoring sort below.
         if self.query.is_empty() {
@@ -452,6 +527,7 @@ impl App {
         for p in &mut self.plugins {
             p.query(&self.query, &mut self.results);
         }
+        self.drop_hidden();
         for item in &mut self.results {
             item.score += self.frecency.bonus(item.plugin, &item.payload, now);
         }
@@ -473,7 +549,15 @@ impl App {
     /// Payloads whose plugin is gone, or whose target no longer exists, are
     /// skipped.
     fn fill_default(&mut self, now: u64) {
-        for (plugin_id, payload) in self.frecency.top(MAX_SUGGESTIONS, now) {
+        // Take more than needed and stop at the cap: hidden entries are
+        // skipped, and they should not eat suggestion slots.
+        for (plugin_id, payload) in self.frecency.top(MAX_RESULTS, now) {
+            if self.results.len() == MAX_SUGGESTIONS {
+                break;
+            }
+            if self.hidden.contains(&key(plugin_id, payload)) {
+                continue;
+            }
             let Some(p) = self.plugins.iter_mut().find(|p| p.id() == plugin_id) else {
                 continue;
             };
@@ -495,10 +579,71 @@ impl App {
             }
             p.browse(free, &mut self.results);
         }
+        // Safe to filter after recording the start: suggestions were already
+        // filtered, so nothing before `commands_start` can be removed.
+        self.drop_hidden();
         if self.results.len() > commands_start {
             self.sections.push((commands_start, COMMANDS));
         }
         self.results.truncate(MAX_RESULTS);
+    }
+
+    fn drop_hidden(&mut self) {
+        if self.hidden.is_empty() {
+            return;
+        }
+        let hidden = &self.hidden;
+        self.results
+            .retain(|i| !hidden.contains(&key(i.plugin, &i.payload)));
+    }
+
+    /// List the hidden entries so they can be restored.
+    fn fill_hidden(&mut self) {
+        let mut keys: Vec<String> = self.hidden.iter().cloned().collect();
+        keys.sort();
+        for k in keys {
+            let Some((plugin_id, payload)) = k.split_once('/') else {
+                continue;
+            };
+            let Some(p) = self.plugins.iter_mut().find(|p| p.id() == plugin_id) else {
+                continue;
+            };
+            if let Some(item) = p.item_for(payload) {
+                self.results.push(item);
+            }
+        }
+        if !self.results.is_empty() {
+            self.sections.push((0, "Hidden"));
+        }
+    }
+
+    /// Switch to the hidden-entry listing.
+    pub fn show_hidden(&mut self) {
+        self.listing = Listing::Hidden;
+        self.query.clear();
+        self.pending_surrogate = None;
+        self.refresh_results();
+    }
+
+    /// Hide or restore the selected entry, and persist the change.
+    fn set_hidden(&mut self, hide: bool) {
+        let Some(item) = self.results.get(self.selected) else {
+            return;
+        };
+        let k = key(item.plugin, &item.payload);
+        if hide {
+            self.hidden.insert(k);
+        } else {
+            self.hidden.remove(&k);
+        }
+        let mut values: Vec<String> = self.hidden.iter().cloned().collect();
+        values.sort();
+        crate::config::set_list_file(HIDDEN, &values);
+
+        self.mode = Mode::Search;
+        let keep = self.selected;
+        self.refresh_results();
+        self.selected = keep.min(self.results.len().saturating_sub(1));
     }
 
     // ---- scrolling and hit-testing --------------------------------------

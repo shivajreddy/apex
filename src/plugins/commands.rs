@@ -77,6 +77,11 @@ fn all() -> Vec<Command> {
             "startup autostart boot signin",
         ),
         Command::new(
+            "hidden",
+            "Apex: Manage Hidden Entries",
+            "unhide restore show excluded removed",
+        ),
+        Command::new(
             "clear_history",
             "Apex: Clear Launch History",
             "frecency reset forget ranking",
@@ -133,6 +138,7 @@ impl Plugin for Commands {
             "quit" => ActionResult::Shell(ShellCommand::Quit),
             "tray" => ActionResult::Shell(ShellCommand::ToggleTray),
             "clear_history" => ActionResult::Shell(ShellCommand::ClearHistory),
+            "hidden" => ActionResult::Shell(ShellCommand::ShowHidden),
             "config" => {
                 open_config(false);
                 ActionResult::Dismiss
@@ -311,6 +317,21 @@ mod tests {
             c.activate(&item("clear_history")),
             ActionResult::Shell(ShellCommand::ClearHistory)
         ));
+        assert!(matches!(
+            c.activate(&item("hidden")),
+            ActionResult::Shell(ShellCommand::ShowHidden)
+        ));
+    }
+
+    #[test]
+    fn manage_hidden_is_findable_by_the_words_people_reach_for() {
+        for q in ["hidden", "unhide", "restore"] {
+            assert_eq!(
+                find(q).first().map(String::as_str),
+                Some("hidden"),
+                "query {q:?} should find Manage Hidden Entries"
+            );
+        }
     }
 
     #[test]

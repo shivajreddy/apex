@@ -148,7 +148,7 @@ pub fn run(config: &crate::config::Config) -> Result<()> {
         );
 
         // Attach application state to the window.
-        let app = Box::new(App::new(crate::plugins(config)));
+        let app = Box::new(App::new(crate::plugins(config), config));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
 
         if config.general_flag("tray_icon", true) {
@@ -542,8 +542,9 @@ unsafe fn run_shell_command(hwnd: HWND, cmd: ShellCommand) {
                 toggle_tray(hwnd);
                 hide(hwnd);
             }
-            // Handled by App, which owns the history.
-            ShellCommand::ClearHistory => {
+            // Answered by App, which owns both the history and the
+            // hidden set.
+            ShellCommand::ClearHistory | ShellCommand::ShowHidden => {
                 resize_to_content(hwnd);
                 invalidate(hwnd);
             }
