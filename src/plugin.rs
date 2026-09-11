@@ -62,6 +62,8 @@ pub enum ShellCommand {
     ClearHistory,
     /// List hidden entries so they can be restored.
     ShowHidden,
+    /// List configured source folders so they can be removed.
+    ShowSources,
 }
 
 /// What the UI should do after a plugin handled an action.

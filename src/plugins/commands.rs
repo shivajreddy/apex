@@ -82,9 +82,14 @@ fn all() -> Vec<Command> {
             "index scan portable tools directory",
         ),
         Command::new(
+            "sources",
+            "Apex: Manage Source Folders",
+            "remove delete indexed directory folders",
+        ),
+        Command::new(
             "hidden",
             "Apex: Manage Hidden Entries",
-            "unhide restore show excluded removed",
+            "unhide restore show excluded",
         ),
         Command::new(
             "clear_history",
@@ -144,6 +149,7 @@ impl Plugin for Commands {
             "tray" => ActionResult::Shell(ShellCommand::ToggleTray),
             "clear_history" => ActionResult::Shell(ShellCommand::ClearHistory),
             "hidden" => ActionResult::Shell(ShellCommand::ShowHidden),
+            "sources" => ActionResult::Shell(ShellCommand::ShowSources),
             "add_source" => source_form("Add Source Folder", ""),
             "config" => {
                 open_config(false);
@@ -365,6 +371,37 @@ mod tests {
             c.activate(&item("hidden")),
             ActionResult::Shell(ShellCommand::ShowHidden)
         ));
+        assert!(matches!(
+            c.activate(&item("sources")),
+            ActionResult::Shell(ShellCommand::ShowSources)
+        ));
+    }
+
+    #[test]
+    fn adding_and_managing_sources_are_told_apart() {
+        // Two commands about the same noun, so the distinguishing verb has
+        // to win rather than the shared word.
+        assert_eq!(
+            find("add source").first().map(String::as_str),
+            Some("add_source")
+        );
+        for q in ["manage sources", "source folders", "remove", "delete"] {
+            assert_eq!(
+                find(q).first().map(String::as_str),
+                Some("sources"),
+                "query {q:?} should find Manage Source Folders"
+            );
+        }
+    }
+
+    #[test]
+    fn keywords_are_synonyms_not_phrase_material() {
+        // Keywords sit after the label in the haystack, so a query pairing a
+        // keyword with a label word in the other order cannot match as a
+        // subsequence. Documented here so the limit is deliberate rather
+        // than discovered.
+        assert!(find("remove source").is_empty());
+        assert_eq!(find("remove").first().map(String::as_str), Some("sources"));
     }
 
     #[test]

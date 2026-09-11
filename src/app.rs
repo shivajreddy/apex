@@ -24,6 +24,10 @@ const HIDDEN: &str = "hidden";
 // identifiers plugins use.
 const ACTION_HIDE: &str = "__hide";
 const ACTION_UNHIDE: &str = "__unhide";
+const ACTION_REMOVE_SOURCE: &str = "__remove_source";
+
+/// Owner of rows the shell builds itself, which no plugin can activate.
+const SHELL: &str = "__shell";
 
 /// Identity of a result across plugins.
 ///
@@ -40,6 +44,8 @@ pub enum Listing {
     Normal,
     /// Hidden entries only, so they can be restored.
     Hidden,
+    /// Configured source folders, so they can be removed.
+    Sources,
 }
 
 pub enum Mode {
@@ -91,6 +97,7 @@ pub struct App {
     /// listing, here rather than per-plugin so one action covers them all.
     hidden: std::collections::HashSet<String>,
     listing: Listing,
+    folder_icon: Option<std::sync::Arc<crate::plugin::Icon>>,
     /// Launch history, applied across all plugins. Lives here rather than in
     /// any one plugin: ranking by past use is a property of the shell, so
     /// every plugin gets it without reimplementing it.
@@ -112,6 +119,7 @@ impl App {
             scroll: 0.0,
             hidden: config.list_values(HIDDEN).into_iter().collect(),
             listing: Listing::Normal,
+            folder_icon: None,
             frecency: Frecency::load(),
         }
     }
@@ -212,16 +220,19 @@ impl App {
         let mut actions = plugin.actions(item);
         // Shell-level, so it is offered on every row whatever produced it,
         // rather than each plugin reimplementing the same entry.
-        actions.push(if self.listing == Listing::Hidden {
-            Action {
+        actions.push(match self.listing {
+            Listing::Hidden => Action {
                 id: ACTION_UNHIDE,
                 label: "Unhide".to_string(),
-            }
-        } else {
-            Action {
+            },
+            Listing::Sources => Action {
+                id: ACTION_REMOVE_SOURCE,
+                label: "Remove Source Folder".to_string(),
+            },
+            Listing::Normal => Action {
                 id: ACTION_HIDE,
                 label: "Hide from Apex".to_string(),
-            }
+            },
         });
         self.mode = Mode::Actions {
             actions,
@@ -255,6 +266,10 @@ impl App {
             }
             ACTION_UNHIDE => {
                 self.set_hidden(false);
+                return UiOutcome::Stay;
+            }
+            ACTION_REMOVE_SOURCE => {
+                self.remove_source();
                 return UiOutcome::Stay;
             }
             _ => {}
@@ -369,6 +384,10 @@ impl App {
                 }
                 if cmd == ShellCommand::ShowHidden {
                     self.show_hidden();
+                    return UiOutcome::Stay;
+                }
+                if cmd == ShellCommand::ShowSources {
+                    self.show_sources();
                     return UiOutcome::Stay;
                 }
                 UiOutcome::Shell(cmd)
@@ -512,9 +531,16 @@ impl App {
         if !self.query.is_empty() {
             self.listing = Listing::Normal;
         }
-        if self.listing == Listing::Hidden {
-            self.fill_hidden();
-            return;
+        match self.listing {
+            Listing::Hidden => {
+                self.fill_hidden();
+                return;
+            }
+            Listing::Sources => {
+                self.fill_sources();
+                return;
+            }
+            Listing::Normal => {}
         }
 
         // Empty query: show the most-used entries instead of nothing. These
@@ -617,9 +643,79 @@ impl App {
         }
     }
 
+    /// List the configured source folders so they can be removed.
+    ///
+    /// Built here rather than by a plugin: these rows describe apex's own
+    /// configuration, and nothing owns them. They are not launchable, so
+    /// Enter does nothing and removal lives behind Ctrl+K - deleting a
+    /// folder of entries is not something to trigger by pressing Return.
+    fn fill_sources(&mut self) {
+        let sources = crate::config::Config::load().list_values(crate::config::SOURCES);
+        let art = self.folder_icon();
+        for path in sources {
+            let name = std::path::Path::new(&path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(path.as_str())
+                .to_string();
+            self.results.push(ResultItem {
+                plugin: SHELL,
+                title: name,
+                badge: None,
+                subtitle: "Source folder".to_string(),
+                payload: path,
+                score: 0,
+                icon: art.clone(),
+            });
+        }
+        if !self.results.is_empty() {
+            self.sections.push((0, "Source folders"));
+        }
+    }
+
+    /// Folder icon for the sources listing, extracted on first use so it
+    /// costs nothing for anyone who never opens that view.
+    fn folder_icon(&mut self) -> Option<std::sync::Arc<crate::plugin::Icon>> {
+        if self.folder_icon.is_none() {
+            self.folder_icon = crate::icon::stock(
+                windows::Win32::UI::Shell::SIID_FOLDER,
+            )
+            .map(std::sync::Arc::new);
+        }
+        self.folder_icon.clone()
+    }
+
+    /// Stop indexing a source folder, and drop the entries it contributed.
+    fn remove_source(&mut self) {
+        let Some(item) = self.results.get(self.selected) else {
+            return;
+        };
+        let target = item.payload.clone();
+        let mut sources = crate::config::Config::load().list_values(crate::config::SOURCES);
+        sources.retain(|s| !s.eq_ignore_ascii_case(&target));
+        crate::config::set_list_file(crate::config::SOURCES, &sources);
+
+        self.mode = Mode::Search;
+        // Reindex, or the folder's entries linger until the next reload.
+        for p in &mut self.plugins {
+            p.refresh();
+        }
+        let keep = self.selected;
+        self.refresh_results();
+        self.selected = keep.min(self.results.len().saturating_sub(1));
+    }
+
     /// Switch to the hidden-entry listing.
     pub fn show_hidden(&mut self) {
         self.listing = Listing::Hidden;
+        self.query.clear();
+        self.pending_surrogate = None;
+        self.refresh_results();
+    }
+
+    /// Switch to the source-folder listing.
+    pub fn show_sources(&mut self) {
+        self.listing = Listing::Sources;
         self.query.clear();
         self.pending_surrogate = None;
         self.refresh_results();

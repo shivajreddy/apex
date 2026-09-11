@@ -544,7 +544,9 @@ unsafe fn run_shell_command(hwnd: HWND, cmd: ShellCommand) {
             }
             // Answered by App, which owns both the history and the
             // hidden set.
-            ShellCommand::ClearHistory | ShellCommand::ShowHidden => {
+            ShellCommand::ClearHistory
+            | ShellCommand::ShowHidden
+            | ShellCommand::ShowSources => {
                 resize_to_content(hwnd);
                 invalidate(hwnd);
             }
