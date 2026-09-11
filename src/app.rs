@@ -214,10 +214,15 @@ impl App {
         let Some(item) = self.results.get(self.selected) else {
             return false;
         };
-        let Some(plugin) = self.plugins.iter().find(|p| p.id() == item.plugin) else {
-            return false;
-        };
-        let mut actions = plugin.actions(item);
+        // Rows the shell builds itself - source folders - have no owning
+        // plugin. They still get the shell-level action appended below, so a
+        // missing plugin means "no plugin actions", not "no panel".
+        let mut actions = self
+            .plugins
+            .iter()
+            .find(|p| p.id() == item.plugin)
+            .map(|p| p.actions(item))
+            .unwrap_or_default();
         // Shell-level, so it is offered on every row whatever produced it,
         // rather than each plugin reimplementing the same entry.
         actions.push(match self.listing {
@@ -845,5 +850,67 @@ impl App {
             Mode::Form { fields, .. } => base.max(crate::render::form_window_height(fields.len())),
             _ => base,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app() -> App {
+        App::new(Vec::new(), &crate::config::Config::from_text(""))
+    }
+
+    fn row(plugin: &'static str) -> ResultItem {
+        ResultItem {
+            plugin,
+            title: "Tools".into(),
+            badge: None,
+            subtitle: "Source folder".into(),
+            payload: r"D:\Tools".into(),
+            score: 0,
+            icon: None,
+        }
+    }
+
+    /// Regression: source rows carry no owning plugin, and open_actions used
+    /// to bail out when it could not find one - so Ctrl+K did nothing at all.
+    #[test]
+    fn actions_open_for_rows_that_no_plugin_owns() {
+        let mut a = app();
+        a.listing = Listing::Sources;
+        a.results.push(row(SHELL));
+        assert!(a.open_actions(), "panel should open for a shell-built row");
+        match &a.mode {
+            Mode::Actions { actions, .. } => {
+                assert_eq!(actions.len(), 1);
+                assert_eq!(actions[0].id, ACTION_REMOVE_SOURCE);
+            }
+            _ => panic!("expected the actions panel"),
+        }
+    }
+
+    #[test]
+    fn the_offered_action_follows_the_listing() {
+        for (listing, expected) in [
+            (Listing::Normal, ACTION_HIDE),
+            (Listing::Hidden, ACTION_UNHIDE),
+            (Listing::Sources, ACTION_REMOVE_SOURCE),
+        ] {
+            let mut a = app();
+            a.listing = listing;
+            a.results.push(row(SHELL));
+            assert!(a.open_actions());
+            match &a.mode {
+                Mode::Actions { actions, .. } => assert_eq!(actions[0].id, expected),
+                _ => panic!("expected the actions panel"),
+            }
+        }
+    }
+
+    #[test]
+    fn no_results_means_no_panel() {
+        let mut a = app();
+        assert!(!a.open_actions());
     }
 }

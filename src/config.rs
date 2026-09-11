@@ -81,7 +81,7 @@ impl Config {
         Self::from_text(&text)
     }
 
-    fn from_text(text: &str) -> Self {
+    pub(crate) fn from_text(text: &str) -> Self {
         let values = parse(text);
         let (hotkey_mods, hotkey_vk) =
             hotkey_from(&values).unwrap_or((DEFAULT_HOTKEY_MODS, DEFAULT_HOTKEY_VK));
