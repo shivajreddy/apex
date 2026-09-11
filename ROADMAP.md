@@ -48,12 +48,14 @@ of private memory; reading the index file adds none.
 
 **Core shell**
 - Borderless `WS_POPUP` window, Windows 11 rounded corners, dark mode
-- Acrylic backdrop: the desktop compositor blurs whatever is behind the
-  window, with the dark tint drawn over it — the Raycast look. The frame is
-  extended into the client area and the backdrop type is set once at
-  creation, so the blur is there the instant the window appears and survives
-  hide/re-show. `[appearance] backdrop = "none"` paints it solid, and systems
-  before Windows 11 22H2 fall back to solid on their own.
+- Acrylic backdrop, self-rendered: on each summon, while the window is
+  positioned but still hidden, apex captures the screen behind it, blurs it,
+  and bakes that frost straight into the window bitmap with the dark tint on
+  top — the Raycast look. It does not use the DWM system backdrop, which
+  lagged, dropped to solid on re-show, and sometimes never appeared; the
+  self-rendered frost is there on the first frame, every summon, on any
+  Windows version. `[appearance] backdrop = "none"` paints it solid;
+  `opacity` sets the tint strength over the blur.
 - Instant show and hide by default. An optional 110 ms scale-and-fade
   settle is available with `[appearance] animation = true`, but off by
   default — an instant summon reads as snappier.
@@ -84,11 +86,12 @@ of private memory; reading the index file adds none.
 **Rendering**
 - Direct2D + DirectWrite, software rasterizer (skips D3D/DXGI, saving
   ~50 MB) — the scene is small and redraws only on input
-- Drawn into a per-pixel-alpha bitmap and presented with
-  `UpdateLayeredWindow`. That is what lets the compositor's acrylic show
-  through; an `ID2D1HwndRenderTarget` presents opaquely, and the system
-  backdrop behind it only ever renders its solid fallback (measured, not
-  guessed — see the spike notes in `window::backdrop` and `render`).
+- Drawn into a 32-bit DIB and presented with `UpdateLayeredWindow`. The
+  frosted background is composited into that DIB directly: the captured
+  screen behind the window is downscaled hard, box-blurred, and stretched
+  back up with bilinear filtering (which finishes the blur), then the tint
+  and content are drawn over it. No compositor effect is involved, so the
+  frost cannot lag, drop out, or depend on a Windows version.
 - Renderer released entirely while hidden
 - Dark theme, blinking caret, selection highlight, result rows with icons
 - Text editing in every field: caret movement by char and word, Home/End,
@@ -205,11 +208,12 @@ Polish the launcher until it's the fastest path to any app.
       because measurement showed enumerating the AppsFolder costs more
       resident memory than extracting the icons does.
 - [x] **Mouse support** — hover to highlight, click to launch, wheel to scroll
-- [x] **Blur / acrylic backdrop** — via a layered window presented with
-      `UpdateLayeredWindow` plus `DWMSBT_TRANSIENTWINDOW`, as predicted.
-      Windows 11 22H2+; earlier systems get a solid window. A Windows 10
-      path through the undocumented `SetWindowCompositionAttribute` accent
-      policy is possible but not done.
+- [x] **Blur / acrylic backdrop** — self-rendered. First tried the DWM
+      system backdrop (`DWMSBT_TRANSIENTWINDOW`); it lagged, dropped to
+      solid on re-show, and proved too unreliable. Replaced with capturing
+      the screen behind the window, blurring it, and baking it into the
+      layered-window bitmap — frost on the first frame, every summon, any
+      Windows version, no compositor dependency.
 - [x] **Fade/scale animation** on summon — scale 96.5% → 100% and content
       opacity 60% → 100% over 110 ms, eased. Per-pixel, because a layered
       window's constant alpha below 255 makes the compositor drop the blur.

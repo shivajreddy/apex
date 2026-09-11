@@ -109,6 +109,23 @@ pub struct Frame<'a> {
     /// How far the list is scrolled, in DIPs.
     pub scroll: f32,
     pub panel: Option<PanelView<'a>>,
+    /// A pre-blurred snapshot of whatever was behind the window when it was
+    /// summoned, drawn as the frosted background under the tint. `None` paints
+    /// the window solid. See [`Backdrop`].
+    pub backdrop: Option<&'a Backdrop>,
+}
+
+/// The acrylic background, rendered by apex itself rather than the compositor:
+/// a small, blurred, opaque snapshot of the desktop behind the window at the
+/// moment it was summoned. Baked straight into the window bitmap, so the
+/// frost is there on the very first frame and never depends on DWM keeping a
+/// live backdrop alive. Device-independent BGRA (alpha forced opaque), stored
+/// small - it is stretched up with bilinear filtering, which is itself part
+/// of the blur.
+pub struct Backdrop {
+    pub width: u32,
+    pub height: u32,
+    pub bgra: Vec<u8>,
 }
 
 /// Overlay state (actions panel or text input), anchored bottom-right.
@@ -249,6 +266,10 @@ struct Brushes {
     badge_fg: ID2D1SolidColorBrush,
     selection: ID2D1SolidColorBrush,
     border: ID2D1SolidColorBrush,
+    /// Tint drawn over the blurred backdrop (translucent), and the whole
+    /// window fill when there is no backdrop (opaque).
+    bg_tint: ID2D1SolidColorBrush,
+    bg_solid: ID2D1SolidColorBrush,
 }
 
 /// A 32bpp top-down DIB selected into a memory DC: the pixels the window is
@@ -419,6 +440,7 @@ impl Renderer {
                 rt.CreateSolidColorBrush(c, None)
             };
             let p = self.palette;
+            let bg = self.background;
             self.target = Some(Target {
                 brushes: Brushes {
                     text: brush(&p.text)?,
@@ -430,6 +452,8 @@ impl Renderer {
                     badge_fg: brush(&p.badge_fg)?,
                     selection: brush(&p.selection)?,
                     border: brush(&p.border)?,
+                    bg_tint: brush(&bg)?,
+                    bg_solid: brush(&D2D1_COLOR_F { a: 1.0, ..bg })?,
                 },
                 icons: HashMap::new(),
                 dib,
@@ -540,6 +564,7 @@ impl Renderer {
             sections,
             scroll,
             panel,
+            backdrop,
         } = frame;
         let (query, caret_visible, selected, scroll) = (*query, *caret_visible, *selected, *scroll);
         let Self {
@@ -551,7 +576,6 @@ impl Renderer {
             fmt_panel,
             fmt_badge,
             fmt_header,
-            background,
             target,
             ..
         } = self;
@@ -577,17 +601,44 @@ impl Renderer {
                 &b.badge_fg,
                 &b.selection,
                 &b.border,
+                &b.bg_tint,
+                &b.bg_solid,
             ] {
                 brush.SetOpacity(opacity);
             }
 
-            rt.BeginDraw();
-            rt.Clear(Some(&D2D1_COLOR_F {
-                a: background.a * opacity,
-                ..*background
-            }));
             let width = t.dib.width as f32 * 96.0 / t.dpi;
             let height = t.dib.height as f32 * 96.0 / t.dpi;
+            let full = D2D_RECT_F {
+                left: 0.0,
+                top: 0.0,
+                right: width,
+                bottom: height,
+            };
+
+            rt.BeginDraw();
+            // Start fully transparent so the corners DWM rounds away stay
+            // clear, then lay down the background: the pre-blurred snapshot
+            // stretched to fill the window (the upscale is part of the blur),
+            // with the tint over it - or a solid fill when there is no
+            // backdrop. This is the whole "acrylic": no compositor effect,
+            // just pixels we drew.
+            rt.Clear(None);
+            match backdrop {
+                Some(bd) => {
+                    if let Some(bmp) = backdrop_bitmap(rt, bd) {
+                        rt.DrawBitmap(
+                            &bmp,
+                            Some(&full),
+                            opacity,
+                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                            None,
+                        );
+                    }
+                    rt.FillRectangle(&full, &b.bg_tint);
+                }
+                None => rt.FillRectangle(&full, &b.bg_solid),
+            }
 
             // Search input (query text or placeholder).
             let input_rect = D2D_RECT_F {
@@ -1022,6 +1073,32 @@ unsafe fn draw_field(
             );
         }
         rt.PopAxisAlignedClip();
+    }
+}
+
+/// Turn the blurred snapshot into a device bitmap. Made fresh each frame -
+/// it is tiny and changes every summon, so caching would cost more than it
+/// saves.
+unsafe fn backdrop_bitmap(rt: &ID2D1RenderTarget, bd: &Backdrop) -> Option<ID2D1Bitmap> {
+    unsafe {
+        let props = D2D1_BITMAP_PROPERTIES {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+        };
+        rt.CreateBitmap(
+            D2D_SIZE_U {
+                width: bd.width,
+                height: bd.height,
+            },
+            Some(bd.bgra.as_ptr() as *const core::ffi::c_void),
+            bd.width * 4,
+            &props,
+        )
+        .ok()
     }
 }
 

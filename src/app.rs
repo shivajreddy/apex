@@ -96,6 +96,10 @@ pub struct App {
     /// `[appearance] opacity` override for the tint strength over the blur,
     /// if the user set one; otherwise the palette's own value is used.
     pub tint: Option<f32>,
+    /// The frosted background for the current summon: a blurred snapshot of
+    /// what was behind the window, captured by the shell just before showing.
+    /// Rebuilt every summon; `None` paints solid.
+    pub backdrop: Option<crate::render::Backdrop>,
     /// When the current summon animation started, until it has finished.
     pub summon: Option<std::time::Instant>,
     /// DPI of the monitor the window was summoned on. Everything is laid
@@ -138,6 +142,7 @@ impl App {
             },
             dark: true,
             tint: config.float("appearance", "opacity"),
+            backdrop: None,
             summon: None,
             dpi: 96.0,
             query: TextField::default(),

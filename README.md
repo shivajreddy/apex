@@ -204,9 +204,11 @@ quicklinks = true
 commands = true
 ```
 
-Acrylic needs Windows 11 22H2 or later; older systems get a solid window
-without being asked. With Windows' own "Transparency effects" switched off,
-the blur is replaced by a solid colour behind the tint.
+The frosted background is rendered by apex itself — it captures and blurs
+the screen behind the window on each summon — so it works on any Windows
+version and does not depend on the system "Transparency effects" setting.
+The blur is a snapshot from the moment you summon, not a live effect. Use
+`opacity` to set how much of it shows through the tint.
 
 Apex only ever rewrites the sections it owns - `[aliases]`, `[quicklinks.*]`,
 `[sources]`, `[hidden]`, and single `[general]` keys - by line surgery. Every
