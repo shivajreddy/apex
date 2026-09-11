@@ -2,7 +2,7 @@
 # The crate name `apex` was already taken on crates.io. The binary below is
 # still `apex`, so nothing about using it changes.
 name = "apex-launcher"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 description = "Ultra-fast, ultra-lightweight launcher for Windows. Raycast, but native."
 repository = "https://github.com/shivajreddy/apex"
