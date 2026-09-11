@@ -20,7 +20,6 @@ mod config;
 mod frecency;
 mod fuzzy;
 mod icon;
-mod launch;
 mod plugin;
 mod plugins;
 mod render;

@@ -22,7 +22,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use windows::Win32::UI::Shell::{SHSTOCKICONID, SIID_APPLICATION, SIID_FOLDER, SIID_INTERNET};
+use windows::Win32::UI::Shell::{
+    SHSTOCKICONID, SIID_APPLICATION, SIID_FOLDER, SIID_INTERNET, ShellExecuteW,
+};
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows::core::{PCWSTR, w};
 
 use crate::config;
 use crate::fuzzy;
@@ -424,10 +428,41 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
 /// Hand the link to the shell, optionally through a specific program.
 fn open(link: &str, open_with: &str) -> bool {
-    let program = (!open_with.is_empty()).then_some(open_with);
-    crate::launch::open(link, program)
+    let link_w = wide(link);
+    let prog_w = wide(open_with);
+    unsafe {
+        let inst = if open_with.is_empty() {
+            ShellExecuteW(
+                None,
+                w!("open"),
+                PCWSTR(link_w.as_ptr()),
+                None,
+                None,
+                SW_SHOWNORMAL,
+            )
+        } else {
+            // The chosen program becomes the target and the link its argument.
+            ShellExecuteW(
+                None,
+                w!("open"),
+                PCWSTR(prog_w.as_ptr()),
+                PCWSTR(link_w.as_ptr()),
+                None,
+                SW_SHOWNORMAL,
+            )
+        };
+        let ok = inst.0 as isize > 32;
+        if !ok {
+            crate::dlog!("quicklinks: failed to open {link}");
+        }
+        ok
+    }
 }
 
 #[cfg(test)]
