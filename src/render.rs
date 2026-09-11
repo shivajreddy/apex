@@ -52,20 +52,27 @@ const FORM_ROW: f32 = 50.0;
 const FORM_TITLE_H: f32 = 28.0;
 const FORM_LABEL_H: f32 = 18.0;
 
-/// Rows visible at once. The list scrolls past this rather than growing the
-/// window, so the default view can list every entry without filling the
-/// screen.
+/// Rows the list viewport is tall enough to show at once. The window is a
+/// fixed size (see [`content_height`]): the list always occupies this many
+/// rows' worth of space, scrolling when there are more and leaving the lower
+/// part empty when there are fewer. Keeping the window one size means the
+/// captured backdrop is never stretched to a different shape, and the window
+/// never jumps around as results come and go.
 pub const MAX_VISIBLE_ROWS: usize = 8;
 
-/// Full height of the list, headers included. May exceed the viewport.
+/// The fixed height of the list viewport - always this, regardless of how
+/// many rows there are.
+pub const LIST_VIEWPORT_H: f32 = LIST_PAD * 2.0 + MAX_VISIBLE_ROWS as f32 * ROW_H;
+
+/// Full height of the list content, headers included. May exceed the
+/// viewport, in which case the list scrolls.
 pub fn list_content_height(rows: usize, headers: usize) -> f32 {
     LIST_PAD * 2.0 + headers as f32 * HEADER_H + rows as f32 * ROW_H
 }
 
-/// Height actually given to the list: the content, capped.
-pub fn list_viewport_height(rows: usize, headers: usize) -> f32 {
-    let cap = LIST_PAD * 2.0 + MAX_VISIBLE_ROWS as f32 * ROW_H;
-    list_content_height(rows, headers).min(cap)
+/// Height given to the list on screen: always the fixed viewport.
+pub fn list_viewport_height(_rows: usize, _headers: usize) -> f32 {
+    LIST_VIEWPORT_H
 }
 
 /// Offset of row `index` within the list content.
@@ -77,13 +84,12 @@ pub fn row_offset(sections: &[(usize, &'static str)], index: usize) -> f32 {
     LIST_PAD + headers as f32 * HEADER_H + index as f32 * ROW_H
 }
 
-/// Total window height for `rows` results under `headers` section headings.
-pub fn content_height(rows: usize, headers: usize) -> f32 {
-    if rows == 0 {
-        INPUT_H
-    } else {
-        INPUT_H + 1.0 + list_viewport_height(rows, headers) + BAR_H
-    }
+/// The window's content height. Fixed: input, separator, the full list
+/// viewport, and the bottom bar - the same whether the list is full, has one
+/// row, or is empty. A fixed window keeps the frosted backdrop from being
+/// stretched out of shape and stops the window resizing as you type.
+pub fn content_height(_rows: usize, _headers: usize) -> f32 {
+    INPUT_H + 1.0 + LIST_VIEWPORT_H + BAR_H
 }
 
 fn form_panel_height(fields: usize) -> f32 {
@@ -663,7 +669,10 @@ impl Renderer {
                 }),
             );
 
-            if !results.is_empty() {
+            // The list region and bottom bar are always drawn - the window is
+            // a fixed size, so an empty result set leaves the list area blank
+            // (with a hint) rather than collapsing the window to the input.
+            {
                 // Separator under the input.
                 rt.FillRectangle(
                     &D2D_RECT_F {
@@ -786,6 +795,23 @@ impl Renderer {
                         };
                         draw_text(rt, &item.subtitle, fmt_subtitle, &row, &b.dim);
                     }
+                }
+
+                // Empty state: a query that matched nothing. (An empty query
+                // shows the default list, so this only appears while typing.)
+                if results.is_empty() && !query.is_empty() {
+                    draw_text(
+                        rt,
+                        "No results",
+                        fmt_title,
+                        &D2D_RECT_F {
+                            left: PAD_X,
+                            top: list_top,
+                            right: width - PAD_X,
+                            bottom: list_top + view_h,
+                        },
+                        &b.dim,
+                    );
                 }
                 rt.PopAxisAlignedClip();
 
