@@ -165,7 +165,16 @@ Polish the launcher until it's the fastest path to any app.
       `UpdateLayeredWindow` is the likely route
 - [ ] **Fade/scale animation** on summon
 - [ ] **`run_as_admin` setting** — elevated logon task, so the hotkey works
-      over Task Manager and other elevated windows
+      over Task Manager and other elevated windows.
+      *Attempted and reverted* (`e1866bf`, `431200f`): an elevated apex
+      became unreliable to summon — it appeared but seemingly failed to take
+      foreground, so the next keystroke dismissed it. Never root-caused. Two
+      things a second attempt needs that the first lacked: a way to test
+      elevated behaviour before enabling it, and an answer for why
+      `force_foreground` fails from a high-integrity process. Note also that
+      launched apps inherit the elevated token, so any retry needs the
+      de-elevation path (hand the target to `explorer.exe`) or it will
+      silently run everything as administrator.
 
 ### v0.3 — "More than apps"
 
