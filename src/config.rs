@@ -26,6 +26,22 @@ start_on_startup = true
 # Show a tray icon (right-click for Open / Reload / Config / Quit).
 tray_icon = true
 
+[appearance]
+# "acrylic" blurs whatever is behind the window (Windows 11 22H2 or later;
+# older systems and "Transparency effects" off fall back to a solid tint).
+# "none" paints the window solid.
+backdrop = "acrylic"
+# "system" follows Windows' light/dark setting for apps; "dark" or "light"
+# pins one.
+theme = "system"
+# Tint strength over the acrylic blur, 0.0 (clear) to 1.0 (solid). Lower
+# shows more of the blurred desktop; higher is more opaque. Ignored when
+# backdrop = "none".
+opacity = 0.5
+# Scale-and-fade the window in when summoned. Off by default - an instant
+# show feels snappier. Set true to enable it.
+animation = false
+
 [hotkey]
 # Modifiers joined with '+': ctrl, alt, shift, win. Use "none" for bare keys.
 modifiers = "ctrl"
@@ -102,10 +118,36 @@ impl Config {
 
     /// Boolean from the `[general]` section with a default.
     pub fn general_flag(&self, key: &str, default: bool) -> bool {
-        match self.values.get(&("general".to_string(), key.to_string())) {
+        self.flag("general", key, default)
+    }
+
+    /// Boolean from any section with a default.
+    pub fn flag(&self, section: &str, key: &str, default: bool) -> bool {
+        match self.values.get(&(section.to_string(), key.to_string())) {
             Some(v) => v.eq_ignore_ascii_case("true"),
             None => default,
         }
+    }
+
+    /// String from any section, if set.
+    pub fn string(&self, section: &str, key: &str) -> Option<&str> {
+        self.values
+            .get(&(section.to_string(), key.to_string()))
+            .map(String::as_str)
+    }
+
+    /// Float from any section, if set and parseable.
+    pub fn float(&self, section: &str, key: &str) -> Option<f32> {
+        self.string(section, key).and_then(|v| v.trim().parse().ok())
+    }
+
+    /// Whether the window should ask the compositor for an acrylic
+    /// backdrop. `[appearance] backdrop = "none"` opts out, for a solid
+    /// window; anything else - including an absent key - means acrylic.
+    pub fn acrylic(&self) -> bool {
+        !self
+            .string("appearance", "backdrop")
+            .is_some_and(|v| v.eq_ignore_ascii_case("none"))
     }
 
     /// `[aliases]` entries: alias (lowercased by the parser) -> app id.
@@ -580,6 +622,22 @@ mod tests {
         assert!(cfg.plugin_enabled("search"));
         assert!(cfg.general_flag("start_menu", true));
         assert!(cfg.general_flag("start_on_startup", true));
+        assert!(cfg.acrylic());
+        // Animation ships off; the default file states it explicitly.
+        assert!(!cfg.flag("appearance", "animation", true));
+    }
+
+    #[test]
+    fn appearance_defaults_to_acrylic_and_only_none_opts_out() {
+        assert!(Config::from_text("").acrylic());
+        assert!(Config::from_text("[appearance]\nbackdrop = \"acrylic\"\n").acrylic());
+        assert!(Config::from_text("[appearance]\nbackdrop = 'mica'\n").acrylic());
+        assert!(!Config::from_text("[appearance]\nbackdrop = \"None\"\n").acrylic());
+        assert!(!Config::from_text("[appearance]\nanimation = false\n").flag(
+            "appearance",
+            "animation",
+            true
+        ));
     }
 
     #[test]

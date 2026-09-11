@@ -5,8 +5,16 @@
 //! lets Apex claim system-reserved combos like Ctrl+Esc (Start menu) exactly
 //! the way Raycast does - and it can never fail with "hotkey already
 //! registered".
+//!
+//! The hook runs on its own thread whose only job is to host it. A
+//! `WH_KEYBOARD_LL` proc must return within `LowLevelHooksTimeout` (capped
+//! at 1s), or Windows silently drops that event and passes the chord
+//! through to the shell - so a hook sharing the UI thread misses summons
+//! whenever the UI thread is mid-render, mid-launch, or broadcasting a
+//! setting change. A dedicated thread never stalls, so the chord is never
+//! missed. It only posts to the window; all the work stays on the UI thread.
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering::Relaxed};
 
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::*;
@@ -14,10 +22,15 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
 };
-use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+use windows::Win32::System::SystemInformation::GetTickCount64;
+use windows::Win32::System::Threading::{AttachThreadInput, CreateMutexW, GetCurrentThreadId};
+use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::{
@@ -27,11 +40,17 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 
 use crate::app::{App, Mode, UiOutcome};
+use crate::editor::{Edit, Motion};
 use crate::plugin::ShellCommand;
 use crate::render;
 
 const CARET_TIMER_ID: usize = 1;
 const CARET_BLINK_MS: u32 = 530;
+/// Drives the summon animation; fires as fast as USER timers go (~10ms).
+const ANIM_TIMER_ID: usize = 2;
+/// Length of the summon animation. Short enough that typing straight
+/// after the hotkey never feels held up - input is live from frame one.
+const SUMMON_MS: u128 = 110;
 const HOTKEY_ID: i32 = 1;
 
 /// Posted by the keyboard hook when the hotkey combo fires.
@@ -54,16 +73,36 @@ static HOOK_MODS: AtomicU32 = AtomicU32::new(0);
 static HOOK_VK: AtomicU32 = AtomicU32::new(0);
 /// Suppresses autorepeat while the hotkey chord is held.
 static HOOK_HELD: AtomicBool = AtomicBool::new(false);
-/// Window is currently shown.
+/// Window is currently shown (intent, set the instant `show` begins its
+/// work - not a promise that focus has landed yet).
 static VISIBLE: AtomicBool = AtomicBool::new(false);
+/// Held for the duration of `show`/`hide` so a `WM_ACTIVATE` delivered
+/// synchronously from inside a foreground call can't re-enter and hide the
+/// window mid-show (or re-hide mid-hide).
+static BUSY: AtomicBool = AtomicBool::new(false);
+/// `GetTickCount64` value before which automatic dismissals are ignored.
+/// Set just after a summon: focus is grabbed a few ms into `show`, and until
+/// it lands a keystroke or activation bounce would otherwise dismiss the
+/// window the user just opened (and wipe what they typed). The explicit
+/// toggle chord is exempt - closing on purpose should be instant.
+static GUARD_UNTIL: AtomicU64 = AtomicU64::new(0);
+/// How long that guard lasts. Comfortably longer than the ~50ms it takes to
+/// show and win foreground, short enough to never swallow a real dismissal.
+const GUARD_MS: u64 = 250;
 /// Mouse hook handle; installed only while the window is visible.
 static MOUSE_HOOK: AtomicIsize = AtomicIsize::new(0);
 /// Single-instance mutex, kept so Restart can release it before relaunching.
 static INSTANCE_MUTEX: AtomicIsize = AtomicIsize::new(0);
+/// Thread id of the keyboard-hook thread, so shutdown can post it WM_QUIT.
+static HOOK_THREAD: AtomicU32 = AtomicU32::new(0);
 /// Embedded app icon, reused for the tray.
 static APP_ICON: AtomicIsize = AtomicIsize::new(0);
 /// Whether the tray icon is currently registered.
 static TRAY_SHOWN: AtomicBool = AtomicBool::new(false);
+/// Whether the acrylic backdrop is in use, so `show` can re-assert it: the
+/// DWM system backdrop is not reliably kept across a hide/re-show and has to
+/// be re-applied each time the window comes back.
+static ACRYLIC: AtomicBool = AtomicBool::new(false);
 /// Last WM_MOUSEMOVE lparam, so a stationary pointer is not treated as hover.
 static LAST_MOUSE: AtomicIsize = AtomicIsize::new(-1);
 
@@ -116,8 +155,10 @@ pub fn run(config: &crate::config::Config) -> Result<()> {
         }
 
         // WS_EX_TOOLWINDOW keeps apex out of the taskbar and Alt+Tab.
+        // WS_EX_LAYERED: the window is presented as a per-pixel-alpha bitmap
+        // (see `render`), which is what lets the compositor blur behind it.
         let hwnd = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED,
             class_name,
             w!("Apex"),
             WS_POPUP,
@@ -139,27 +180,32 @@ pub fn run(config: &crate::config::Config) -> Result<()> {
             &corner as *const _ as *const core::ffi::c_void,
             size_of_val(&corner) as u32,
         );
-        let dark = BOOL(1);
+        let translucent = config.acrylic() && backdrop(hwnd);
+        ACRYLIC.store(translucent, Relaxed);
+
+        // Attach application state to the window.
+        let mut app = Box::new(App::new(crate::plugins(config), config));
+        app.translucent = translucent;
+        app.dark = app.forced_dark.unwrap_or_else(|| !system_light_theme());
+        let dark = BOOL(app.dark as i32);
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_USE_IMMERSIVE_DARK_MODE,
             &dark as *const _ as *const core::ffi::c_void,
             size_of_val(&dark) as u32,
         );
-
-        // Attach application state to the window.
-        let app = Box::new(App::new(crate::plugins(config), config));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
 
         if config.general_flag("tray_icon", true) {
             add_tray(hwnd);
         }
 
-        // Global hotkey via low-level keyboard hook (see module docs).
+        // Global hotkey via low-level keyboard hook, on its own thread so it
+        // can never miss the chord (see module docs).
         HOOK_HWND.store(hwnd.0 as isize, Relaxed);
         HOOK_MODS.store(config.hotkey_mods, Relaxed);
         HOOK_VK.store(config.hotkey_vk, Relaxed);
-        let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), None, 0)?;
+        let hook_thread = spawn_hook_thread();
 
         // Belt-and-suspenders: UIPI skips our hook while an elevated window
         // (e.g. Task Manager) has focus, but registered hotkeys still fire.
@@ -178,13 +224,115 @@ pub fn run(config: &crate::config::Config) -> Result<()> {
         }
 
         let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
-        let _ = UnhookWindowsHookEx(hook);
+        // Wake the hook thread out of GetMessage so it unhooks and exits.
+        let hook_tid = HOOK_THREAD.swap(0, Relaxed);
+        if hook_tid != 0 {
+            let _ = PostThreadMessageW(hook_tid, WM_QUIT, WPARAM(0), LPARAM(0));
+        }
+        let _ = hook_thread.join();
         let mouse = MOUSE_HOOK.swap(0, Relaxed);
         if mouse != 0 {
             let _ = UnhookWindowsHookEx(HHOOK(mouse as *mut core::ffi::c_void));
         }
         Ok(())
     }
+}
+
+/// Host the low-level keyboard hook on a thread that does nothing else, so
+/// its proc always returns well within `LowLevelHooksTimeout` and Windows
+/// never drops the chord. The proc only reads the `HOOK_*` statics and posts
+/// to the window, so no state has to cross the thread boundary here.
+fn spawn_hook_thread() -> std::thread::JoinHandle<()> {
+    std::thread::spawn(|| unsafe {
+        HOOK_THREAD.store(GetCurrentThreadId(), Relaxed);
+        let hook = match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), None, 0) {
+            Ok(h) => h,
+            Err(e) => {
+                crate::dlog!("keyboard hook install failed: {e}");
+                return;
+            }
+        };
+        crate::dlog!("keyboard hook installed on its own thread");
+        // No windows live on this thread, so nothing needs dispatching; the
+        // loop exists only to keep the queue pumped and to catch the WM_QUIT
+        // posted at shutdown.
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
+        let _ = UnhookWindowsHookEx(hook);
+    })
+}
+
+/// Ask the compositor to blur the desktop behind the window - Windows 11's
+/// acrylic, the material its own flyouts use. Returns whether it took.
+///
+/// `DWMSBT_TRANSIENTWINDOW` is the "flyout" backdrop: acrylic that samples
+/// whatever is behind the window, which is exactly the Raycast look. The
+/// main-window and tabbed variants (Mica) only ever rendered their solid
+/// fallback here. The attribute exists from Windows 11 22H2; earlier
+/// systems reject it and the window is painted solid instead. When the
+/// user has turned "Transparency effects" off, the call still succeeds and
+/// the compositor substitutes a solid colour behind the tint, which looks
+/// fine - so no detection is needed for that case.
+unsafe fn backdrop(hwnd: HWND) -> bool {
+    unsafe {
+        extend_frame(hwnd);
+        // Set the backdrop type ONCE, here, while the window still exists but
+        // is hidden. Re-setting it on every summon makes DWM re-initialise
+        // the acrylic and the blur only fades in a few hundred ms after the
+        // window appears - a visible lag. Set once, it is ready instantly on
+        // every show; the frame extension below is what has to be re-asserted.
+        let kind = DWMSBT_TRANSIENTWINDOW;
+        let result = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            &kind as *const _ as *const core::ffi::c_void,
+            size_of_val(&kind) as u32,
+        );
+        if let Err(e) = &result {
+            crate::dlog!("backdrop: acrylic unavailable, painting solid: {e}");
+        }
+        result.is_ok()
+    }
+}
+
+/// Extend the window frame across the whole client area - the documented
+/// companion to the system backdrop; without it the backdrop renders only
+/// where a WS_POPUP's (nonexistent) frame would be. Cheap, and re-asserting
+/// it on each show is what keeps the material from dropping to solid after a
+/// hide, without the re-initialisation lag that re-setting the backdrop type
+/// would cause.
+unsafe fn extend_frame(hwnd: HWND) {
+    unsafe {
+        let margins = MARGINS {
+            cxLeftWidth: -1,
+            cxRightWidth: -1,
+            cyTopHeight: -1,
+            cyBottomHeight: -1,
+        };
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+    }
+}
+
+/// Whether Windows is set to light mode for apps (the Colors page under
+/// Settings, Personalization). Read from the registry on every show - a few
+/// microseconds - rather than cached, so flipping the setting takes effect
+/// at the next summon without a restart. Missing value (older systems)
+/// means dark.
+fn system_light_theme() -> bool {
+    let mut value: u32 = 0;
+    let mut size = size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"),
+            w!("AppsUseLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut value as *mut u32 as *mut core::ffi::c_void),
+            Some(&mut size),
+        )
+    };
+    status == ERROR_SUCCESS && value != 0
 }
 
 fn is_modifier_vk(vk: u32) -> bool {
@@ -234,6 +382,11 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
                         // (e.g. Ctrl+Esc won't open the Start menu).
                         return LRESULT(1);
                     }
+                    // Hotkey key pressed without its modifiers: not the chord,
+                    // and a good moment to clear the held latch in case the
+                    // matching key-up was ever missed (which would otherwise
+                    // wedge the next real chord into a no-op).
+                    HOOK_HELD.store(false, Relaxed);
                 } else {
                     HOOK_HELD.store(false, Relaxed);
                 }
@@ -297,9 +450,103 @@ unsafe fn app_mut(hwnd: HWND) -> Option<&'static mut App> {
     }
 }
 
-unsafe fn invalidate(hwnd: HWND) {
+/// Draw the current state and put it on screen.
+///
+/// Layered windows are not painted through `WM_PAINT`: the whole bitmap is
+/// handed over in one call, which also positions and sizes the window, so
+/// this is where the height follows the content and where the summon
+/// animation's scale and opacity are applied. Called directly wherever the
+/// old design invalidated; each call is well under a millisecond.
+unsafe fn repaint(hwnd: HWND) {
     unsafe {
-        let _ = InvalidateRect(Some(hwnd), None, false);
+        if !VISIBLE.load(Relaxed) {
+            return;
+        }
+        let Some(app) = app_mut(hwnd) else { return };
+        if app.ensure_renderer().is_none() {
+            return;
+        }
+
+        // Animation progress, eased so the motion settles rather than stops.
+        let (opacity, scale) = match app.summon {
+            Some(started) if app.animate => {
+                let t = (started.elapsed().as_millis() as f32 / SUMMON_MS as f32).min(1.0);
+                if t >= 1.0 {
+                    app.summon = None;
+                    let _ = KillTimer(Some(hwnd), ANIM_TIMER_ID);
+                }
+                let eased = 1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t);
+                (0.6 + 0.4 * eased, 0.965 + 0.035 * eased)
+            }
+            _ => (1.0, 1.0),
+        };
+
+        let mut rc = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut rc);
+        let scale_px = app.dpi / 96.0;
+        let place = render::Placement {
+            x: rc.left,
+            y: rc.top,
+            width: (render::WINDOW_WIDTH * scale_px) as u32,
+            height: (app.content_height() * scale_px) as u32,
+            dpi: app.dpi,
+            opacity,
+            scale,
+        };
+        let panel = match &app.mode {
+            Mode::Search => None,
+            Mode::Actions { actions, selected } => Some(render::PanelView::Actions {
+                actions,
+                selected: *selected,
+            }),
+            Mode::TextInput { prompt, buffer, .. } => {
+                Some(render::PanelView::TextInput { prompt, buffer })
+            }
+            Mode::Form {
+                title,
+                fields,
+                focused,
+                ..
+            } => Some(render::PanelView::Form {
+                title,
+                fields,
+                focused: *focused,
+            }),
+        };
+        let frame = render::Frame {
+            query: &app.query,
+            caret_visible: app.caret_visible,
+            results: &app.results,
+            selected: app.selected,
+            sections: &app.sections,
+            scroll: app.scroll,
+            panel,
+        };
+        if let Some(r) = app.renderer.as_mut() {
+            r.present(hwnd, &frame, &place);
+        }
+    }
+}
+
+/// Restart the caret blink with the caret showing, so it never blinks off
+/// in the middle of typing.
+unsafe fn nudge_caret(hwnd: HWND) {
+    unsafe {
+        if let Some(app) = app_mut(hwnd) {
+            app.caret_visible = true;
+        }
+        SetTimer(Some(hwnd), CARET_TIMER_ID, CARET_BLINK_MS, None);
+    }
+}
+
+/// Apply a text edit to the focused field and show the result.
+unsafe fn apply_edit(hwnd: HWND, edit: Edit) {
+    unsafe {
+        if let Some(app) = app_mut(hwnd) {
+            app.edit(edit);
+        }
+        nudge_caret(hwnd);
+        repaint(hwnd);
     }
 }
 
@@ -343,10 +590,7 @@ unsafe extern "system" fn wndproc(
                 LRESULT(0)
             }
             WM_APP_DISMISS => {
-                crate::dlog!("WM_APP_DISMISS (visible={})", IsWindowVisible(hwnd).as_bool());
-                if IsWindowVisible(hwnd).as_bool() {
-                    hide(hwnd);
-                }
+                dismiss(hwnd);
                 LRESULT(0)
             }
             WM_KEYDOWN => {
@@ -361,66 +605,18 @@ unsafe extern "system" fn wndproc(
                 if let Some(app) = app_mut(hwnd) {
                     app.caret_visible = !app.caret_visible;
                 }
-                invalidate(hwnd);
+                repaint(hwnd);
                 LRESULT(0)
             }
-            WM_SIZE => {
-                if let Some(app) = app_mut(hwnd) {
-                    if let Some(r) = app.renderer.as_mut() {
-                        let w = (lparam.0 & 0xFFFF) as u32;
-                        let h = ((lparam.0 >> 16) & 0xFFFF) as u32;
-                        r.resize(w, h);
-                    }
-                }
+            WM_TIMER if wparam.0 == ANIM_TIMER_ID => {
+                repaint(hwnd);
                 LRESULT(0)
             }
-            WM_DPICHANGED => {
-                if let Some(app) = app_mut(hwnd) {
-                    if let Some(r) = app.renderer.as_mut() {
-                        r.update_dpi((wparam.0 & 0xFFFF) as f32);
-                    }
-                }
-                LRESULT(0)
-            }
+            // The bitmap is pushed with UpdateLayeredWindow, so there is
+            // nothing to draw here; validating keeps WM_PAINT from repeating.
             WM_PAINT => {
                 let mut ps = PAINTSTRUCT::default();
                 let _ = BeginPaint(hwnd, &mut ps);
-                if let Some(app) = app_mut(hwnd) {
-                    if app.ensure_renderer().is_some() {
-                        let panel = match &app.mode {
-                            Mode::Search => None,
-                            Mode::Actions { actions, selected } => Some(render::PanelView::Actions {
-                                actions,
-                                selected: *selected,
-                            }),
-                            Mode::TextInput { prompt, buffer, .. } => {
-                                Some(render::PanelView::TextInput { prompt, buffer })
-                            }
-                            Mode::Form {
-                                title,
-                                fields,
-                                focused,
-                                ..
-                            } => Some(render::PanelView::Form {
-                                title,
-                                fields,
-                                focused: *focused,
-                            }),
-                        };
-                        let frame = render::Frame {
-                            query: &app.query,
-                            caret_visible: app.caret_visible,
-                            results: &app.results,
-                            selected: app.selected,
-                            sections: &app.sections,
-                            scroll: app.scroll,
-                            panel,
-                        };
-                        if let Some(r) = app.renderer.as_mut() {
-                            r.draw(hwnd, &frame);
-                        }
-                    }
-                }
                 let _ = EndPaint(hwnd, &ps);
                 LRESULT(0)
             }
@@ -433,19 +629,35 @@ unsafe extern "system" fn wndproc(
                 if LAST_MOUSE.swap(pos as isize, Relaxed) != pos as isize
                     && mode_kind(hwnd) == ModeKind::Search
                 {
-                    let y = client_dip_y(hwnd, ((pos >> 16) & 0xFFFF) as i16 as f32);
+                    let (_, y) = client_dips(hwnd, lparam);
                     if let Some(app) = app_mut(hwnd)
                         && let Some(row) = app.row_at(y)
                         && app.select(row)
                     {
-                        invalidate(hwnd);
+                        repaint(hwnd);
                     }
                 }
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
                 if mode_kind(hwnd) == ModeKind::Search {
-                    let y = client_dip_y(hwnd, ((lparam.0 as u32 >> 16) & 0xFFFF) as i16 as f32);
+                    let (x, y) = client_dips(hwnd, lparam);
+                    if y < render::INPUT_H {
+                        // A click in the input places the caret; with Shift
+                        // it extends the selection, as in any edit control.
+                        let shift = (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
+                        if let Some(app) = app_mut(hwnd)
+                            && let Some(pos) = app
+                                .renderer
+                                .as_ref()
+                                .and_then(|r| r.hit_test_input(&app.query, x))
+                        {
+                            app.place_caret(pos, shift);
+                            nudge_caret(hwnd);
+                            repaint(hwnd);
+                        }
+                        return LRESULT(0);
+                    }
                     let hit = app_mut(hwnd).and_then(|a| {
                         let row = a.row_at(y)?;
                         a.select(row);
@@ -464,15 +676,18 @@ unsafe extern "system" fn wndproc(
                 if let Some(app) = app_mut(hwnd)
                     && app.scroll_by(dips)
                 {
-                    invalidate(hwnd);
+                    repaint(hwnd);
                 }
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),
-            // Dismiss when the window loses focus (click elsewhere), Raycast-style.
+            // Dismiss when the window loses activation (click elsewhere,
+            // Alt+Tab), Raycast-style - through the same guarded funnel as
+            // the hook-driven dismissals, so an activation bounce during the
+            // summon itself doesn't hide the window before it settles.
             WM_ACTIVATE => {
                 if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
-                    hide(hwnd);
+                    dismiss(hwnd);
                 }
                 LRESULT(0)
             }
@@ -490,10 +705,15 @@ unsafe extern "system" fn wndproc(
     }
 }
 
-/// Convert a client-space y in physical pixels to logical DIPs, which is what
-/// all the layout maths uses.
-unsafe fn client_dip_y(hwnd: HWND, y: f32) -> f32 {
-    unsafe { y * 96.0 / GetDpiForWindow(hwnd) as f32 }
+/// Client-space mouse position from a message's lparam, in logical DIPs -
+/// what all the layout maths uses.
+unsafe fn client_dips(hwnd: HWND, lparam: LPARAM) -> (f32, f32) {
+    unsafe {
+        let x = (lparam.0 & 0xFFFF) as i16 as f32;
+        let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+        let scale = 96.0 / GetDpiForWindow(hwnd) as f32;
+        (x * scale, y * scale)
+    }
 }
 
 /// Which mode the app is in, without holding a borrow.
@@ -522,10 +742,7 @@ unsafe fn settle(hwnd: HWND, outcome: UiOutcome) {
     unsafe {
         match outcome {
             UiOutcome::Hide => hide(hwnd),
-            UiOutcome::Stay => {
-                resize_to_content(hwnd);
-                invalidate(hwnd);
-            }
+            UiOutcome::Stay => repaint(hwnd),
             UiOutcome::Shell(cmd) => run_shell_command(hwnd, cmd),
         }
     }
@@ -546,10 +763,7 @@ unsafe fn run_shell_command(hwnd: HWND, cmd: ShellCommand) {
             // hidden set.
             ShellCommand::ClearHistory
             | ShellCommand::ShowHidden
-            | ShellCommand::ShowSources => {
-                resize_to_content(hwnd);
-                invalidate(hwnd);
-            }
+            | ShellCommand::ShowSources => repaint(hwnd),
         }
     }
 }
@@ -701,6 +915,34 @@ unsafe fn clipboard_text(hwnd: HWND) -> Option<String> {
     }
 }
 
+/// Put `text` on the clipboard, for Ctrl+C / Ctrl+X.
+unsafe fn set_clipboard_text(hwnd: HWND, text: &str) {
+    const CF_UNICODETEXT: u32 = 13;
+    unsafe {
+        if OpenClipboard(Some(hwnd)).is_err() {
+            return;
+        }
+        let units: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        if EmptyClipboard().is_ok()
+            && let Ok(hglobal) = GlobalAlloc(GMEM_MOVEABLE, units.len() * 2)
+        {
+            let ptr = GlobalLock(hglobal) as *mut u16;
+            if !ptr.is_null() {
+                std::ptr::copy_nonoverlapping(units.as_ptr(), ptr, units.len());
+                let _ = GlobalUnlock(hglobal);
+                // On success the system owns the memory; on failure it is
+                // still ours to free.
+                if SetClipboardData(CF_UNICODETEXT, Some(HANDLE(hglobal.0))).is_err() {
+                    let _ = GlobalFree(Some(hglobal));
+                }
+            } else {
+                let _ = GlobalFree(Some(hglobal));
+            }
+        }
+        let _ = CloseClipboard();
+    }
+}
+
 unsafe fn on_keydown(hwnd: HWND, key: VIRTUAL_KEY) {
     unsafe {
         let ctrl = (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
@@ -712,16 +954,53 @@ unsafe fn on_keydown(hwnd: HWND, key: VIRTUAL_KEY) {
             return;
         }
 
-        // Paste, in whichever text field has focus. Handled here rather than
-        // in on_char because Ctrl+V arrives as WM_CHAR 0x16, a control code
-        // the text handlers correctly ignore.
+        // Clipboard and caret keys, in whichever text field has focus.
+        // Handled here rather than in on_char because the Ctrl chords arrive
+        // as WM_CHAR control codes, which the char handler correctly ignores.
         if (key == VK_V && ctrl) || (key == VK_INSERT && shift) {
-            if let Some(text) = clipboard_text(hwnd)
-                && app_mut(hwnd).map(|a| a.paste(&text)).unwrap_or(false)
-            {
-                resize_to_content(hwnd);
-                invalidate(hwnd);
+            if let Some(text) = clipboard_text(hwnd) {
+                apply_edit(hwnd, Edit::Text(&text));
             }
+            return;
+        }
+        if (key == VK_C && ctrl) || (key == VK_INSERT && ctrl) {
+            if let Some(text) = app_mut(hwnd).and_then(|a| a.selected_text()) {
+                set_clipboard_text(hwnd, &text);
+            }
+            return;
+        }
+        if (key == VK_X && ctrl) || (key == VK_DELETE && shift) {
+            if let Some(text) = app_mut(hwnd).and_then(|a| a.cut()) {
+                set_clipboard_text(hwnd, &text);
+                nudge_caret(hwnd);
+                repaint(hwnd);
+            }
+            return;
+        }
+        let motion = match key {
+            VK_LEFT => Some(Motion::Left),
+            VK_RIGHT => Some(Motion::Right),
+            VK_HOME => Some(Motion::Home),
+            VK_END => Some(Motion::End),
+            _ => None,
+        };
+        if let Some(motion) = motion {
+            apply_edit(
+                hwnd,
+                Edit::Move {
+                    motion,
+                    word: ctrl,
+                    select: shift,
+                },
+            );
+            return;
+        }
+        if key == VK_DELETE {
+            apply_edit(hwnd, Edit::Delete { word: ctrl });
+            return;
+        }
+        if key == VK_A && ctrl {
+            apply_edit(hwnd, Edit::SelectAll);
             return;
         }
 
@@ -730,20 +1009,20 @@ unsafe fn on_keydown(hwnd: HWND, key: VIRTUAL_KEY) {
                 VK_ESCAPE => hide(hwnd),
                 VK_K if ctrl => {
                     if app_mut(hwnd).map(|a| a.open_actions()).unwrap_or(false) {
-                        invalidate(hwnd);
+                        repaint(hwnd);
                     }
                 }
                 VK_DOWN => {
                     if let Some(app) = app_mut(hwnd) {
                         app.move_selection(1);
                     }
-                    invalidate(hwnd);
+                    repaint(hwnd);
                 }
                 VK_UP => {
                     if let Some(app) = app_mut(hwnd) {
                         app.move_selection(-1);
                     }
-                    invalidate(hwnd);
+                    repaint(hwnd);
                 }
                 VK_RETURN => {
                     let outcome = app_mut(hwnd)
@@ -754,29 +1033,23 @@ unsafe fn on_keydown(hwnd: HWND, key: VIRTUAL_KEY) {
                 _ => {}
             },
             ModeKind::Actions => match key {
-                VK_ESCAPE => {
+                VK_ESCAPE | VK_K if key == VK_ESCAPE || ctrl => {
                     if let Some(app) = app_mut(hwnd) {
                         app.close_panel();
                     }
-                    invalidate(hwnd);
-                }
-                VK_K if ctrl => {
-                    if let Some(app) = app_mut(hwnd) {
-                        app.close_panel();
-                    }
-                    invalidate(hwnd);
+                    repaint(hwnd);
                 }
                 VK_DOWN => {
                     if let Some(app) = app_mut(hwnd) {
                         app.panel_move(1);
                     }
-                    invalidate(hwnd);
+                    repaint(hwnd);
                 }
                 VK_UP => {
                     if let Some(app) = app_mut(hwnd) {
                         app.panel_move(-1);
                     }
-                    invalidate(hwnd);
+                    repaint(hwnd);
                 }
                 VK_RETURN => {
                     let outcome = app_mut(hwnd)
@@ -791,8 +1064,7 @@ unsafe fn on_keydown(hwnd: HWND, key: VIRTUAL_KEY) {
                     if let Some(app) = app_mut(hwnd) {
                         app.close_panel();
                     }
-                    resize_to_content(hwnd);
-                    invalidate(hwnd);
+                    repaint(hwnd);
                 }
                 VK_RETURN => {
                     let outcome = app_mut(hwnd)
@@ -807,29 +1079,30 @@ unsafe fn on_keydown(hwnd: HWND, key: VIRTUAL_KEY) {
                     if let Some(app) = app_mut(hwnd) {
                         app.close_panel();
                     }
-                    resize_to_content(hwnd);
-                    invalidate(hwnd);
+                    repaint(hwnd);
                 }
                 // Tab and the arrows both move between fields; Shift+Tab and
                 // Up go back.
                 VK_TAB => {
-                    let shift = (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
                     if let Some(app) = app_mut(hwnd) {
                         app.form_move(if shift { -1 } else { 1 });
                     }
-                    invalidate(hwnd);
+                    nudge_caret(hwnd);
+                    repaint(hwnd);
                 }
                 VK_DOWN => {
                     if let Some(app) = app_mut(hwnd) {
                         app.form_move(1);
                     }
-                    invalidate(hwnd);
+                    nudge_caret(hwnd);
+                    repaint(hwnd);
                 }
                 VK_UP => {
                     if let Some(app) = app_mut(hwnd) {
                         app.form_move(-1);
                     }
-                    invalidate(hwnd);
+                    nudge_caret(hwnd);
+                    repaint(hwnd);
                 }
                 VK_RETURN => {
                     let outcome = app_mut(hwnd).map(|a| a.submit_form()).unwrap_or(UiOutcome::Stay);
@@ -841,52 +1114,43 @@ unsafe fn on_keydown(hwnd: HWND, key: VIRTUAL_KEY) {
     }
 }
 
+/// Typed text goes to whichever field has focus; the actions panel has none,
+/// so there it is dropped.
+///
+/// Only Backspace (0x08), Ctrl+Backspace (0x7F) and printable units are
+/// edits. Every other control code - Tab, Enter, Escape, the Ctrl chords -
+/// is a command, already handled in `on_keydown`.
 unsafe fn on_char(hwnd: HWND, unit: u16) {
-    unsafe {
-        match mode_kind(hwnd) {
-            ModeKind::Search => {
-                let changed = match unit {
-                    0x08 => app_mut(hwnd).map(|a| a.backspace(false)).unwrap_or(false),
-                    0x7F => app_mut(hwnd).map(|a| a.backspace(true)).unwrap_or(false),
-                    u if u >= 0x20 => app_mut(hwnd).map(|a| a.insert_utf16(u)).unwrap_or(false),
-                    _ => false,
-                };
-                if changed {
-                    if let Some(app) = app_mut(hwnd) {
-                        app.caret_visible = true;
-                    }
-                    SetTimer(Some(hwnd), CARET_TIMER_ID, CARET_BLINK_MS, None);
-                    resize_to_content(hwnd);
-                    invalidate(hwnd);
-                }
-            }
-            ModeKind::TextInput => {
-                if let Some(app) = app_mut(hwnd) {
-                    app.text_input_char(unit);
-                }
-                invalidate(hwnd);
-            }
-            ModeKind::Form => {
-                // Tab arrives as WM_CHAR 0x09 too; field movement is handled
-                // in on_keydown, so swallow it here rather than inserting it.
-                if unit != 0x09 {
-                    if let Some(app) = app_mut(hwnd) {
-                        app.form_char(unit);
-                    }
-                    invalidate(hwnd);
-                }
-            }
-            ModeKind::Actions => {}
-        }
-    }
+    let edit = match unit {
+        0x08 => Edit::Backspace { word: false },
+        0x7F => Edit::Backspace { word: true },
+        u if u >= 0x20 => Edit::Char(u),
+        _ => return,
+    };
+    unsafe { apply_edit(hwnd, edit) }
 }
 
 unsafe fn toggle(hwnd: HWND) {
     unsafe {
-        if IsWindowVisible(hwnd).as_bool() {
+        if !VISIBLE.load(Relaxed) {
+            show(hwnd);
+        } else if GetForegroundWindow() == hwnd {
+            // Up and focused: the chord dismisses it.
             hide(hwnd);
         } else {
-            show(hwnd);
+            // Up but not frontmost - a previous summon lost the race for
+            // foreground, or an elevated window held it. Bring it forward
+            // and focus it rather than toggling off, so the chord always
+            // leaves apex ready to type into instead of needing a re-press.
+            // Same interlock as show(): arm the guard before grabbing
+            // foreground and hold BUSY across it, so a keystroke right after
+            // re-focus (or a synchronous activation bounce) can't dismiss.
+            BUSY.store(true, Relaxed);
+            GUARD_UNTIL.store(GetTickCount64() + GUARD_MS, Relaxed);
+            force_foreground(hwnd);
+            let _ = SetFocus(Some(hwnd));
+            BUSY.store(false, Relaxed);
+            repaint(hwnd);
         }
     }
 }
@@ -915,12 +1179,28 @@ unsafe fn cursor_monitor_metrics() -> (f32, RECT) {
 /// scaled to that monitor's DPI.
 unsafe fn show(hwnd: HWND) {
     unsafe {
+        // Held across the whole summon so a synchronous WM_ACTIVATE from
+        // inside force_foreground cannot re-enter and hide the window.
+        BUSY.store(true, Relaxed);
+        // Re-extend the frame so the acrylic keeps compositing across a
+        // hide/re-show. The backdrop type itself is set once, at creation,
+        // so this carries no re-initialisation lag - the blur is there the
+        // instant the window appears.
+        if ACRYLIC.load(Relaxed) {
+            extend_frame(hwnd);
+        }
         let (scale, work) = cursor_monitor_metrics();
 
         // Rebuild the most-used list before measuring: the app index may have
         // finished loading, and the last launch may have reordered it.
         let content_h = match app_mut(hwnd) {
             Some(a) => {
+                a.dpi = 96.0 * scale;
+                a.caret_visible = true;
+                // The renderer was dropped on hide, so a theme change is
+                // picked up simply by choosing the palette again here.
+                a.dark = a.forced_dark.unwrap_or_else(|| !system_light_theme());
+                a.summon = a.animate.then(std::time::Instant::now);
                 a.refresh_on_show();
                 a.content_height()
             }
@@ -932,8 +1212,20 @@ unsafe fn show(hwnd: HWND) {
         let y = work.top + (work.bottom - work.top) / 5;
 
         crate::dlog!("show: x={x} y={y} w={w} h={h} scale={scale}");
-        let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_SHOWWINDOW);
+        // Place while still hidden, paint the first frame into the layered
+        // surface, and only then show: the window never appears blank.
+        let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE);
         VISIBLE.store(true, Relaxed);
+        repaint(hwnd);
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+        );
         force_foreground(hwnd);
         let _ = SetFocus(Some(hwnd));
 
@@ -944,36 +1236,16 @@ unsafe fn show(hwnd: HWND) {
             }
         }
 
-        if let Some(app) = app_mut(hwnd) {
-            app.caret_visible = true;
-        }
         SetTimer(Some(hwnd), CARET_TIMER_ID, CARET_BLINK_MS, None);
-        invalidate(hwnd);
-    }
-}
-
-/// Grow/shrink the window height to fit the current results.
-unsafe fn resize_to_content(hwnd: HWND) {
-    unsafe {
-        let Some(app) = app_mut(hwnd) else { return };
-        let content_h = app.content_height();
-        let dpi = GetDpiForWindow(hwnd) as f32;
-        let h = (content_h * dpi / 96.0) as i32;
-        crate::dlog!("resize_to_content: dpi={dpi} content_h={content_h} h={h}");
-
-        let mut rc = RECT::default();
-        let _ = GetWindowRect(hwnd, &mut rc);
-        if rc.bottom - rc.top != h {
-            let _ = SetWindowPos(
-                hwnd,
-                None,
-                0,
-                0,
-                rc.right - rc.left,
-                h,
-                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
-            );
+        if app_mut(hwnd).is_some_and(|a| a.summon.is_some()) {
+            SetTimer(Some(hwnd), ANIM_TIMER_ID, USER_TIMER_MINIMUM, None);
         }
+
+        // Open the guard window and release the interlock only now that the
+        // window is up, focused, and painted: any activation bounce or early
+        // keystroke from the last few ms is ignored rather than dismissing.
+        GUARD_UNTIL.store(GetTickCount64() + GUARD_MS, Relaxed);
+        BUSY.store(false, Relaxed);
     }
 }
 
@@ -990,28 +1262,32 @@ unsafe fn resize_to_content(hwnd: HWND) {
 /// earn focus" trick fires a real key event that lands in whatever window is
 /// focused - with Ctrl held (as during Ctrl+Esc) it reads as AltGr and can
 /// emit a stray character into the query.
-unsafe fn force_foreground(hwnd: HWND) {
+unsafe fn force_foreground(hwnd: HWND) -> bool {
     unsafe {
         if SetForegroundWindow(hwnd).as_bool() && GetForegroundWindow() == hwnd {
-            return;
+            let _ = SetFocus(Some(hwnd));
+            return true;
         }
 
-        use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-
-        // Remember and clear the foreground lock timeout.
+        // Remember and clear the foreground lock timeout - but only if we can
+        // actually read it back, so a failed read never leaves us "restoring"
+        // it to 0 and pinning the lock open system-wide.
         let mut prev: u32 = 0;
-        let _ = SystemParametersInfoW(
+        let has_prev = SystemParametersInfoW(
             SPI_GETFOREGROUNDLOCKTIMEOUT,
             0,
             Some(&mut prev as *mut u32 as *mut core::ffi::c_void),
             SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        );
-        let _ = SystemParametersInfoW(
-            SPI_SETFOREGROUNDLOCKTIMEOUT,
-            0,
-            Some(std::ptr::null_mut()),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        );
+        )
+        .is_ok();
+        if has_prev {
+            let _ = SystemParametersInfoW(
+                SPI_SETFOREGROUNDLOCKTIMEOUT,
+                0,
+                Some(std::ptr::null_mut()),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            );
+        }
 
         let fg = GetForegroundWindow();
         let our_tid = GetCurrentThreadId();
@@ -1024,40 +1300,69 @@ unsafe fn force_foreground(hwnd: HWND) {
         if attached {
             let _ = AttachThreadInput(our_tid, fg_tid, true);
         }
+        // With the input queues attached, all four take effect against the
+        // shared foreground state, so keyboard focus lands on us in one go.
         let _ = BringWindowToTop(hwnd);
         let _ = SetForegroundWindow(hwnd);
+        let _ = SetActiveWindow(hwnd);
+        let _ = SetFocus(Some(hwnd));
         if attached {
             let _ = AttachThreadInput(our_tid, fg_tid, false);
         }
 
-        let _ = SystemParametersInfoW(
-            SPI_SETFOREGROUNDLOCKTIMEOUT,
-            0,
-            Some(prev as usize as *mut core::ffi::c_void),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        );
+        if has_prev {
+            let _ = SystemParametersInfoW(
+                SPI_SETFOREGROUNDLOCKTIMEOUT,
+                0,
+                Some(prev as usize as *mut core::ffi::c_void),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            );
+        }
+        let won = GetForegroundWindow() == hwnd;
         crate::dlog!(
-            "force_foreground: lock_timeout={prev} attached={attached} fg_tid={fg_tid} our_tid={our_tid} won={}",
-            GetForegroundWindow() == hwnd
+            "force_foreground: has_prev={has_prev} prev={prev} attached={attached} fg_tid={fg_tid} our_tid={our_tid} won={won}"
         );
+        won
+    }
+}
+
+/// The single gate every *automatic* dismissal passes through - focus loss,
+/// a click outside, a keystroke that landed elsewhere. Refused while hidden,
+/// while a show/hide is mid-flight (re-entrancy), or inside the post-summon
+/// guard window. The explicit toggle chord does not come here: closing on
+/// purpose is never guarded.
+unsafe fn dismiss(hwnd: HWND) {
+    unsafe {
+        if !VISIBLE.load(Relaxed) || BUSY.load(Relaxed) {
+            return;
+        }
+        if GetTickCount64() < GUARD_UNTIL.load(Relaxed) {
+            crate::dlog!("dismiss ignored: within post-summon guard window");
+            return;
+        }
+        hide(hwnd);
     }
 }
 
 unsafe fn hide(hwnd: HWND) {
     unsafe {
+        BUSY.store(true, Relaxed);
         VISIBLE.store(false, Relaxed);
         let mouse = MOUSE_HOOK.swap(0, Relaxed);
         if mouse != 0 {
             let _ = UnhookWindowsHookEx(HHOOK(mouse as *mut core::ffi::c_void));
         }
         let _ = KillTimer(Some(hwnd), CARET_TIMER_ID);
+        let _ = KillTimer(Some(hwnd), ANIM_TIMER_ID);
         let _ = ShowWindow(hwnd, SW_HIDE);
         if let Some(app) = app_mut(hwnd) {
+            app.summon = None;
             // Fresh query next time the launcher opens.
             app.clear_query();
             // Drop the whole renderer (factories included) so the process
             // returns to baseline memory while hidden.
             app.renderer = None;
         }
+        BUSY.store(false, Relaxed);
     }
 }

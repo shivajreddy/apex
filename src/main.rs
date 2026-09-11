@@ -16,7 +16,9 @@ macro_rules! dlog {
 }
 
 mod app;
+mod appindex;
 mod config;
+mod editor;
 mod frecency;
 mod fuzzy;
 mod icon;
@@ -31,7 +33,7 @@ mod window;
 fn plugins(config: &config::Config) -> Vec<Box<dyn plugin::Plugin>> {
     let mut list: Vec<Box<dyn plugin::Plugin>> = Vec::new();
     if config.plugin_enabled(plugins::search::ID) {
-        list.push(Box::new(plugins::search::Search::new(config.aliases_map(), config.list_values(config::SOURCES))));
+        list.push(Box::new(plugins::search::Search::new(config.aliases_map())));
     }
     if config.plugin_enabled(plugins::quicklinks::ID) {
         list.push(Box::new(plugins::quicklinks::Quicklinks::new(
@@ -45,6 +47,14 @@ fn plugins(config: &config::Config) -> Vec<Box<dyn plugin::Plugin>> {
 }
 
 fn main() {
+    // The index helper is this same exe: it builds the application index,
+    // writes it to disk and exits, keeping the shell's enumeration and
+    // imaging DLLs out of the launcher. Decided before anything else so a
+    // helper never touches the single-instance mutex, setup, or a window.
+    if std::env::args().nth(1).as_deref() == Some(appindex::HELPER_FLAG) {
+        appindex::helper_main();
+        return;
+    }
     let config = config::Config::load();
     if let Err(err) = window::run(&config) {
         fatal(&format!("Apex failed to start:\n{err}"));

@@ -34,37 +34,66 @@ feature loses.
 
 | | |
 |---|---|
-| Binary size | 560 KB |
-| Memory, idle | ~12 MB private |
-| App index | ~150 apps in ~1 s (background thread) |
-| Tests | 65 unit tests |
+| Binary size | 586 KB |
+| Memory, idle | ~7.5 MB private at start, ~9.7 MB after the first summon (was 12.8 / 22.4) |
+| App index | ~150 apps, loaded from disk in under 1 ms; rebuilt by a helper process in ~1.5 s |
+| Tests | 88 unit tests |
 
-Idle memory is what it is because icon extraction runs during the startup
-scan, loading the Windows imaging DLLs immediately and never unloading them.
-There is no cheaper "before first use" state to report: the helper-process
-icon cache below is the fix.
+The launcher process never enumerates the shell or touches the imaging
+stack: the index helper below does, in a process that exits. Measured in a
+bare process, enumerating the AppsFolder alone loads 58 DLLs and adds 8 MB
+of private memory; reading the index file adds none.
 
 ### Shipped
 
 **Core shell**
 - Borderless `WS_POPUP` window, Windows 11 rounded corners, dark mode
+- Acrylic backdrop: the desktop compositor blurs whatever is behind the
+  window, with the dark tint drawn over it — the Raycast look. The frame is
+  extended into the client area and the backdrop type is set once at
+  creation, so the blur is there the instant the window appears and survives
+  hide/re-show. `[appearance] backdrop = "none"` paints it solid, and systems
+  before Windows 11 22H2 fall back to solid on their own.
+- Instant show and hide by default. An optional 110 ms scale-and-fade
+  settle is available with `[appearance] animation = true`, but off by
+  default — an instant summon reads as snappier.
+- Light and dark palettes, following Windows' app theme setting at each
+  summon; `[appearance] theme = "dark" | "light"` pins one.
 - Hidden from taskbar and Alt+Tab (`WS_EX_TOOLWINDOW`)
 - Opens on the monitor under the cursor, per-monitor DPI aware
-- Height animates to fit content
+- Height follows the content
 - Single instance via named mutex
 
 **Summon & dismiss**
 - Global hotkey via `WH_KEYBOARD_LL`, so Apex can claim system-reserved
   chords like `Ctrl+Esc` (Start menu) — the Raycast approach
+- The hook runs on a dedicated thread that does nothing else, so it always
+  beats `LowLevelHooksTimeout`. On the UI thread the chord was silently
+  dropped whenever a render, launch or setting-change broadcast was in
+  flight, which is what made summoning need several presses.
 - `RegisterHotKey` retained as a secondary path
-- Reliable focus stealing without injecting synthetic input
-- Dismiss on `Esc`, focus loss, outside click, or typing into another app
+- Reliable focus stealing without injecting synthetic input: the toggle
+  re-focuses an already-open window rather than hiding it, so a lost
+  foreground race never turns the next press into a dismiss
+- Dismiss on `Esc`, focus loss, outside click, or typing into another app,
+  all funnelled through one guarded path. A post-summon guard window and a
+  show/hide re-entrancy interlock stop the window from dismissing itself in
+  the few ms between appearing and winning focus - the bug where typing
+  immediately after the hotkey made it vanish and lose the query.
 
 **Rendering**
 - Direct2D + DirectWrite, software rasterizer (skips D3D/DXGI, saving
   ~50 MB) — the scene is small and redraws only on input
+- Drawn into a per-pixel-alpha bitmap and presented with
+  `UpdateLayeredWindow`. That is what lets the compositor's acrylic show
+  through; an `ID2D1HwndRenderTarget` presents opaquely, and the system
+  backdrop behind it only ever renders its solid fallback (measured, not
+  guessed — see the spike notes in `window::backdrop` and `render`).
 - Renderer released entirely while hidden
 - Dark theme, blinking caret, selection highlight, result rows with icons
+- Text editing in every field: caret movement by char and word, Home/End,
+  Shift-selection, select all, Delete, cut/copy/paste, click to place the
+  caret; long text scrolls to keep the caret in view
 - Sectioned default list: `Suggestions` from launch history, then `Commands`
   holding every app, quicklink and apex command. The heading is omitted when
   there is no history to show.
@@ -84,8 +113,20 @@ icon cache below is the fix.
   list the Start menu shows
 - fzy-style fuzzy ranking: word-start, camelCase, and consecutive-run
   bonuses; gap, lead, and length penalties
-- Real app icons via `IShellItemImageFactory`, extracted once at index time
+- Real app icons via `IShellItemImageFactory`
 - Launch through `shell:AppsFolder\<AppUserModelID>`
+
+**Index helper**
+- Enumeration and icon extraction run in a helper process (`apex --index`,
+  the same exe) that writes `%LOCALAPPDATA%\apex\index.bin` and exits, so
+  the shell's enumeration and imaging DLLs never load into the launcher
+- The launcher reads the last index at startup — every app and icon is
+  there before the first summon — then runs the helper in the background
+  to pick up installs and removals; `Apex: Reload` runs it too
+- Bitmaps are stored once and shared, so the file stays around 1 MB; a
+  corrupt or truncated file is treated as absent, never trusted
+- If the helper cannot be started at all, the launcher indexes in-process
+  rather than showing nothing
 
 **Frecency**
 - One decaying weight per entry, 14-day half-life: a single number captures
@@ -127,9 +168,10 @@ icon cache below is the fix.
   `[general]` keys; every other line and comment is preserved byte-for-byte
 - `[general]` Start menu entry, run-at-login and tray icon, all self-healing
   and cleanly removed when disabled
-- `[hotkey]` custom chord, `[plugins]` per-plugin toggles
+- `[hotkey]` custom chord, `[plugins]` per-plugin toggles, `[appearance]`
+  backdrop and animation
 - Tray icon with Open / Reload / Open Config / Quit
-- Clipboard paste in the query, prompts and forms
+- Clipboard cut, copy and paste in the query, prompts and forms
 - Embedded app icon and version metadata
 
 ### Version history
@@ -154,16 +196,22 @@ Polish the launcher until it's the fastest path to any app.
 - [x] **Tray icon** with Open / Reload / Open Config / Quit
 - [x] **Live index refresh** — via `Apex: Reload`. Still manual; watching for
       installs and removals is the remaining half.
-- [~] **Text editing** in the query — clipboard paste and word delete are in;
-      caret movement and selection are not.
-- [ ] **Icon cache on disk** — skip re-extraction at every start, and move
-      extraction into a helper process so the shell imaging DLLs stay out
-      of the resident set (the ~11.8 MB idle figure above is entirely this)
+- [x] **Text editing** in the query — caret movement, word jumps,
+      selection, cut/copy/paste, click to place the caret; the same editor
+      backs the prompt and form fields.
+- [x] **Icon cache on disk** — became the index helper: the whole index,
+      not just the icons, is built by a helper process and read from disk,
+      because measurement showed enumerating the AppsFolder costs more
+      resident memory than extracting the icons does.
 - [x] **Mouse support** — hover to highlight, click to launch, wheel to scroll
-- [ ] **Blur / acrylic backdrop** — needs per-pixel alpha, which the current
-      `ID2D1HwndRenderTarget` cannot do; a layered window driven by
-      `UpdateLayeredWindow` is the likely route
-- [ ] **Fade/scale animation** on summon
+- [x] **Blur / acrylic backdrop** — via a layered window presented with
+      `UpdateLayeredWindow` plus `DWMSBT_TRANSIENTWINDOW`, as predicted.
+      Windows 11 22H2+; earlier systems get a solid window. A Windows 10
+      path through the undocumented `SetWindowCompositionAttribute` accent
+      policy is possible but not done.
+- [x] **Fade/scale animation** on summon — scale 96.5% → 100% and content
+      opacity 60% → 100% over 110 ms, eased. Per-pixel, because a layered
+      window's constant alpha below 255 makes the compositor drop the blur.
 - [ ] **`run_as_admin` setting** — elevated logon task, so the hotkey works
       over Task Manager and other elevated windows.
       *Attempted and reverted* (`e1866bf`, `431200f`): an elevated apex
@@ -221,9 +269,11 @@ Additional plugins. Disabled ones are never constructed and cost nothing.
   through to the shell and Apex can't take focus. Running Apex elevated
   avoids it; `run_as_admin` (v0.2) and a signed `uiAccess` build (v1.0)
   are the real fixes.
-- **Idle memory** sits around 11.8 MB because icon extraction loads Windows
-  imaging DLLs that are never unloaded. The helper-process icon cache
-  addresses this.
+- **Acrylic needs Windows 11 22H2** (`DWMWA_SYSTEMBACKDROP_TYPE`). Earlier
+  systems get a solid window automatically; with "Transparency effects" off
+  the compositor substitutes a solid colour behind the tint.
+- **The index refreshes on start and on `Apex: Reload`**, not live: an app
+  installed while apex is running appears after either.
 - **Aliases** are bare TOML keys, so they're normalized to lowercase
   `a-z 0-9 - _ .` (spaces become `-`).
 - **Aliases don't travel between machines.** Desktop apps get an

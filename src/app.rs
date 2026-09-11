@@ -1,6 +1,7 @@
 //! Application state: query text, caret, plugins, current results, and the
 //! UI mode (search / actions panel / one-line text input).
 
+use crate::editor::{Edit, FormEntry, TextField};
 use crate::frecency::{self, Frecency};
 use crate::plugin::{Action, ActionResult, FormField, Plugin, ResultItem, ShellCommand};
 use crate::render::Renderer;
@@ -57,12 +58,12 @@ pub enum Mode {
     TextInput {
         prompt: String,
         action_id: &'static str,
-        buffer: String,
+        buffer: TextField,
     },
     Form {
         title: String,
         action_id: &'static str,
-        fields: Vec<FormField>,
+        fields: Vec<FormEntry>,
         focused: usize,
     },
 }
@@ -81,9 +82,26 @@ pub struct App {
     /// Present only while the window is visible; dropped on hide so the
     /// process returns to baseline memory. Recreated lazily (~1ms) on show.
     pub renderer: Option<Renderer>,
-    pub query: String,
-    /// High surrogate waiting for its pair (WM_CHAR delivers UTF-16 units).
-    pending_surrogate: Option<u16>,
+    /// Whether the desktop compositor is blurring what is behind the
+    /// window, in which case the background is painted as a tint rather
+    /// than solid.
+    pub translucent: bool,
+    /// Play the short scale-and-fade when summoned.
+    pub animate: bool,
+    /// `[appearance] theme` pinned to dark (`Some(true)`) or light; `None`
+    /// follows Windows' setting for apps, re-read on every show.
+    pub forced_dark: Option<bool>,
+    /// Palette in use for the current show.
+    pub dark: bool,
+    /// `[appearance] opacity` override for the tint strength over the blur,
+    /// if the user set one; otherwise the palette's own value is used.
+    pub tint: Option<f32>,
+    /// When the current summon animation started, until it has finished.
+    pub summon: Option<std::time::Instant>,
+    /// DPI of the monitor the window was summoned on. Everything is laid
+    /// out in DIPs and converted with this at present time.
+    pub dpi: f32,
+    pub query: TextField,
     pub caret_visible: bool,
     pub plugins: Vec<Box<dyn Plugin>>,
     pub results: Vec<ResultItem>,
@@ -109,8 +127,20 @@ impl App {
         Self {
             mode: Mode::Search,
             renderer: None,
-            query: String::new(),
-            pending_surrogate: None,
+            translucent: false,
+            // Off by default: an instant, snappy show reads as faster than
+            // any open animation, however short. Opt in with the config key.
+            animate: config.flag("appearance", "animation", false),
+            forced_dark: match config.string("appearance", "theme") {
+                Some(t) if t.eq_ignore_ascii_case("dark") => Some(true),
+                Some(t) if t.eq_ignore_ascii_case("light") => Some(false),
+                _ => None,
+            },
+            dark: true,
+            tint: config.float("appearance", "opacity"),
+            summon: None,
+            dpi: 96.0,
+            query: TextField::default(),
             caret_visible: true,
             plugins,
             results: Vec::new(),
@@ -138,7 +168,7 @@ impl App {
     /// Get the renderer, creating it if needed (first show or after hide).
     pub fn ensure_renderer(&mut self) -> Option<&mut Renderer> {
         if self.renderer.is_none() {
-            match Renderer::new() {
+            match Renderer::new(self.translucent, self.dark, self.tint) {
                 Ok(r) => self.renderer = Some(r),
                 Err(e) => {
                     crate::dlog!("renderer creation failed: {e}");
@@ -149,61 +179,58 @@ impl App {
         self.renderer.as_mut()
     }
 
-    /// Handle a UTF-16 unit from WM_CHAR. Returns true if the query changed.
-    pub fn insert_utf16(&mut self, unit: u16) -> bool {
-        match unit {
-            0xD800..=0xDBFF => {
-                self.pending_surrogate = Some(unit);
-                false
-            }
-            0xDC00..=0xDFFF => {
-                if let Some(high) = self.pending_surrogate.take() {
-                    let cp = 0x10000 + (((high as u32) - 0xD800) << 10) + ((unit as u32) - 0xDC00);
-                    if let Some(c) = char::from_u32(cp) {
-                        self.query.push(c);
-                        self.refresh_results();
-                        return true;
-                    }
-                }
-                false
-            }
-            _ => {
-                self.pending_surrogate = None;
-                match char::from_u32(unit as u32) {
-                    Some(c) => {
-                        self.query.push(c);
-                        self.refresh_results();
-                        true
-                    }
-                    None => false,
-                }
-            }
+    // ---- text editing --------------------------------------------------
+
+    /// The field keyboard input currently goes to: the query in search mode,
+    /// the prompt's buffer, or the focused form field. None while the
+    /// actions panel is up.
+    fn focused_field(&mut self) -> Option<&mut TextField> {
+        match &mut self.mode {
+            Mode::Search => Some(&mut self.query),
+            Mode::TextInput { buffer, .. } => Some(buffer),
+            Mode::Form {
+                fields, focused, ..
+            } => fields.get_mut(*focused).map(|f| &mut f.value),
+            Mode::Actions { .. } => None,
         }
     }
 
-    /// Delete one char, or the trailing word when `word` is set (Ctrl+Backspace).
-    pub fn backspace(&mut self, word: bool) -> bool {
-        if self.query.is_empty() {
+    /// Apply an edit to the focused field. Returns whether its text changed;
+    /// a changed query is re-run against the plugins here, so callers only
+    /// need to repaint (and refit the window).
+    pub fn edit(&mut self, edit: Edit) -> bool {
+        let Some(field) = self.focused_field() else {
             return false;
+        };
+        let changed = field.apply(edit);
+        if changed && matches!(self.mode, Mode::Search) {
+            self.refresh_results();
         }
-        if word {
-            while self.query.ends_with(' ') {
-                self.query.pop();
-            }
-            while self.query.chars().next_back().is_some_and(|c| c != ' ') {
-                self.query.pop();
-            }
-        } else {
-            self.query.pop();
+        changed
+    }
+
+    /// Selected text of the focused field, for Ctrl+C.
+    pub fn selected_text(&mut self) -> Option<String> {
+        self.focused_field()?.selected_text().map(str::to_string)
+    }
+
+    /// Remove and return the focused field's selection, for Ctrl+X.
+    pub fn cut(&mut self) -> Option<String> {
+        let text = self.focused_field()?.cut()?;
+        if matches!(self.mode, Mode::Search) {
+            self.refresh_results();
         }
-        self.refresh_results();
-        true
+        Some(text)
+    }
+
+    /// Put the query caret at a byte offset, e.g. under a mouse click.
+    pub fn place_caret(&mut self, pos: usize, select: bool) {
+        self.query.set_caret(pos, select);
     }
 
     pub fn clear_query(&mut self) {
         self.mode = Mode::Search;
         self.query.clear();
-        self.pending_surrogate = None;
         self.refresh_results();
     }
 
@@ -288,59 +315,11 @@ impl App {
         let (action_id, text) = match &self.mode {
             Mode::TextInput {
                 action_id, buffer, ..
-            } => (*action_id, buffer.clone()),
+            } => (*action_id, buffer.text().trim().to_string()),
             _ => return UiOutcome::Stay,
         };
-        let result = self.dispatch(|p, item| p.submit_text(action_id, item, text.trim()));
+        let result = self.dispatch(|p, item| p.submit_text(action_id, item, &text));
         self.apply(result)
-    }
-
-    /// Append clipboard text to whichever field currently has focus.
-    /// Returns true if anything changed.
-    pub fn paste(&mut self, text: &str) -> bool {
-        if text.is_empty() {
-            return false;
-        }
-        // Checked first so the mutable borrow of `mode` below doesn't
-        // collide with touching `query` and re-running the search.
-        if matches!(self.mode, Mode::Search) {
-            self.query.push_str(text);
-            self.refresh_results();
-            return true;
-        }
-        match &mut self.mode {
-            Mode::TextInput { buffer, .. } => {
-                buffer.push_str(text);
-                true
-            }
-            Mode::Form {
-                fields, focused, ..
-            } => match fields.get_mut(*focused) {
-                Some(field) => {
-                    field.value.push_str(text);
-                    true
-                }
-                None => false,
-            },
-            _ => false,
-        }
-    }
-
-    /// Feed a WM_CHAR unit to the text-input buffer.
-    pub fn text_input_char(&mut self, unit: u16) {
-        if let Mode::TextInput { buffer, .. } = &mut self.mode {
-            match unit {
-                0x08 => {
-                    buffer.pop();
-                }
-                u if u >= 0x20 => {
-                    if let Some(c) = char::from_u32(u as u32) {
-                        buffer.push(c);
-                    }
-                }
-                _ => {}
-            }
-        }
     }
 
     fn dispatch(
@@ -411,7 +390,6 @@ impl App {
                 // Clear back to the default list: the reload is otherwise
                 // invisible, since the query still matches the command row.
                 self.query.clear();
-                self.pending_surrogate = None;
                 self.refresh_results();
                 UiOutcome::Stay
             }
@@ -419,7 +397,7 @@ impl App {
                 self.mode = Mode::TextInput {
                     prompt,
                     action_id,
-                    buffer: String::new(),
+                    buffer: TextField::default(),
                 };
                 UiOutcome::Stay
             }
@@ -431,7 +409,13 @@ impl App {
                 self.mode = Mode::Form {
                     title,
                     action_id,
-                    fields,
+                    fields: fields
+                        .into_iter()
+                        .map(|f| FormEntry {
+                            value: TextField::new(&f.value),
+                            label: f.label,
+                        })
+                        .collect(),
                     focused: 0,
                 };
                 UiOutcome::Stay
@@ -455,39 +439,6 @@ impl App {
         }
     }
 
-    /// Feed a WM_CHAR unit to the focused form field.
-    pub fn form_char(&mut self, unit: u16) {
-        let Mode::Form {
-            fields, focused, ..
-        } = &mut self.mode
-        else {
-            return;
-        };
-        let Some(field) = fields.get_mut(*focused) else {
-            return;
-        };
-        match unit {
-            0x08 => {
-                field.value.pop();
-            }
-            // Ctrl+Backspace: drop the trailing word, as in the main query.
-            0x7F => {
-                while field.value.ends_with(' ') {
-                    field.value.pop();
-                }
-                while field.value.chars().next_back().is_some_and(|c| c != ' ') {
-                    field.value.pop();
-                }
-            }
-            u if u >= 0x20 => {
-                if let Some(c) = char::from_u32(u as u32) {
-                    field.value.push(c);
-                }
-            }
-            _ => {}
-        }
-    }
-
     /// Commit the form to its plugin action.
     pub fn submit_form(&mut self) -> UiOutcome {
         let (action_id, fields) = match &self.mode {
@@ -497,7 +448,7 @@ impl App {
                 *action_id,
                 fields
                     .iter()
-                    .map(|f| FormField::new(&f.label, f.value.trim()))
+                    .map(|f| FormField::new(&f.label, f.value.text().trim()))
                     .collect::<Vec<_>>(),
             ),
             _ => return UiOutcome::Stay,
@@ -556,7 +507,7 @@ impl App {
         }
 
         for p in &mut self.plugins {
-            p.query(&self.query, &mut self.results);
+            p.query(self.query.text(), &mut self.results);
         }
         self.drop_hidden();
         for item in &mut self.results {
@@ -564,7 +515,7 @@ impl App {
         }
         crate::dlog!(
             "refresh: query='{}' -> {} results",
-            self.query,
+            self.query.text(),
             self.results.len()
         );
         self.results
@@ -678,14 +629,20 @@ impl App {
         }
     }
 
-    /// Folder icon for the sources listing, extracted on first use so it
-    /// costs nothing for anyone who never opens that view.
+    /// Folder icon for the sources listing, fetched on first use so it costs
+    /// nothing for anyone who never opens that view.
+    ///
+    /// Read from the index file, which the helper stocks with it, rather
+    /// than extracted here: extraction loads the imaging DLLs for good.
+    /// Falls back to extracting only when there is no index yet.
     fn folder_icon(&mut self) -> Option<std::sync::Arc<crate::plugin::Icon>> {
         if self.folder_icon.is_none() {
-            self.folder_icon = crate::icon::stock(
-                windows::Win32::UI::Shell::SIID_FOLDER,
-            )
-            .map(std::sync::Arc::new);
+            self.folder_icon = crate::appindex::load()
+                .and_then(|index| index.folder)
+                .or_else(|| {
+                    crate::icon::stock(windows::Win32::UI::Shell::SIID_FOLDER)
+                        .map(std::sync::Arc::new)
+                });
         }
         self.folder_icon.clone()
     }
@@ -714,7 +671,6 @@ impl App {
     pub fn show_hidden(&mut self) {
         self.listing = Listing::Hidden;
         self.query.clear();
-        self.pending_surrogate = None;
         self.refresh_results();
     }
 
@@ -722,7 +678,6 @@ impl App {
     pub fn show_sources(&mut self) {
         self.listing = Listing::Sources;
         self.query.clear();
-        self.pending_surrogate = None;
         self.refresh_results();
     }
 
@@ -816,7 +771,6 @@ impl App {
         self.frecency = Frecency::default();
         self.frecency.save(frecency::now());
         self.query.clear();
-        self.pending_surrogate = None;
         self.refresh_results();
     }
 

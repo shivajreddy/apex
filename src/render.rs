@@ -1,19 +1,27 @@
 //! Direct2D + DirectWrite rendering. All layout is in logical DIPs; the
 //! render target is DPI-aware so drawing scales per-monitor automatically.
+//!
+//! The scene is drawn into a 32-bit DIB with real per-pixel alpha and handed
+//! to the window with `UpdateLayeredWindow`. That is what lets the desktop
+//! compositor blur whatever is behind the window (see `window::backdrop`):
+//! an `ID2D1HwndRenderTarget` presents opaquely and the system backdrop then
+//! only ever renders its solid fallback. The DIB route also creates no
+//! swap chain, so it is cheaper than the hwnd target it replaced.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND, RECT};
+use windows::Win32::Foundation::{COLORREF, D2DERR_RECREATE_TARGET, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 
-use crate::plugin::{Action, FormField, Icon, ResultItem};
+use crate::editor::{FormEntry, TextField};
+use crate::plugin::{Action, Icon, ResultItem};
 
 // ---- layout (logical DIPs) ----
 pub const WINDOW_WIDTH: f32 = 680.0;
@@ -34,6 +42,8 @@ const PANEL_W: f32 = 300.0;
 const PANEL_ROW: f32 = 32.0;
 const PANEL_PAD: f32 = 6.0;
 const PANEL_MARGIN: f32 = 8.0;
+/// Width of the text caret.
+const CARET_W: f32 = 2.0;
 
 // Forms stack a dim label over an editable value, so they need more width
 // than the actions panel - links in particular are long.
@@ -90,7 +100,7 @@ pub fn form_window_height(fields: usize) -> f32 {
 
 /// Everything the renderer needs for one frame.
 pub struct Frame<'a> {
-    pub query: &'a str,
+    pub query: &'a TextField,
     pub caret_visible: bool,
     pub results: &'a [ResultItem],
     pub selected: usize,
@@ -109,13 +119,30 @@ pub enum PanelView<'a> {
     },
     TextInput {
         prompt: &'a str,
-        buffer: &'a str,
+        buffer: &'a TextField,
     },
     Form {
         title: &'a str,
-        fields: &'a [FormField],
+        fields: &'a [FormEntry],
         focused: usize,
     },
+}
+
+/// Where the frame goes on screen, in physical pixels.
+pub struct Placement {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub dpi: f32,
+    /// Opacity of everything drawn, tint included, `0..=1`; the summon
+    /// animation ramps it. Applied per pixel rather than as the layered
+    /// window's constant alpha, because a constant alpha below 255 makes the
+    /// compositor drop the blur and show the desktop through sharply.
+    pub opacity: f32,
+    /// Uniform scale about the window's centre, `0 < scale <= 1`; the
+    /// summon animation grows it to 1.
+    pub scale: f32,
 }
 
 // ---- theme ----
@@ -128,14 +155,60 @@ const fn rgba(rgb: u32, a: f32) -> D2D1_COLOR_F {
     }
 }
 
-const COL_BG: D2D1_COLOR_F = rgba(0x1E1E20, 1.0);
-const COL_TEXT: D2D1_COLOR_F = rgba(0xF2F2F2, 1.0);
-const COL_DIM: D2D1_COLOR_F = rgba(0xF2F2F2, 0.35);
-const COL_FAINT: D2D1_COLOR_F = rgba(0xFFFFFF, 0.07);
-const COL_SELECT: D2D1_COLOR_F = rgba(0xFFFFFF, 0.08);
-const COL_PANEL: D2D1_COLOR_F = rgba(0x2A2A2E, 1.0);
-const COL_BADGE_BG: D2D1_COLOR_F = rgba(0xFFFFFF, 0.11);
-const COL_BADGE_FG: D2D1_COLOR_F = rgba(0xF2F2F2, 0.60);
+/// The colours of one appearance. Two exist, following Windows' light/dark
+/// setting for apps; `[appearance] theme` pins either.
+pub struct Palette {
+    /// Window tint. Over the acrylic backdrop this much of the window is
+    /// this colour and the blurred desktop shows through the rest; without
+    /// a backdrop it is drawn fully opaque.
+    background: D2D1_COLOR_F,
+    text: D2D1_COLOR_F,
+    dim: D2D1_COLOR_F,
+    /// Hairline separators.
+    faint: D2D1_COLOR_F,
+    /// The highlighted row.
+    select: D2D1_COLOR_F,
+    panel: D2D1_COLOR_F,
+    badge_bg: D2D1_COLOR_F,
+    badge_fg: D2D1_COLOR_F,
+    /// Selected text.
+    selection: D2D1_COLOR_F,
+    /// Hairline rim just inside the window edge - the "glass edge" that
+    /// reads as frosted even over a dark backdrop, where the blur alone is
+    /// invisible.
+    border: D2D1_COLOR_F,
+}
+
+// The tint is deliberately translucent (alpha well below 1) so the acrylic
+// blur behind it stays visible; the compositor supplies a solid colour
+// instead when transparency effects are off, and the window still looks
+// right. Over a dark background a blurred dark desktop is just dark, so the
+// rim below is what keeps it reading as glass rather than a solid slab.
+const DARK: Palette = Palette {
+    background: rgba(0x121216, 0.50),
+    text: rgba(0xF4F4F6, 1.0),
+    dim: rgba(0xF4F4F6, 0.42),
+    faint: rgba(0xFFFFFF, 0.08),
+    select: rgba(0xFFFFFF, 0.10),
+    panel: rgba(0x26262B, 0.94),
+    badge_bg: rgba(0xFFFFFF, 0.13),
+    badge_fg: rgba(0xF4F4F6, 0.65),
+    selection: rgba(0x4C8DFF, 0.45),
+    border: rgba(0xFFFFFF, 0.12),
+};
+
+const LIGHT: Palette = Palette {
+    background: rgba(0xF6F6F8, 0.55),
+    text: rgba(0x1B1B1F, 1.0),
+    dim: rgba(0x1B1B1F, 0.50),
+    faint: rgba(0x000000, 0.09),
+    select: rgba(0x000000, 0.07),
+    panel: rgba(0xF0F0F3, 0.96),
+    badge_bg: rgba(0x000000, 0.09),
+    badge_fg: rgba(0x1B1B1F, 0.70),
+    selection: rgba(0x3B82F6, 0.35),
+    border: rgba(0x000000, 0.14),
+};
 
 pub struct Renderer {
     dwrite: IDWriteFactory,
@@ -147,12 +220,26 @@ pub struct Renderer {
     fmt_panel: IDWriteTextFormat,
     fmt_badge: IDWriteTextFormat,
     fmt_header: IDWriteTextFormat,
+    palette: &'static Palette,
+    /// The palette's background: translucent over a backdrop, opaque
+    /// without one.
+    background: D2D1_COLOR_F,
     target: Option<Target>,
 }
 
-/// Device-dependent resources, recreated if the target is lost.
+/// Device-dependent resources, recreated if the target is lost or the window
+/// changes size.
 struct Target {
-    rt: ID2D1HwndRenderTarget,
+    rt: ID2D1DCRenderTarget,
+    dib: Dib,
+    dpi: f32,
+    brushes: Brushes,
+    /// D2D copies of plugin icons, keyed by the Arc's data address.
+    /// Dropped with the target (i.e. every hide), so it stays small.
+    icons: HashMap<usize, ID2D1Bitmap>,
+}
+
+struct Brushes {
     text: ID2D1SolidColorBrush,
     dim: ID2D1SolidColorBrush,
     faint: ID2D1SolidColorBrush,
@@ -160,13 +247,70 @@ struct Target {
     panel: ID2D1SolidColorBrush,
     badge_bg: ID2D1SolidColorBrush,
     badge_fg: ID2D1SolidColorBrush,
-    /// D2D copies of plugin icons, keyed by the Arc's data address.
-    /// Dropped with the target (i.e. every hide), so it stays small.
-    icons: HashMap<usize, ID2D1Bitmap>,
+    selection: ID2D1SolidColorBrush,
+    border: ID2D1SolidColorBrush,
+}
+
+/// A 32bpp top-down DIB selected into a memory DC: the pixels the window is
+/// made of. Physical pixels.
+struct Dib {
+    hdc: HDC,
+    bitmap: HBITMAP,
+    previous: HGDIOBJ,
+    width: u32,
+    height: u32,
+}
+
+impl Dib {
+    unsafe fn new(width: u32, height: u32) -> Result<Self> {
+        unsafe {
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width as i32,
+                    biHeight: -(height as i32), // top-down
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits = std::ptr::null_mut();
+            let bitmap = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0)?;
+            let hdc = CreateCompatibleDC(None);
+            if hdc.is_invalid() {
+                let _ = DeleteObject(bitmap.into());
+                return Err(Error::from_thread());
+            }
+            let previous = SelectObject(hdc, bitmap.into());
+            Ok(Self {
+                hdc,
+                bitmap,
+                previous,
+                width,
+                height,
+            })
+        }
+    }
+}
+
+impl Drop for Dib {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.hdc, self.previous);
+            let _ = DeleteObject(self.bitmap.into());
+            let _ = DeleteDC(self.hdc);
+        }
+    }
 }
 
 impl Renderer {
-    pub fn new() -> Result<Self> {
+    /// `translucent` selects the tinted background that lets a backdrop
+    /// show through; without one the window is painted solid. `dark` picks
+    /// the palette. `tint`, if set, overrides the palette's background alpha
+    /// (the `[appearance] opacity` config), 0 clear to 1 solid.
+    pub fn new(translucent: bool, dark: bool, tint: Option<f32>) -> Result<Self> {
         unsafe {
             let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
@@ -183,8 +327,11 @@ impl Renderer {
                 )
             };
 
+            // Editable fields never wrap: text longer than the field scrolls
+            // horizontally to keep the caret in view instead.
             let fmt_input = make(20.0, DWRITE_FONT_WEIGHT_NORMAL)?;
             fmt_input.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            fmt_input.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
             let fmt_title = make(15.0, DWRITE_FONT_WEIGHT_NORMAL)?;
             fmt_title.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
             let fmt_subtitle = make(12.0, DWRITE_FONT_WEIGHT_NORMAL)?;
@@ -194,6 +341,7 @@ impl Renderer {
             fmt_subtitle_left.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
             let fmt_panel = make(14.0, DWRITE_FONT_WEIGHT_NORMAL)?;
             fmt_panel.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            fmt_panel.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
             // Centred both ways so the text sits in the middle of the pill.
             let fmt_badge = make(11.5, DWRITE_FONT_WEIGHT_NORMAL)?;
             fmt_badge.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
@@ -201,6 +349,14 @@ impl Renderer {
             let fmt_header = make(11.5, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
             fmt_header.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
 
+            let palette = if dark { &DARK } else { &LIGHT };
+            let alpha = tint
+                .map(|t| t.clamp(0.0, 1.0))
+                .unwrap_or(palette.background.a);
+            let background = D2D1_COLOR_F {
+                a: if translucent { alpha } else { 1.0 },
+                ..palette.background
+            };
             Ok(Self {
                 d2d,
                 dwrite,
@@ -211,22 +367,30 @@ impl Renderer {
                 fmt_panel,
                 fmt_badge,
                 fmt_header,
+                palette,
+                background,
                 target: None,
             })
         }
     }
 
-    unsafe fn ensure_target(&mut self, hwnd: HWND) -> Result<()> {
-        if self.target.is_some() {
+    /// Make sure a target of the right size exists.
+    ///
+    /// The DIB is the window's size in physical pixels, so any change of
+    /// height (results coming and going) or DPI rebuilds it. That is cheap -
+    /// one allocation and a handful of brushes - and far simpler than
+    /// keeping an oversized bitmap around.
+    unsafe fn ensure_target(&mut self, width: u32, height: u32, dpi: f32) -> Result<()> {
+        if let Some(t) = &self.target
+            && t.dib.width == width
+            && t.dib.height == height
+            && t.dpi == dpi
+        {
             return Ok(());
         }
+        self.target = None;
         unsafe {
-            let mut rc = RECT::default();
-            GetClientRect(hwnd, &mut rc)?;
-            let size = D2D_SIZE_U {
-                width: (rc.right - rc.left).max(1) as u32,
-                height: (rc.bottom - rc.top).max(1) as u32,
-            };
+            let dib = Dib::new(width.max(1), height.max(1))?;
             // Software rasterizer: our scene is trivial (one small window,
             // redraws only on input) and skipping D3D/DXGI device creation
             // saves ~50MB of process memory. CPU cost per frame is <1ms.
@@ -234,78 +398,140 @@ impl Renderer {
                 r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
                 pixelFormat: D2D1_PIXEL_FORMAT {
                     format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    alphaMode: D2D1_ALPHA_MODE_IGNORE,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
                 },
                 dpiX: 0.0,
                 dpiY: 0.0,
-                usage: D2D1_RENDER_TARGET_USAGE_NONE,
+                usage: D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE,
                 minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
             };
-            let hwnd_props = D2D1_HWND_RENDER_TARGET_PROPERTIES {
-                hwnd,
-                pixelSize: size,
-                presentOptions: D2D1_PRESENT_OPTIONS_NONE,
+            let rt = self.d2d.CreateDCRenderTarget(&props)?;
+            let bounds = RECT {
+                left: 0,
+                top: 0,
+                right: dib.width as i32,
+                bottom: dib.height as i32,
             };
-            let rt = self.d2d.CreateHwndRenderTarget(&props, &hwnd_props)?;
-            let dpi = GetDpiForWindow(hwnd) as f32;
+            rt.BindDC(dib.hdc, &bounds)?;
             rt.SetDpi(dpi, dpi);
 
             let brush = |c: &D2D1_COLOR_F| -> Result<ID2D1SolidColorBrush> {
                 rt.CreateSolidColorBrush(c, None)
             };
+            let p = self.palette;
             self.target = Some(Target {
-                text: brush(&COL_TEXT)?,
-                dim: brush(&COL_DIM)?,
-                faint: brush(&COL_FAINT)?,
-                select: brush(&COL_SELECT)?,
-                panel: brush(&COL_PANEL)?,
-                badge_bg: brush(&COL_BADGE_BG)?,
-                badge_fg: brush(&COL_BADGE_FG)?,
+                brushes: Brushes {
+                    text: brush(&p.text)?,
+                    dim: brush(&p.dim)?,
+                    faint: brush(&p.faint)?,
+                    select: brush(&p.select)?,
+                    panel: brush(&p.panel)?,
+                    badge_bg: brush(&p.badge_bg)?,
+                    badge_fg: brush(&p.badge_fg)?,
+                    selection: brush(&p.selection)?,
+                    border: brush(&p.border)?,
+                },
                 icons: HashMap::new(),
+                dib,
+                dpi,
                 rt,
             });
             Ok(())
         }
     }
 
-    pub fn resize(&mut self, width: u32, height: u32) {
-        if let Some(t) = &self.target {
-            unsafe {
-                let _ = t.rt.Resize(&D2D_SIZE_U { width, height });
-            }
-        }
-    }
-
-    pub fn update_dpi(&mut self, dpi: f32) {
-        if let Some(t) = &self.target {
-            unsafe { t.rt.SetDpi(dpi, dpi) };
-        }
-    }
-
-    /// Width of `text` in DIPs when rendered with the input font.
-    fn measure_input(&self, text: &str) -> f32 {
-        self.measure(&self.fmt_input, text)
-    }
-
-    /// Width of `text` in DIPs when rendered with `format`.
-    fn measure(&self, format: &IDWriteTextFormat, text: &str) -> f32 {
-        if text.is_empty() {
-            return 0.0;
-        }
+    /// Byte offset in the query nearest to a click at `x` DIPs from the
+    /// window's left edge, for placing the caret with the mouse.
+    pub fn hit_test_input(&self, field: &TextField, x: f32) -> Option<usize> {
+        let text = field.text();
+        let caret_x = measure(&self.dwrite, &self.fmt_input, &text[..field.caret()]);
+        let shift = field_shift(caret_x, WINDOW_WIDTH - PAD_X * 2.0);
+        let local = x - PAD_X + shift;
         unsafe {
             let units: Vec<u16> = text.encode_utf16().collect();
-            let Ok(layout) = self.dwrite.CreateTextLayout(&units, format, 8192.0, 512.0) else {
-                return 0.0;
-            };
-            let mut m = DWRITE_TEXT_METRICS::default();
-            if layout.GetMetrics(&mut m).is_err() {
-                return 0.0;
+            let layout = self
+                .dwrite
+                .CreateTextLayout(&units, &self.fmt_input, 8192.0, INPUT_H)
+                .ok()?;
+            let mut trailing = BOOL(0);
+            let mut inside = BOOL(0);
+            let mut metrics = DWRITE_HIT_TEST_METRICS::default();
+            layout
+                .HitTestPoint(local, INPUT_H / 2.0, &mut trailing, &mut inside, &mut metrics)
+                .ok()?;
+            let mut units_left = metrics.textPosition as usize
+                + if trailing.as_bool() {
+                    metrics.length as usize
+                } else {
+                    0
+                };
+            // UTF-16 index back to a byte offset.
+            let mut bytes = 0;
+            for c in text.chars() {
+                let len16 = c.len_utf16();
+                if len16 > units_left {
+                    break;
+                }
+                units_left -= len16;
+                bytes += c.len_utf8();
             }
-            m.widthIncludingTrailingWhitespace
+            Some(bytes)
         }
     }
 
-    pub fn draw(&mut self, hwnd: HWND, frame: &Frame) {
+    /// Draw `frame` and put it on screen at `place`.
+    pub fn present(&mut self, hwnd: HWND, frame: &Frame, place: &Placement) {
+        unsafe {
+            if let Err(e) = self.ensure_target(place.width, place.height, place.dpi) {
+                crate::dlog!("present: target creation failed: {e}");
+                return;
+            }
+            let end = self.draw(frame, place);
+            if let Err(e) = &end {
+                crate::dlog!("present: EndDraw failed: {e}");
+            }
+            if matches!(&end, Err(e) if e.code() == D2DERR_RECREATE_TARGET) {
+                self.target = None;
+                return;
+            }
+            let Some(t) = &self.target else { return };
+            // GDI-compatible target: make sure the DIB bits are final before
+            // the window reads them.
+            let _ = GdiFlush();
+
+            // The window shrinks about its centre while scaling; the content
+            // was drawn scaled into the top-left corner of the DIB.
+            let w = (place.width as f32 * place.scale).round().max(1.0) as i32;
+            let h = (place.height as f32 * place.scale).round().max(1.0) as i32;
+            let dst = POINT {
+                x: place.x + (place.width as i32 - w) / 2,
+                y: place.y + (place.height as i32 - h) / 2,
+            };
+            let size = SIZE { cx: w, cy: h };
+            let src = POINT { x: 0, y: 0 };
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            if let Err(e) = UpdateLayeredWindow(
+                hwnd,
+                None,
+                Some(&dst),
+                Some(&size),
+                Some(t.dib.hdc),
+                Some(&src),
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            ) {
+                crate::dlog!("present: UpdateLayeredWindow failed: {e}");
+            }
+        }
+    }
+
+    unsafe fn draw(&mut self, frame: &Frame, place: &Placement) -> Result<()> {
         let Frame {
             query,
             caret_visible,
@@ -315,56 +541,53 @@ impl Renderer {
             scroll,
             panel,
         } = frame;
-        let (query, selected, scroll) = (*query, *selected, *scroll);
+        let (query, caret_visible, selected, scroll) = (*query, *caret_visible, *selected, *scroll);
+        let Self {
+            dwrite,
+            fmt_input,
+            fmt_title,
+            fmt_subtitle,
+            fmt_subtitle_left,
+            fmt_panel,
+            fmt_badge,
+            fmt_header,
+            background,
+            target,
+            ..
+        } = self;
+        let t = target.as_mut().unwrap();
+        let rt = &t.rt;
+        let b = &t.brushes;
         unsafe {
-            if self.ensure_target(hwnd).is_err() {
-                return;
+            // The summon animation scales the scene by drawing it at a
+            // proportionally lower DPI, which shrinks everything uniformly
+            // into the DIB's top-left corner - the part `present` shows.
+            let dpi = t.dpi * place.scale;
+            rt.SetDpi(dpi, dpi);
+            // And fades it by drawing everything, tint included, with less
+            // opacity. Brushes keep their opacity, so it is reset each frame.
+            let opacity = place.opacity.clamp(0.0, 1.0);
+            for brush in [
+                &b.text,
+                &b.dim,
+                &b.faint,
+                &b.select,
+                &b.panel,
+                &b.badge_bg,
+                &b.badge_fg,
+                &b.selection,
+                &b.border,
+            ] {
+                brush.SetOpacity(opacity);
             }
-            let caret_x = PAD_X + self.measure_input(query) + 1.0;
-            // Text measurement needs &self, so do it before borrowing the
-            // target mutably below.
-            let text_input_caret = match panel {
-                Some(PanelView::TextInput { prompt, buffer }) => Some((
-                    self.measure(&self.fmt_title, prompt),
-                    self.measure(&self.fmt_title, buffer),
-                )),
-                _ => None,
-            };
-            let form_caret = match panel {
-                Some(PanelView::Form {
-                    fields, focused, ..
-                }) => fields
-                    .get(*focused)
-                    .map(|f| self.measure(&self.fmt_panel, &f.value)),
-                _ => None,
-            };
-            // Badge geometry per row: (title width, badge text width). Rows
-            // without a badge measure nothing.
-            let badges: Vec<Option<(f32, f32)>> = results
-                .iter()
-                .map(|item| {
-                    item.badge.as_ref().map(|b| {
-                        (
-                            self.measure(&self.fmt_title, &item.title),
-                            self.measure(&self.fmt_badge, b),
-                        )
-                    })
-                })
-                .collect();
-            let hint = match panel {
-                Some(PanelView::Form { .. }) => "Save \u{21b5}      Field Tab",
-                Some(PanelView::TextInput { .. }) => "Confirm \u{21b5}",
-                Some(PanelView::Actions { .. }) => "Run \u{21b5}",
-                None => "Open \u{21b5}      Actions Ctrl+K",
-            };
-            let t = self.target.as_mut().unwrap();
-            let rt = &t.rt;
 
             rt.BeginDraw();
-            rt.Clear(Some(&COL_BG));
-            let size = rt.GetSize();
-            let width = size.width;
-            let height = size.height;
+            rt.Clear(Some(&D2D1_COLOR_F {
+                a: background.a * opacity,
+                ..*background
+            }));
+            let width = t.dib.width as f32 * 96.0 / t.dpi;
+            let height = t.dib.height as f32 * 96.0 / t.dpi;
 
             // Search input (query text or placeholder).
             let input_rect = D2D_RECT_F {
@@ -374,24 +597,20 @@ impl Renderer {
                 bottom: INPUT_H,
             };
             if query.is_empty() {
-                draw_text(rt, "Search apps and commands…", &self.fmt_input, &input_rect, &t.dim);
-            } else {
-                draw_text(rt, query, &self.fmt_input, &input_rect, &t.text);
+                draw_text(rt, "Search apps and commands…", fmt_input, &input_rect, &b.dim);
             }
-
-            // Caret.
-            if *caret_visible && panel.is_none() {
-                let mid = INPUT_H / 2.0;
-                rt.FillRectangle(
-                    &D2D_RECT_F {
-                        left: caret_x,
-                        top: mid - 12.0,
-                        right: caret_x + 2.0,
-                        bottom: mid + 12.0,
-                    },
-                    &t.text,
-                );
-            }
+            draw_field(
+                rt,
+                dwrite,
+                b,
+                query,
+                fmt_input,
+                &input_rect,
+                panel.is_none().then_some(Focus {
+                    caret_visible,
+                    caret_half: 12.0,
+                }),
+            );
 
             if !results.is_empty() {
                 // Separator under the input.
@@ -402,7 +621,7 @@ impl Renderer {
                         right: width,
                         bottom: INPUT_H + 1.0,
                     },
-                    &t.faint,
+                    &b.faint,
                 );
 
                 let list_top = INPUT_H + 1.0;
@@ -427,14 +646,14 @@ impl Renderer {
                     draw_text(
                         rt,
                         title,
-                        &self.fmt_header,
+                        fmt_header,
                         &D2D_RECT_F {
                             left: PAD_X,
                             top: hy,
                             right: width - PAD_X,
                             bottom: hy + HEADER_H,
                         },
-                        &t.dim,
+                        &b.dim,
                     );
                 }
 
@@ -457,25 +676,25 @@ impl Renderer {
                                 radiusX: 8.0,
                                 radiusY: 8.0,
                             },
-                            &t.select,
+                            &b.select,
                         );
                     }
-                    if let Some(icon) = &item.icon {
-                        if let Some(bmp) = icon_bitmap(rt, &mut t.icons, icon) {
-                            let top = y + (ROW_H - ICON_SIZE) / 2.0;
-                            rt.DrawBitmap(
-                                &bmp,
-                                Some(&D2D_RECT_F {
-                                    left: PAD_X,
-                                    top,
-                                    right: PAD_X + ICON_SIZE,
-                                    bottom: top + ICON_SIZE,
-                                }),
-                                1.0,
-                                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                                None,
-                            );
-                        }
+                    if let Some(icon) = &item.icon
+                        && let Some(bmp) = icon_bitmap(rt, &mut t.icons, icon)
+                    {
+                        let top = y + (ROW_H - ICON_SIZE) / 2.0;
+                        rt.DrawBitmap(
+                            &bmp,
+                            Some(&D2D_RECT_F {
+                                left: PAD_X,
+                                top,
+                                right: PAD_X + ICON_SIZE,
+                                bottom: top + ICON_SIZE,
+                            }),
+                            opacity,
+                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                            None,
+                        );
                     }
                     let title_rect = D2D_RECT_F {
                         left: PAD_X + ICON_SIZE + ICON_GAP,
@@ -483,12 +702,12 @@ impl Renderer {
                         right: width - PAD_X,
                         bottom: y + ROW_H,
                     };
-                    draw_text(rt, &item.title, &self.fmt_title, &title_rect, &t.text);
+                    draw_text(rt, &item.title, fmt_title, &title_rect, &b.text);
 
                     // Alias pill, immediately after the title.
-                    if let Some(badge) = &item.badge
-                        && let Some((title_w, badge_w)) = badges[i]
-                    {
+                    if let Some(badge) = &item.badge {
+                        let title_w = measure(dwrite, fmt_title, &item.title);
+                        let badge_w = measure(dwrite, fmt_badge, badge);
                         let left = title_rect.left + title_w + BADGE_GAP;
                         let pill = D2D_RECT_F {
                             left,
@@ -502,9 +721,9 @@ impl Renderer {
                                 radiusX: 5.0,
                                 radiusY: 5.0,
                             },
-                            &t.badge_bg,
+                            &b.badge_bg,
                         );
-                        draw_text(rt, badge, &self.fmt_badge, &pill, &t.badge_fg);
+                        draw_text(rt, badge, fmt_badge, &pill, &b.badge_fg);
                     }
 
                     if !item.subtitle.is_empty() {
@@ -514,12 +733,18 @@ impl Renderer {
                             right: width - PAD_X,
                             bottom: y + ROW_H,
                         };
-                        draw_text(rt, &item.subtitle, &self.fmt_subtitle, &row, &t.dim);
+                        draw_text(rt, &item.subtitle, fmt_subtitle, &row, &b.dim);
                     }
                 }
                 rt.PopAxisAlignedClip();
 
                 // Bottom bar with key hints.
+                let hint = match panel {
+                    Some(PanelView::Form { .. }) => "Save \u{21b5}      Field Tab",
+                    Some(PanelView::TextInput { .. }) => "Confirm \u{21b5}",
+                    Some(PanelView::Actions { .. }) => "Run \u{21b5}",
+                    None => "Open \u{21b5}      Actions Ctrl+K",
+                };
                 let bar_top = height - BAR_H;
                 rt.FillRectangle(
                     &D2D_RECT_F {
@@ -528,7 +753,7 @@ impl Renderer {
                         right: width,
                         bottom: bar_top + 1.0,
                     },
-                    &t.faint,
+                    &b.faint,
                 );
                 let bar_rect = D2D_RECT_F {
                     left: PAD_X,
@@ -536,8 +761,8 @@ impl Renderer {
                     right: width - PAD_X,
                     bottom: height,
                 };
-                draw_text(rt, "Apex", &self.fmt_subtitle_left, &bar_rect, &t.dim);
-                draw_text(rt, hint, &self.fmt_subtitle, &bar_rect, &t.dim);
+                draw_text(rt, "Apex", fmt_subtitle_left, &bar_rect, &b.dim);
+                draw_text(rt, hint, fmt_subtitle, &bar_rect, &b.dim);
             }
 
             // Overlay panel (actions / text input / form), bottom-right.
@@ -564,7 +789,7 @@ impl Renderer {
                         radiusX: 10.0,
                         radiusY: 10.0,
                     },
-                    &t.panel,
+                    &b.panel,
                 );
 
                 match view {
@@ -584,7 +809,7 @@ impl Renderer {
                                         radiusX: 6.0,
                                         radiusY: 6.0,
                                     },
-                                    &t.select,
+                                    &b.select,
                                 );
                             }
                             let label_rect = D2D_RECT_F {
@@ -592,7 +817,7 @@ impl Renderer {
                                 right: row.right - 10.0,
                                 ..row
                             };
-                            draw_text(rt, &action.label, &self.fmt_panel, &label_rect, &t.text);
+                            draw_text(rt, &action.label, fmt_panel, &label_rect, &b.text);
                             ay += PANEL_ROW;
                         }
                     }
@@ -604,25 +829,24 @@ impl Renderer {
                             bottom: rect.bottom - PANEL_PAD,
                         };
                         let prompt_text = format!("{prompt}: ");
-                        draw_text(rt, &prompt_text, &self.fmt_panel, &row, &t.dim);
-                        if let Some((pw, bw)) = text_input_caret {
-                            let text_rect = D2D_RECT_F {
-                                left: row.left + pw + 8.0,
-                                ..row
-                            };
-                            draw_text(rt, buffer, &self.fmt_panel, &text_rect, &t.text);
-                            let cx = text_rect.left + bw + 1.0;
-                            let mid = (row.top + row.bottom) / 2.0;
-                            rt.FillRectangle(
-                                &D2D_RECT_F {
-                                    left: cx,
-                                    top: mid - 9.0,
-                                    right: cx + 1.5,
-                                    bottom: mid + 9.0,
-                                },
-                                &t.text,
-                            );
-                        }
+                        draw_text(rt, &prompt_text, fmt_panel, &row, &b.dim);
+                        let prompt_w = measure(dwrite, fmt_panel, &prompt_text);
+                        let field_rect = D2D_RECT_F {
+                            left: row.left + prompt_w + 8.0,
+                            ..row
+                        };
+                        draw_field(
+                            rt,
+                            dwrite,
+                            b,
+                            buffer,
+                            fmt_panel,
+                            &field_rect,
+                            Some(Focus {
+                                caret_visible,
+                                caret_half: 9.0,
+                            }),
+                        );
                     }
                     PanelView::Form {
                         title,
@@ -635,7 +859,7 @@ impl Renderer {
                             right: rect.right - PANEL_PAD - 10.0,
                             bottom: rect.top + PANEL_PAD + FORM_TITLE_H,
                         };
-                        draw_text(rt, title, &self.fmt_panel, &title_rect, &t.dim);
+                        draw_text(rt, title, fmt_panel, &title_rect, &b.dim);
 
                         let mut fy = rect.top + PANEL_PAD + FORM_TITLE_H;
                         for (i, field) in fields.iter().enumerate() {
@@ -652,7 +876,7 @@ impl Renderer {
                                         radiusX: 6.0,
                                         radiusY: 6.0,
                                     },
-                                    &t.select,
+                                    &b.select,
                                 );
                             }
                             let label_rect = D2D_RECT_F {
@@ -661,13 +885,7 @@ impl Renderer {
                                 right: row.right - 10.0,
                                 bottom: row.top + 3.0 + FORM_LABEL_H,
                             };
-                            draw_text(
-                                rt,
-                                &field.label,
-                                &self.fmt_subtitle_left,
-                                &label_rect,
-                                &t.dim,
-                            );
+                            draw_text(rt, &field.label, fmt_subtitle_left, &label_rect, &b.dim);
 
                             let value_rect = D2D_RECT_F {
                                 left: row.left + 10.0,
@@ -675,44 +893,159 @@ impl Renderer {
                                 right: row.right - 10.0,
                                 bottom: row.bottom,
                             };
-                            draw_text(rt, &field.value, &self.fmt_panel, &value_rect, &t.text);
-
-                            if i == *focused
-                                && let Some(vw) = form_caret
-                            {
-                                let cx = value_rect.left + vw + 1.0;
-                                let mid = (value_rect.top + value_rect.bottom) / 2.0;
-                                rt.FillRectangle(
-                                    &D2D_RECT_F {
-                                        left: cx,
-                                        top: mid - 8.0,
-                                        right: cx + 1.5,
-                                        bottom: mid + 8.0,
-                                    },
-                                    &t.text,
-                                );
-                            }
+                            draw_field(
+                                rt,
+                                dwrite,
+                                b,
+                                &field.value,
+                                fmt_panel,
+                                &value_rect,
+                                (i == *focused).then_some(Focus {
+                                    caret_visible,
+                                    caret_half: 8.0,
+                                }),
+                            );
                             fy += FORM_ROW;
                         }
                     }
                 }
             }
 
-            let end = rt.EndDraw(None, None);
-            if let Err(e) = &end {
-                crate::dlog!("draw: EndDraw failed: {e}");
-            }
-            let recreate = matches!(end, Err(e) if e.code() == D2DERR_RECREATE_TARGET);
-            if recreate {
-                self.target = None;
-            }
+            // Glass-edge rim, drawn last so it sits crisply at the very edge
+            // over everything. Inset half the stroke so the 1px line stays
+            // inside the window and traces the DWM rounded corners (~8 DIP).
+            rt.DrawRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: 0.5,
+                        top: 0.5,
+                        right: width - 0.5,
+                        bottom: height - 0.5,
+                    },
+                    radiusX: 8.0,
+                    radiusY: 8.0,
+                },
+                &b.border,
+                1.0,
+                None,
+            );
+
+            rt.EndDraw(None, None)
         }
+    }
+}
+
+/// How far a field's content is shifted left so the caret stays in view.
+fn field_shift(caret_x: f32, avail: f32) -> f32 {
+    (caret_x + CARET_W - avail).max(0.0)
+}
+
+/// How a focused field shows its caret. `None` means the field is not the
+/// one being edited: no caret, no selection, no scrolling.
+#[derive(Clone, Copy)]
+struct Focus {
+    /// Off during the blink's dark phase.
+    caret_visible: bool,
+    /// Caret extent above and below the field's middle, in DIPs.
+    caret_half: f32,
+}
+
+/// Paint one editable field inside `rect`: selection highlight, text, and -
+/// when focused - the caret.
+///
+/// Text wider than the field scrolls left so the caret stays visible; the
+/// field is clipped to its rect so the overflow never shows.
+unsafe fn draw_field(
+    rt: &ID2D1RenderTarget,
+    dwrite: &IDWriteFactory,
+    brushes: &Brushes,
+    field: &TextField,
+    format: &IDWriteTextFormat,
+    rect: &D2D_RECT_F,
+    focus: Option<Focus>,
+) {
+    let text = field.text();
+    let caret_x = measure(dwrite, format, &text[..field.caret()]);
+    let shift = if focus.is_some() {
+        field_shift(caret_x, rect.right - rect.left)
+    } else {
+        0.0
+    };
+    let left = rect.left - shift;
+    let mid = (rect.top + rect.bottom) / 2.0;
+    unsafe {
+        rt.PushAxisAlignedClip(rect, D2D1_ANTIALIAS_MODE_ALIASED);
+        if let Some(focus) = focus
+            && let Some((a, b)) = field.selection()
+        {
+            let x0 = left + measure(dwrite, format, &text[..a]);
+            let x1 = left + measure(dwrite, format, &text[..b]);
+            rt.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: x0,
+                        top: mid - focus.caret_half - 1.0,
+                        right: x1,
+                        bottom: mid + focus.caret_half + 1.0,
+                    },
+                    radiusX: 3.0,
+                    radiusY: 3.0,
+                },
+                &brushes.selection,
+            );
+        }
+        draw_text(
+            rt,
+            text,
+            format,
+            &D2D_RECT_F {
+                left,
+                top: rect.top,
+                // No wrapping, so the right edge only needs to be far away.
+                right: left + 1.0e5,
+                bottom: rect.bottom,
+            },
+            &brushes.text,
+        );
+        if let Some(focus) = focus
+            && focus.caret_visible
+        {
+            let cx = left + caret_x + 1.0;
+            rt.FillRectangle(
+                &D2D_RECT_F {
+                    left: cx,
+                    top: mid - focus.caret_half,
+                    right: cx + CARET_W,
+                    bottom: mid + focus.caret_half,
+                },
+                &brushes.text,
+            );
+        }
+        rt.PopAxisAlignedClip();
+    }
+}
+
+/// Width of `text` in DIPs when rendered with `format`.
+fn measure(dwrite: &IDWriteFactory, format: &IDWriteTextFormat, text: &str) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    unsafe {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let Ok(layout) = dwrite.CreateTextLayout(&units, format, 8192.0, 512.0) else {
+            return 0.0;
+        };
+        let mut m = DWRITE_TEXT_METRICS::default();
+        if layout.GetMetrics(&mut m).is_err() {
+            return 0.0;
+        }
+        m.widthIncludingTrailingWhitespace
     }
 }
 
 /// Get (or create) the per-target D2D bitmap for an icon.
 unsafe fn icon_bitmap(
-    rt: &ID2D1HwndRenderTarget,
+    rt: &ID2D1RenderTarget,
     cache: &mut HashMap<usize, ID2D1Bitmap>,
     icon: &Arc<Icon>,
 ) -> Option<ID2D1Bitmap> {
@@ -746,7 +1079,7 @@ unsafe fn icon_bitmap(
 }
 
 unsafe fn draw_text(
-    rt: &ID2D1HwndRenderTarget,
+    rt: &ID2D1RenderTarget,
     text: &str,
     format: &IDWriteTextFormat,
     rect: &D2D_RECT_F,

@@ -2,36 +2,29 @@
 //!
 //! AppsFolder is the same list the Start menu shows: classic desktop apps
 //! (Start Menu shortcuts) and packaged/UWP apps (Notepad, Settings, Store
-//! apps). Indexing runs on a background thread so startup stays instant;
+//! apps). The list itself comes from [`crate::appindex`]: a helper process
+//! builds it and writes it to disk, and this plugin only ever reads the
+//! file, so the shell's enumeration and imaging libraries never load into
+//! the launcher. Loading and refreshing happen on a background thread;
 //! results are swapped in on the first query that finds them ready.
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
-use windows::Win32::System::Com::{
-    COINIT_DISABLE_OLE1DDE, COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree,
-};
-use windows::Win32::UI::Shell::{
-    BHID_EnumItems, FOLDERID_AppsFolder, IEnumShellItems, IShellItem, KF_FLAG_DEFAULT,
-    SHGetKnownFolderItem, SIGDN, SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING, SIID_APPLICATION,
-    ShellExecuteW,
-};
+use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{PCWSTR, w};
 
 use std::collections::HashMap;
 
-use crate::icon;
-use crate::plugin::{Action, ActionResult, Icon, Plugin, ResultItem};
+use crate::appindex::{self, AppIndex};
 use crate::fuzzy;
+use crate::plugin::{Action, ActionResult, Icon, Plugin, ResultItem};
 
 pub const ID: &str = "search";
 
 /// Score boost for an exact alias hit; large enough to always rank first.
 const ALIAS_BOOST: i32 = 2000;
-
-/// What counts as launchable in a user-added source folder.
-const SOURCE_EXTENSIONS: [&str; 5] = ["exe", "lnk", "bat", "cmd", "ps1"];
 
 struct AppEntry {
     /// Display name as shown in the Start menu.
@@ -45,6 +38,18 @@ struct AppEntry {
     icon: Option<Arc<Icon>>,
 }
 
+impl AppEntry {
+    fn from_index(app: appindex::IndexedApp) -> Self {
+        Self {
+            name_folded: fuzzy::fold_case(&app.name),
+            bonus: fuzzy::bonuses(&app.name),
+            name: app.name,
+            app_id: app.app_id,
+            icon: app.icon,
+        }
+    }
+}
+
 pub struct Search {
     entries: Vec<AppEntry>,
     pending: Option<Receiver<Vec<AppEntry>>>,
@@ -53,29 +58,54 @@ pub struct Search {
     aliases: HashMap<String, String>,
 }
 
-/// Scan the AppsFolder on a background thread so startup - and reloads -
-/// never block the UI.
-fn spawn_index(sources: Vec<String>) -> Receiver<Vec<AppEntry>> {
+fn entries_of(index: AppIndex) -> Vec<AppEntry> {
+    index.apps.into_iter().map(AppEntry::from_index).collect()
+}
+
+/// Load the index on a background thread so startup - and reloads - never
+/// block the UI.
+///
+/// At startup the last index on disk is delivered first, so the first
+/// summon already has every app, and the helper then rebuilds it to catch
+/// installs and removals; that second delivery supersedes the first. A
+/// reload skips the stale copy and only delivers the rebuilt one. If the
+/// helper cannot run at all, the index is built in-process instead - that
+/// costs the memory the helper exists to save, but apex keeps working.
+fn spawn_index(use_cached: bool) -> Receiver<Vec<AppEntry>> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
-        let entries = index_apps(&sources);
-        crate::dlog!(
-            "search: indexed {} apps in {:.1?}",
-            entries.len(),
-            started.elapsed()
-        );
-        // Ignored if the receiver is gone: a second reload supersedes this one.
-        let _ = tx.send(entries);
+        let mut delivered = false;
+        if use_cached && let Some(index) = appindex::load() {
+            delivered = tx.send(entries_of(index)).is_ok();
+        }
+        let fresh = if appindex::run_helper() {
+            appindex::load()
+        } else {
+            crate::dlog!("search: index helper failed, indexing in-process");
+            let sources = crate::config::Config::load().list_values(crate::config::SOURCES);
+            Some(appindex::build(&sources))
+        };
+        if let Some(index) = fresh {
+            crate::dlog!(
+                "search: indexed {} apps in {:.1?}",
+                index.apps.len(),
+                started.elapsed()
+            );
+            // Ignored if the receiver is gone: a later reload supersedes this.
+            let _ = tx.send(entries_of(index));
+        } else if !delivered {
+            crate::dlog!("search: no index available");
+        }
     });
     rx
 }
 
 impl Search {
-    pub fn new(aliases: HashMap<String, String>, sources: Vec<String>) -> Self {
+    pub fn new(aliases: HashMap<String, String>) -> Self {
         Self {
             entries: Vec::new(),
-            pending: Some(spawn_index(sources)),
+            pending: Some(spawn_index(true)),
             aliases,
         }
     }
@@ -87,16 +117,21 @@ impl Search {
             .map(|(a, _)| a.as_str())
     }
 
-    /// Swap in the index once the background scan finishes.
+    /// Swap in the newest index the background thread has delivered.
+    ///
+    /// Drains rather than taking one message: the startup thread delivers
+    /// the cached index and then the rebuilt one, and only the last matters.
     fn poll_index(&mut self) {
         let Some(rx) = &self.pending else { return };
-        match rx.try_recv() {
-            Ok(entries) => {
-                self.entries = entries;
-                self.pending = None;
+        loop {
+            match rx.try_recv() {
+                Ok(entries) => self.entries = entries,
+                Err(TryRecvError::Disconnected) => {
+                    self.pending = None;
+                    return;
+                }
+                Err(TryRecvError::Empty) => return,
             }
-            Err(TryRecvError::Disconnected) => self.pending = None,
-            Err(TryRecvError::Empty) => {}
         }
     }
 }
@@ -107,13 +142,13 @@ impl Plugin for Search {
     }
 
     fn refresh(&mut self) {
-        // Aliases and sources come back from disk too, so editing the config
-        // by hand and reloading is enough - no restart.
-        let config = crate::config::Config::load();
-        self.aliases = config.aliases_map();
-        // The current index stays in place until the rescan lands, so the
+        // Aliases come back from disk too, so editing the config by hand and
+        // reloading is enough - no restart. Source folders are read by the
+        // helper itself.
+        self.aliases = crate::config::Config::load().aliases_map();
+        // The current index stays in place until the rebuild lands, so the
         // list never blinks empty.
-        self.pending = Some(spawn_index(config.list_values(crate::config::SOURCES)));
+        self.pending = Some(spawn_index(false));
     }
 
     fn query(&mut self, q: &str, out: &mut Vec<ResultItem>) {
@@ -241,114 +276,6 @@ fn make_item(e: &AppEntry, alias: Option<&str>, score: i32) -> ResultItem {
         payload: e.app_id.clone(),
         score,
         icon: e.icon.clone(),
-    }
-}
-
-fn index_apps(sources: &[String]) -> Vec<AppEntry> {
-    unsafe {
-        // MTA: this worker never pumps messages, and STA COM without a pump
-        // can deadlock inside shell calls (icon extraction did exactly that).
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE);
-        // Extracted once and shared by every entry that has no icon of its
-        // own, so the fallback costs one bitmap rather than one per app.
-        let fallback = icon::stock(SIID_APPLICATION).map(Arc::new);
-        let mut out = Vec::new();
-        if let Err(e) = enum_apps_folder(&mut out, fallback.as_ref()) {
-            crate::dlog!("search: AppsFolder enumeration failed: {e}");
-        }
-        for dir in sources {
-            scan_source(dir, &mut out, fallback.as_ref());
-        }
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        out.dedup_by(|a, b| a.name == b.name && a.app_id == b.app_id);
-        out
-    }
-}
-
-/// Index launchable files sitting directly in a user-added source folder.
-///
-/// One level only, deliberately: a source pointed at a deep tree - or at a
-/// drive root by mistake - would otherwise stall indexing.
-fn scan_source(dir: &str, out: &mut Vec<AppEntry>, fallback: Option<&Arc<Icon>>) {
-    let Ok(listing) = std::fs::read_dir(dir) else {
-        crate::dlog!("search: source unreadable, skipping: {dir}");
-        return;
-    };
-    let mut found = 0usize;
-    for entry in listing.flatten() {
-        let path = entry.path();
-        let is_launchable = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|ext| SOURCE_EXTENSIONS.iter().any(|w| ext.eq_ignore_ascii_case(w)));
-        if !is_launchable || !path.is_file() {
-            continue;
-        }
-        let (Some(name), Some(full)) = (
-            path.file_stem().and_then(|s| s.to_str()),
-            path.to_str(),
-        ) else {
-            continue;
-        };
-        out.push(AppEntry {
-            name_folded: fuzzy::fold_case(name),
-            bonus: fuzzy::bonuses(name),
-            icon: icon::from_path(full)
-                .map(Arc::new)
-                .or_else(|| fallback.cloned()),
-            app_id: full.to_string(),
-            name: name.to_string(),
-        });
-        found += 1;
-    }
-    crate::dlog!("search: source {dir} contributed {found} entries");
-}
-
-unsafe fn enum_apps_folder(
-    out: &mut Vec<AppEntry>,
-    fallback: Option<&Arc<Icon>>,
-) -> windows::core::Result<()> {
-    unsafe {
-        let folder: IShellItem = SHGetKnownFolderItem(&FOLDERID_AppsFolder, KF_FLAG_DEFAULT, None)?;
-        let items: IEnumShellItems = folder.BindToHandler(None, &BHID_EnumItems)?;
-        loop {
-            let mut batch: [Option<IShellItem>; 16] = Default::default();
-            let mut fetched = 0u32;
-            let _ = items.Next(&mut batch, Some(&mut fetched));
-            if fetched == 0 {
-                break;
-            }
-            for item in batch.iter().take(fetched as usize).flatten() {
-                let Ok(name) = display_name(item, SIGDN_NORMALDISPLAY) else {
-                    continue;
-                };
-                let Ok(app_id) = display_name(item, SIGDN_PARENTRELATIVEPARSING) else {
-                    continue;
-                };
-                if name.is_empty() || app_id.is_empty() {
-                    continue;
-                }
-                out.push(AppEntry {
-                    name_folded: fuzzy::fold_case(&name),
-                    bonus: fuzzy::bonuses(&name),
-                    app_id,
-                    icon: icon::from_shell_item(item)
-                        .map(Arc::new)
-                        .or_else(|| fallback.cloned()),
-                    name,
-                });
-            }
-        }
-        Ok(())
-    }
-}
-
-unsafe fn display_name(item: &IShellItem, kind: SIGDN) -> windows::core::Result<String> {
-    unsafe {
-        let pw = item.GetDisplayName(kind)?;
-        let s = pw.to_string().unwrap_or_default();
-        CoTaskMemFree(Some(pw.0 as *const _));
-        Ok(s)
     }
 }
 

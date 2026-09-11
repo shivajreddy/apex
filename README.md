@@ -14,8 +14,8 @@ Ultra-fast, ultra-lightweight launcher for Windows. Raycast, but native.
 
 `v0.2.2`, pre-release. Working today: global hotkey, fuzzy app search with
 icons (desktop + Store apps), frecency ranking, quicklinks, apex commands, a
-tray icon, aliases, and an actions panel. See [ROADMAP.md](ROADMAP.md) for
-what's shipped and what's next.
+tray icon, aliases, an actions panel, and an acrylic backdrop. See
+[ROADMAP.md](ROADMAP.md) for what's shipped and what's next.
 
 ## Install
 
@@ -73,10 +73,13 @@ Start-Process "$env:LOCALAPPDATA\Programs\Apex\apex.exe"
 | `↑` `↓` | move selection |
 | `Enter` | open |
 | `Ctrl+K` | actions for the selected result |
-| `Ctrl+V` | paste, in the query and in any field |
+| `←` `→` `Home` `End` | move the caret; `Ctrl` jumps by word, `Shift` selects |
+| `Ctrl+A` | select all |
+| `Ctrl+X` `Ctrl+C` `Ctrl+V` | cut, copy, paste - in the query and in any field |
 | `Tab` | next field, in forms |
 
-The mouse works too: hover to highlight, click to launch, wheel to scroll.
+The mouse works too: hover to highlight, click to launch, wheel to scroll,
+click in the query to place the caret.
 
 Summoning apex with an empty query lists your most-used entries under
 `Suggestions`, then everything else - every app, quicklink and command -
@@ -85,8 +88,24 @@ whether you have ten entries or three hundred. `Suggestions` is omitted
 entirely until you have launched something.
 
 Note: `Ctrl+Esc` normally opens the Start menu. Apex claims it with a
-low-level keyboard hook - before the shell sees it - so it wins even over
-reserved combos (the Win key still opens Start).
+low-level keyboard hook, on its own thread so a busy moment never makes it
+miss the chord - before the shell sees it, so it wins even over reserved
+combos (the Win key still opens Start).
+
+If summoning is unreliable, another app is almost certainly intercepting the
+key first. `Ctrl+Esc` is a shell chord, and tools that install their own
+keyboard hooks - a tiling window manager, Windhawk, remappers - sit in the
+same hook chain and can swallow the real keypress before Apex sees it. The
+robust fix is a chord nothing else claims:
+
+```toml
+[hotkey]
+modifiers = "ctrl"
+key = "space"
+```
+
+Tiling window managers also try to manage the popup. Tell yours to leave it
+alone - in GlazeWM, a `window_rules` `ignore` on `window_process: 'apex'`.
 
 ### Aliases
 
@@ -169,6 +188,12 @@ start_menu = true        # Start menu entry, refreshed each launch
 start_on_startup = true  # run Apex at sign-in (HKCU Run key)
 tray_icon = true         # tray icon: Open / Reload / Open Config / Quit
 
+[appearance]
+backdrop = "acrylic"     # blur what's behind the window; "none" for solid
+theme = "system"         # follow Windows' light/dark setting; or "dark", "light"
+opacity = 0.5            # tint over the blur: 0.0 clear .. 1.0 solid
+animation = true         # scale-and-fade on summon; false shows it instantly
+
 [hotkey]
 modifiers = "ctrl"       # ctrl, alt, shift, win, joined with '+'; or "none"
 key = "escape"           # a-z, 0-9, f1-f24, space, escape, tab, grave, enter
@@ -179,6 +204,10 @@ quicklinks = true
 commands = true
 ```
 
+Acrylic needs Windows 11 22H2 or later; older systems get a solid window
+without being asked. With Windows' own "Transparency effects" switched off,
+the blur is replaced by a solid colour behind the tint.
+
 Apex only ever rewrites the sections it owns - `[aliases]`, `[quicklinks.*]`,
 `[sources]`, `[hidden]`, and single `[general]` keys - by line surgery. Every
 other section, and every comment, is preserved byte-for-byte.
@@ -186,6 +215,13 @@ other section, and every comment, is preserved byte-for-byte.
 Launch history is *not* kept here. It lives in
 `%LOCALAPPDATA%\apex\frecency.tsv`, because it rewrites on every launch and is
 machine-local - the config file is yours, and often lives in a git repo.
+
+The application index lives beside it, as `index.bin`. A helper process
+(`apex --index`, the same exe) enumerates installed apps and extracts their
+icons, writes the file, and exits, so the shell's enumeration and imaging
+libraries never load into the launcher itself. Apex reads the last index at
+startup and refreshes it in the background; `Apex: Reload` refreshes it on
+demand. It is safe to delete.
 
 ## Known limitations
 
