@@ -6,7 +6,7 @@
 
 Where Apex is, how it got here, and where it's going.
 
-**Status:** `v0.2.1` — pre-release, in active development.
+**Status:** `v0.2.2` — pre-release, in active development.
 **Working today:** global hotkey, app search with icons, frecency ranking,
 quicklinks, apex commands, tray icon, aliases.
 
@@ -34,10 +34,10 @@ feature loses.
 
 | | |
 |---|---|
-| Binary size | 533 KB |
+| Binary size | 560 KB |
 | Memory, idle | ~12 MB private |
 | App index | ~150 apps in ~1 s (background thread) |
-| Tests | 57 unit tests |
+| Tests | 65 unit tests |
 
 Idle memory is what it is because icon extraction runs during the startup
 scan, loading the Windows imaging DLLs immediately and never unloading them.
@@ -71,6 +71,13 @@ icon cache below is the fix.
 - Scrolling list with a fixed viewport, so the default view can hold every
   installed entry without filling the screen. Rows outside it are culled.
 - Mouse: hover to highlight, click to launch, wheel to scroll
+
+**Curating the catalogue**
+- `Hide from Apex` on any row, from a shell-level action appended to whatever
+  the owning plugin offered, so one implementation covers every entry type
+- `[sources]`: extra folders indexed alongside the Start menu, one level deep,
+  for portable apps and loose scripts
+- Management views for both, reachable as `Apex:` commands
 
 **Search plugin** (the first plugin)
 - Indexes the shell `AppsFolder`: desktop **and** UWP/Store apps, the same
@@ -129,7 +136,8 @@ icon cache below is the fix.
 
 | Version | Contents |
 |---|---|
-| `v0.2.1` (current) | Sectioned and scrolling result list, mouse support. |
+| `v0.2.2` (current) | Hide entries, extra source folders, and management views for both. |
+| `v0.2.1` | Sectioned and scrolling result list, mouse support. |
 | `v0.2.0` | Frecency ranking, quicklinks, apex commands, tray icon, clipboard paste, alias pills, icon fallback. |
 | `v0.1.0` | Global hotkey, app search with icons, launch, aliases, actions panel. First usable launcher. |
 

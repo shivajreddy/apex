@@ -12,7 +12,7 @@ Ultra-fast, ultra-lightweight launcher for Windows. Raycast, but native.
 
 ## Status
 
-`v0.2.1`, pre-release. Working today: global hotkey, fuzzy app search with
+`v0.2.2`, pre-release. Working today: global hotkey, fuzzy app search with
 icons (desktop + Store apps), frecency ranking, quicklinks, apex commands, a
 tray icon, aliases, and an actions panel. See [ROADMAP.md](ROADMAP.md) for
 what's shipped and what's next.
@@ -112,6 +112,30 @@ open_with = 'chrome'        # optional; defaults to the system handler
 Prefer `'single quotes'`: they keep Windows paths like `C:\tools\x.exe`
 literal, with no escaping.
 
+### Curating what shows up
+
+`Commands` lists every installed application, which usually includes
+uninstallers and bundled helpers you will never launch. `Ctrl+K` on any row
+offers **Hide from Apex**; `Apex: Manage Hidden Entries` lists what you hid,
+with **Unhide** to put it back.
+
+### Source folders
+
+Portable apps and loose scripts never get a Start Menu entry, so apex cannot
+see them by default. `Apex: Add Source Folder` takes a folder and indexes
+what is in it - `.exe`, `.lnk`, `.bat`, `.cmd` and `.ps1`, one level deep.
+`Apex: Manage Source Folders` lists what you have added, with **Remove Source
+Folder** behind `Ctrl+K`; removing reindexes immediately.
+
+```toml
+[sources]
+1 = 'D:\PortableApps'
+```
+
+Scanning is deliberately not recursive: a source pointed at a deep tree, or
+at a drive root by mistake, would stall indexing. The keys are just indices -
+a bare TOML key cannot hold a Windows path.
+
 ### Apex commands
 
 Type `apex` to list them all; each is also reachable by its own word, and by
@@ -127,6 +151,9 @@ hidden synonyms (`startup` finds Toggle Start at Login, `exit` finds Quit).
 | `Apex: Toggle Tray Icon` | show/hide the tray icon, and remember the choice |
 | `Apex: Toggle Start at Login` | flip `start_on_startup` and apply it now |
 | `Apex: Clear Launch History` | reset frecency ranking |
+| `Apex: Add Source Folder` | index an extra folder of apps and scripts |
+| `Apex: Manage Source Folders` | review source folders, and remove them |
+| `Apex: Manage Hidden Entries` | review what you have hidden, and restore it |
 
 Reload picks up hand-edits to `config.toml`, so editing it in your dotfiles
 and reloading is enough. `[general]` and `[hotkey]` still need a restart.
@@ -152,8 +179,9 @@ quicklinks = true
 commands = true
 ```
 
-Apex only ever rewrites the `[aliases]` and `[quicklinks.*]` sections, by line
-surgery; every other section, and every comment, is preserved byte-for-byte.
+Apex only ever rewrites the sections it owns - `[aliases]`, `[quicklinks.*]`,
+`[sources]`, `[hidden]`, and single `[general]` keys - by line surgery. Every
+other section, and every comment, is preserved byte-for-byte.
 
 Launch history is *not* kept here. It lives in
 `%LOCALAPPDATA%\apex\frecency.tsv`, because it rewrites on every launch and is
