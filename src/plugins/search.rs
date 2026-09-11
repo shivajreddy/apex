@@ -406,20 +406,5 @@ fn launch(app_id: &str) -> bool {
     } else {
         format!("shell:AppsFolder\\{app_id}")
     };
-    let wide: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe {
-        let inst = ShellExecuteW(
-            None,
-            w!("open"),
-            PCWSTR(wide.as_ptr()),
-            None,
-            None,
-            SW_SHOWNORMAL,
-        );
-        let ok = inst.0 as isize > 32;
-        if !ok {
-            crate::dlog!("search: failed to launch {target}");
-        }
-        ok
-    }
+    crate::launch::open(&target, None)
 }

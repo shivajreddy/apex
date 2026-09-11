@@ -164,8 +164,11 @@ Polish the launcher until it's the fastest path to any app.
       `ID2D1HwndRenderTarget` cannot do; a layered window driven by
       `UpdateLayeredWindow` is the likely route
 - [ ] **Fade/scale animation** on summon
-- [ ] **`run_as_admin` setting** — elevated logon task, so the hotkey works
-      over Task Manager and other elevated windows
+- [x] **`run_as_admin` setting** — elevated logon task, so the hotkey works
+      over Task Manager and other elevated windows. Launches are routed
+      through Explorer so the apps themselves stay unelevated; a quicklink
+      with `open_with` is the one case that cannot be, since Explorer will
+      not forward a program-and-argument pair.
 
 ### v0.3 — "More than apps"
 

@@ -25,6 +25,11 @@ start_menu = true
 start_on_startup = true
 # Show a tray icon (right-click for Open / Reload / Config / Quit).
 tray_icon = true
+# Run apex elevated, via a scheduled logon task, so the hotkey still works
+# while an elevated window (Task Manager) has focus. Enabling it asks for
+# admin once to create the task, and takes effect at the next sign-in.
+# Apps you launch are handed to Explorer so they still run unelevated.
+run_as_admin = false
 
 [hotkey]
 # Modifiers joined with '+': ctrl, alt, shift, win. Use "none" for bare keys.
