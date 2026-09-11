@@ -30,6 +30,9 @@ pub const ID: &str = "search";
 /// Score boost for an exact alias hit; large enough to always rank first.
 const ALIAS_BOOST: i32 = 2000;
 
+/// What counts as launchable in a user-added source folder.
+const SOURCE_EXTENSIONS: [&str; 5] = ["exe", "lnk", "bat", "cmd", "ps1"];
+
 struct AppEntry {
     /// Display name as shown in the Start menu.
     name: String,
@@ -52,11 +55,11 @@ pub struct Search {
 
 /// Scan the AppsFolder on a background thread so startup - and reloads -
 /// never block the UI.
-fn spawn_index() -> Receiver<Vec<AppEntry>> {
+fn spawn_index(sources: Vec<String>) -> Receiver<Vec<AppEntry>> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
-        let entries = index_apps();
+        let entries = index_apps(&sources);
         crate::dlog!(
             "search: indexed {} apps in {:.1?}",
             entries.len(),
@@ -69,10 +72,10 @@ fn spawn_index() -> Receiver<Vec<AppEntry>> {
 }
 
 impl Search {
-    pub fn new(aliases: HashMap<String, String>) -> Self {
+    pub fn new(aliases: HashMap<String, String>, sources: Vec<String>) -> Self {
         Self {
             entries: Vec::new(),
-            pending: Some(spawn_index()),
+            pending: Some(spawn_index(sources)),
             aliases,
         }
     }
@@ -104,12 +107,13 @@ impl Plugin for Search {
     }
 
     fn refresh(&mut self) {
-        // Aliases come back from disk too, so editing the config by hand and
-        // reloading is enough - no restart.
-        self.aliases = crate::config::Config::load().aliases_map();
+        // Aliases and sources come back from disk too, so editing the config
+        // by hand and reloading is enough - no restart.
+        let config = crate::config::Config::load();
+        self.aliases = config.aliases_map();
         // The current index stays in place until the rescan lands, so the
         // list never blinks empty.
-        self.pending = Some(spawn_index());
+        self.pending = Some(spawn_index(config.list_values(crate::config::SOURCES)));
     }
 
     fn query(&mut self, q: &str, out: &mut Vec<ResultItem>) {
@@ -240,7 +244,7 @@ fn make_item(e: &AppEntry, alias: Option<&str>, score: i32) -> ResultItem {
     }
 }
 
-fn index_apps() -> Vec<AppEntry> {
+fn index_apps(sources: &[String]) -> Vec<AppEntry> {
     unsafe {
         // MTA: this worker never pumps messages, and STA COM without a pump
         // can deadlock inside shell calls (icon extraction did exactly that).
@@ -252,10 +256,52 @@ fn index_apps() -> Vec<AppEntry> {
         if let Err(e) = enum_apps_folder(&mut out, fallback.as_ref()) {
             crate::dlog!("search: AppsFolder enumeration failed: {e}");
         }
+        for dir in sources {
+            scan_source(dir, &mut out, fallback.as_ref());
+        }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out.dedup_by(|a, b| a.name == b.name && a.app_id == b.app_id);
         out
     }
+}
+
+/// Index launchable files sitting directly in a user-added source folder.
+///
+/// One level only, deliberately: a source pointed at a deep tree - or at a
+/// drive root by mistake - would otherwise stall indexing.
+fn scan_source(dir: &str, out: &mut Vec<AppEntry>, fallback: Option<&Arc<Icon>>) {
+    let Ok(listing) = std::fs::read_dir(dir) else {
+        crate::dlog!("search: source unreadable, skipping: {dir}");
+        return;
+    };
+    let mut found = 0usize;
+    for entry in listing.flatten() {
+        let path = entry.path();
+        let is_launchable = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| SOURCE_EXTENSIONS.iter().any(|w| ext.eq_ignore_ascii_case(w)));
+        if !is_launchable || !path.is_file() {
+            continue;
+        }
+        let (Some(name), Some(full)) = (
+            path.file_stem().and_then(|s| s.to_str()),
+            path.to_str(),
+        ) else {
+            continue;
+        };
+        out.push(AppEntry {
+            name_folded: fuzzy::fold_case(name),
+            bonus: fuzzy::bonuses(name),
+            icon: icon::from_path(full)
+                .map(Arc::new)
+                .or_else(|| fallback.cloned()),
+            app_id: full.to_string(),
+            name: name.to_string(),
+        });
+        found += 1;
+    }
+    crate::dlog!("search: source {dir} contributed {found} entries");
 }
 
 unsafe fn enum_apps_folder(
@@ -350,9 +396,16 @@ fn reveal(app_id: &str) -> bool {
     }
 }
 
-/// Launch an AppsFolder entry via the shell. Returns true on success.
+/// Launch an entry via the shell. Returns true on success.
+///
+/// Source-folder entries carry a real path and are run directly; AppsFolder
+/// ids are not paths and have to go through the `shell:AppsFolder` verb.
 fn launch(app_id: &str) -> bool {
-    let target = format!("shell:AppsFolder\\{app_id}");
+    let target = if std::path::Path::new(app_id).exists() {
+        app_id.to_string()
+    } else {
+        format!("shell:AppsFolder\\{app_id}")
+    };
     let wide: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         let inst = ShellExecuteW(

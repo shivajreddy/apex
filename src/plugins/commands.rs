@@ -18,7 +18,7 @@ use windows::core::{PCWSTR, w};
 use crate::config;
 use crate::fuzzy;
 use crate::icon;
-use crate::plugin::{Action, ActionResult, Icon, Plugin, ResultItem, ShellCommand};
+use crate::plugin::{Action, ActionResult, FormField, Icon, Plugin, ResultItem, ShellCommand};
 
 pub const ID: &str = "commands";
 
@@ -75,6 +75,11 @@ fn all() -> Vec<Command> {
             "startup",
             "Apex: Toggle Start at Login",
             "startup autostart boot signin",
+        ),
+        Command::new(
+            "add_source",
+            "Apex: Add Source Folder",
+            "index scan portable tools directory",
         ),
         Command::new(
             "hidden",
@@ -139,6 +144,7 @@ impl Plugin for Commands {
             "tray" => ActionResult::Shell(ShellCommand::ToggleTray),
             "clear_history" => ActionResult::Shell(ShellCommand::ClearHistory),
             "hidden" => ActionResult::Shell(ShellCommand::ShowHidden),
+            "add_source" => source_form("Add Source Folder", ""),
             "config" => {
                 open_config(false);
                 ActionResult::Dismiss
@@ -166,6 +172,40 @@ impl Plugin for Commands {
 
     fn run_action(&mut self, _action_id: &str, item: &ResultItem) -> ActionResult {
         self.activate(item)
+    }
+
+    fn submit_form(
+        &mut self,
+        action_id: &str,
+        _item: &ResultItem,
+        fields: &[FormField],
+    ) -> ActionResult {
+        if action_id != "add_source" {
+            return ActionResult::Done;
+        }
+        let path = fields
+            .first()
+            .map(|f| config::sanitize_value(&f.value))
+            .unwrap_or_default();
+        // Reopen the form rather than writing a source that indexes nothing.
+        if path.is_empty() || !std::path::Path::new(&path).is_dir() {
+            return source_form("Folder not found", &path);
+        }
+        let mut sources = config::Config::load().list_values(config::SOURCES);
+        if !sources.iter().any(|s| s.eq_ignore_ascii_case(&path)) {
+            sources.push(path);
+            config::set_list_file(config::SOURCES, &sources);
+        }
+        // Reload so the new folder is indexed immediately.
+        ActionResult::Refresh
+    }
+}
+
+fn source_form(title: &str, value: &str) -> ActionResult {
+    ActionResult::RequestForm {
+        title: title.to_string(),
+        action_id: "add_source",
+        fields: vec![FormField::new("Folder (paste with Ctrl+V)", value)],
     }
 }
 
@@ -224,10 +264,14 @@ mod tests {
         }
     }
 
+    /// Payloads best-first. Mirrors what `App::refresh_results` does with a
+    /// plugin's output - without the sort, this would assert on the order
+    /// commands happen to be declared in rather than on ranking.
     fn find(q: &str) -> Vec<String> {
         let mut c = commands();
         let mut out = Vec::new();
         c.query(q, &mut out);
+        out.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.title.cmp(&b.title)));
         out.into_iter().map(|i| i.payload).collect()
     }
 

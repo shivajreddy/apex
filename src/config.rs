@@ -8,6 +8,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// Config section listing extra folders to index.
+pub const SOURCES: &str = "sources";
+
 // MOD_CONTROL / VK_ESCAPE as plain integers to keep this module POD.
 pub const DEFAULT_HOTKEY_MODS: u32 = 0x0002;
 pub const DEFAULT_HOTKEY_VK: u32 = 0x1B;
@@ -50,6 +53,20 @@ commands = true
 # asks for a value using the token's name, then substitutes it in.
 # Prefer 'single quotes' - they keep Windows paths like C:\tools\x.exe
 # literal, with no escaping.
+
+# Extra folders to index, alongside the Start menu. Scanned one level deep
+# for .exe, .lnk, .bat, .cmd and .ps1 - handy for portable apps. Add one
+# with "Apex: Add Source Folder", or by hand here, then reload.
+#
+#   [sources]
+#   1 = 'D:\PortableApps'
+
+# Entries removed from apex, as plugin/payload. Written by the "Hide from
+# Apex" action; review them with "Apex: Manage Hidden Entries". The keys are
+# just indices - a bare TOML key cannot hold a path or a {GUID}.
+#
+#   [hidden]
+#   1 = 'search/C:\Windows\system32\some-tool.exe'
 "#;
 
 pub struct Config {

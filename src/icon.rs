@@ -12,8 +12,8 @@ use windows::Win32::Graphics::Gdi::{
     GetObjectW, HBITMAP, ReleaseDC,
 };
 use windows::Win32::UI::Shell::{
-    IShellItem, IShellItemImageFactory, SHGSI_ICON, SHGSI_LARGEICON, SHGetStockIconInfo,
-    SHSTOCKICONID, SHSTOCKICONINFO, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
+    IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SHGSI_ICON, SHGSI_LARGEICON,
+    SHGetStockIconInfo, SHSTOCKICONID, SHSTOCKICONINFO, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -44,6 +44,15 @@ pub fn from_shell_item(item: &IShellItem) -> Option<Icon> {
         let icon = from_hbitmap(hbmp);
         let _ = DeleteObject(hbmp.into());
         icon
+    }
+}
+
+/// The shell's icon for a file on disk, used by indexed source folders.
+pub fn from_path(path: &str) -> Option<Icon> {
+    unsafe {
+        let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).ok()?;
+        from_shell_item(&item)
     }
 }
 
