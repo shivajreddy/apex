@@ -796,23 +796,6 @@ impl Renderer {
                         draw_text(rt, &item.subtitle, fmt_subtitle, &row, &b.dim);
                     }
                 }
-
-                // Empty state: a query that matched nothing. (An empty query
-                // shows the default list, so this only appears while typing.)
-                if results.is_empty() && !query.is_empty() {
-                    draw_text(
-                        rt,
-                        "No results",
-                        fmt_title,
-                        &D2D_RECT_F {
-                            left: PAD_X,
-                            top: list_top,
-                            right: width - PAD_X,
-                            bottom: list_top + view_h,
-                        },
-                        &b.dim,
-                    );
-                }
                 rt.PopAxisAlignedClip();
 
                 // Bottom bar with key hints.
