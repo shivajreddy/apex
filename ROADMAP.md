@@ -6,7 +6,7 @@
 
 Where Apex is, how it got here, and where it's going.
 
-**Status:** `v0.3.0` — pre-release, in active development.
+**Status:** `v0.4.0` — pre-release, in active development.
 **Working today:** global hotkey, app search with icons, frecency ranking,
 quicklinks, apex commands, tray icon, aliases.
 
@@ -181,7 +181,8 @@ of private memory; reading the index file adds none.
 
 | Version | Contents |
 |---|---|
-| `v0.3.0` (current) | Out-of-process app index, shared line editor, acrylic backdrop, summon animation. Completes v0.2 bar `run_as_admin`. |
+| `v0.4.0` (current) | Runs elevated so the hotkey works over admin windows; self-rendered acrylic backdrop; fixed window size; reliable summon (dedicated hook thread, guard window); alias-pill polish. |
+| `v0.3.0` | Out-of-process app index, shared line editor, acrylic backdrop, summon animation. |
 | `v0.2.2` | Hide entries, extra source folders, and management views for both. |
 | `v0.2.1` | Sectioned and scrolling result list, mouse support. |
 | `v0.2.0` | Frecency ranking, quicklinks, apex commands, tray icon, clipboard paste, alias pills, icon fallback. |

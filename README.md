@@ -12,10 +12,11 @@ Ultra-fast, ultra-lightweight launcher for Windows. Raycast, but native.
 
 ## Status
 
-`v0.3.0`, pre-release. Working today: global hotkey, fuzzy app search with
-icons (desktop + Store apps), frecency ranking, quicklinks, apex commands, a
-tray icon, aliases, an actions panel, and an acrylic backdrop. See
-[ROADMAP.md](ROADMAP.md) for what's shipped and what's next.
+`v0.4.0`, pre-release. Working today: global hotkey (runs elevated so it works
+over admin windows), fuzzy app search with icons (desktop + Store apps),
+frecency ranking, quicklinks, apex commands, a tray icon, aliases, an actions
+panel, and a self-rendered acrylic backdrop. See [ROADMAP.md](ROADMAP.md) for
+what's shipped and what's next.
 
 ## Install
 
