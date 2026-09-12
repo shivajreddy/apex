@@ -96,10 +96,6 @@ pub struct App {
     /// `[appearance] opacity` override for the tint strength over the blur,
     /// if the user set one; otherwise the palette's own value is used.
     pub tint: Option<f32>,
-    /// The frosted background for the current summon: a blurred snapshot of
-    /// what was behind the window, captured by the shell just before showing.
-    /// Rebuilt every summon; `None` paints solid.
-    pub backdrop: Option<crate::render::Backdrop>,
     /// When the current summon animation started, until it has finished.
     pub summon: Option<std::time::Instant>,
     /// DPI of the monitor the window was summoned on. Everything is laid
@@ -142,7 +138,6 @@ impl App {
             },
             dark: true,
             tint: config.float("appearance", "opacity"),
-            backdrop: None,
             summon: None,
             dpi: 96.0,
             query: TextField::default(),
@@ -173,7 +168,7 @@ impl App {
     /// Get the renderer, creating it if needed (first show or after hide).
     pub fn ensure_renderer(&mut self) -> Option<&mut Renderer> {
         if self.renderer.is_none() {
-            match Renderer::new(self.translucent, self.dark, self.tint) {
+            match Renderer::new(self.translucent, self.dark) {
                 Ok(r) => self.renderer = Some(r),
                 Err(e) => {
                     crate::dlog!("renderer creation failed: {e}");
@@ -625,6 +620,7 @@ impl App {
                 plugin: SHELL,
                 title: name,
                 badge: None,
+                category: String::new(),
                 subtitle: "Source folder".to_string(),
                 payload: path,
                 score: 0,
@@ -827,6 +823,7 @@ mod tests {
             plugin,
             title: "Tools".into(),
             badge: None,
+            category: String::new(),
             subtitle: "Source folder".into(),
             payload: r"D:\Tools".into(),
             score: 0,

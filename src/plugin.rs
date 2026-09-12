@@ -23,6 +23,11 @@ pub struct ResultItem {
     /// alias that reaches this item. Kept separate from `subtitle` so it can
     /// sit next to the name rather than in the right-hand type column.
     pub badge: Option<String>,
+    /// Dimmed label drawn right after the title (before the alias pill), the
+    /// group the item belongs to - e.g. "Apex" for a command. Empty when the
+    /// item has no meaningful category. Distinct from `subtitle`, the
+    /// right-hand type column.
+    pub category: String,
     pub subtitle: String,
     /// Plugin-specific payload (e.g. path of the shortcut to launch).
     pub payload: String,

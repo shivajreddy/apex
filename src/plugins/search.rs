@@ -272,6 +272,7 @@ fn make_item(e: &AppEntry, alias: Option<&str>, score: i32) -> ResultItem {
         plugin: ID,
         title: e.name.clone(),
         badge: alias.map(str::to_string),
+        category: String::new(),
         subtitle: "Application".to_string(),
         payload: e.app_id.clone(),
         score,

@@ -2,11 +2,11 @@
 //! render target is DPI-aware so drawing scales per-monitor automatically.
 //!
 //! The scene is drawn into a 32-bit DIB with real per-pixel alpha and handed
-//! to the window with `UpdateLayeredWindow`. That is what lets the desktop
-//! compositor blur whatever is behind the window (see `window::backdrop`):
-//! an `ID2D1HwndRenderTarget` presents opaquely and the system backdrop then
-//! only ever renders its solid fallback. The DIB route also creates no
-//! swap chain, so it is cheaper than the hwnd target it replaced.
+//! to the window with `UpdateLayeredWindow`. When translucent, the window
+//! pixels are left clear where the background would be, so the live DWM
+//! acrylic set on the HWND (see `window::set_acrylic`) blurs whatever is
+//! behind the window in real time. The DIB route creates no swap chain, so
+//! it is cheaper than an hwnd target.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,9 +34,15 @@ const ICON_SIZE: f32 = 26.0;
 const ICON_GAP: f32 = 12.0;
 const BAR_H: f32 = 34.0;
 pub const HEADER_H: f32 = 26.0;
-// Alias pill drawn immediately after a result's title.
-const BADGE_H: f32 = 19.0;
-const BADGE_PAD_X: f32 = 7.0;
+// Gap between the title and the dimmed category that follows it.
+const CATEGORY_GAP: f32 = 8.0;
+// Alpha of the otherwise-invisible background fill under the live acrylic:
+// enough that the layered window catches mouse events (a 0-alpha pixel is
+// click-through), far too little to dim the blur. 2/255 survives rounding.
+const HIT_TEST_ALPHA: f32 = 2.0 / 255.0;
+// Alias pill drawn immediately after a result's title (and category).
+const BADGE_H: f32 = 20.0;
+const BADGE_PAD_X: f32 = 8.0;
 const BADGE_GAP: f32 = 9.0;
 /// Downward nudge for alias-pill text so it sits at its optical centre.
 const BADGE_TEXT_DY: f32 = 1.5;
@@ -62,9 +68,8 @@ const FORM_LABEL_H: f32 = 18.0;
 /// Rows the list viewport is tall enough to show at once. The window is a
 /// fixed size (see [`content_height`]): the list always occupies this many
 /// rows' worth of space, scrolling when there are more and leaving the lower
-/// part empty when there are fewer. Keeping the window one size means the
-/// captured backdrop is never stretched to a different shape, and the window
-/// never jumps around as results come and go.
+/// part empty when there are fewer, so the window never jumps around as
+/// results come and go.
 pub const MAX_VISIBLE_ROWS: usize = 8;
 
 /// The fixed height of the list viewport - always this, regardless of how
@@ -93,8 +98,7 @@ pub fn row_offset(sections: &[(usize, &'static str)], index: usize) -> f32 {
 
 /// The window's content height. Fixed: input, separator, the full list
 /// viewport, and the bottom bar - the same whether the list is full, has one
-/// row, or is empty. A fixed window keeps the frosted backdrop from being
-/// stretched out of shape and stops the window resizing as you type.
+/// row, or is empty. A fixed window stops the window resizing as you type.
 pub fn content_height(_rows: usize, _headers: usize) -> f32 {
     INPUT_H + 1.0 + LIST_VIEWPORT_H + BAR_H
 }
@@ -122,23 +126,6 @@ pub struct Frame<'a> {
     /// How far the list is scrolled, in DIPs.
     pub scroll: f32,
     pub panel: Option<PanelView<'a>>,
-    /// A pre-blurred snapshot of whatever was behind the window when it was
-    /// summoned, drawn as the frosted background under the tint. `None` paints
-    /// the window solid. See [`Backdrop`].
-    pub backdrop: Option<&'a Backdrop>,
-}
-
-/// The acrylic background, rendered by apex itself rather than the compositor:
-/// a small, blurred, opaque snapshot of the desktop behind the window at the
-/// moment it was summoned. Baked straight into the window bitmap, so the
-/// frost is there on the very first frame and never depends on DWM keeping a
-/// live backdrop alive. Device-independent BGRA (alpha forced opaque), stored
-/// small - it is stretched up with bilinear filtering, which is itself part
-/// of the blur.
-pub struct Backdrop {
-    pub width: u32,
-    pub height: u32,
-    pub bgra: Vec<u8>,
 }
 
 /// Overlay state (actions panel or text input), anchored bottom-right.
@@ -188,9 +175,10 @@ const fn rgba(rgb: u32, a: f32) -> D2D1_COLOR_F {
 /// The colours of one appearance. Two exist, following Windows' light/dark
 /// setting for apps; `[appearance] theme` pins either.
 pub struct Palette {
-    /// Window tint. Over the acrylic backdrop this much of the window is
-    /// this colour and the blurred desktop shows through the rest; without
-    /// a backdrop it is drawn fully opaque.
+    /// Solid window background, used only when the backdrop is "none". With
+    /// acrylic the compositor paints the tint (see `window::acrylic_color`)
+    /// and the window pixels here are left clear, so only the RGB matters -
+    /// the fill forces full alpha.
     background: D2D1_COLOR_F,
     text: D2D1_COLOR_F,
     dim: D2D1_COLOR_F,
@@ -211,10 +199,9 @@ pub struct Palette {
     scrollbar: D2D1_COLOR_F,
 }
 
-// The tint is deliberately translucent (alpha well below 1) so the acrylic
-// blur behind it stays visible; the compositor supplies a solid colour
-// instead when transparency effects are off, and the window still looks
-// right. Over a dark background a blurred dark desktop is just dark, so the
+// `background` is the solid fill for backdrop = "none"; its alpha is ignored
+// (the fill forces full opacity). With acrylic the compositor paints the tint
+// behind the clear window, so over a dark desktop the blur is just dark - the
 // rim below is what keeps it reading as glass rather than a solid slab.
 const DARK: Palette = Palette {
     background: rgba(0x121216, 0.50),
@@ -255,9 +242,12 @@ pub struct Renderer {
     fmt_badge: IDWriteTextFormat,
     fmt_header: IDWriteTextFormat,
     palette: &'static Palette,
-    /// The palette's background: translucent over a backdrop, opaque
-    /// without one.
+    /// The palette's background, used only for the solid (non-acrylic) fill.
     background: D2D1_COLOR_F,
+    /// Whether the compositor is providing a live acrylic blur behind the
+    /// window. When true the window background is left transparent so the
+    /// blur shows; when false it is filled solid.
+    translucent: bool,
     target: Option<Target>,
 }
 
@@ -284,9 +274,7 @@ struct Brushes {
     selection: ID2D1SolidColorBrush,
     border: ID2D1SolidColorBrush,
     scrollbar: ID2D1SolidColorBrush,
-    /// Tint drawn over the blurred backdrop (translucent), and the whole
-    /// window fill when there is no backdrop (opaque).
-    bg_tint: ID2D1SolidColorBrush,
+    /// The opaque window fill, used only when acrylic is off.
     bg_solid: ID2D1SolidColorBrush,
 }
 
@@ -345,11 +333,10 @@ impl Drop for Dib {
 }
 
 impl Renderer {
-    /// `translucent` selects the tinted background that lets a backdrop
-    /// show through; without one the window is painted solid. `dark` picks
-    /// the palette. `tint`, if set, overrides the palette's background alpha
-    /// (the `[appearance] opacity` config), 0 clear to 1 solid.
-    pub fn new(translucent: bool, dark: bool, tint: Option<f32>) -> Result<Self> {
+    /// `translucent` leaves the window background transparent so the
+    /// compositor's acrylic blur shows; without it the window is painted
+    /// solid. `dark` picks the palette.
+    pub fn new(translucent: bool, dark: bool) -> Result<Self> {
         unsafe {
             let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
@@ -389,13 +376,6 @@ impl Renderer {
             fmt_header.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
 
             let palette = if dark { &DARK } else { &LIGHT };
-            let alpha = tint
-                .map(|t| t.clamp(0.0, 1.0))
-                .unwrap_or(palette.background.a);
-            let background = D2D1_COLOR_F {
-                a: if translucent { alpha } else { 1.0 },
-                ..palette.background
-            };
             Ok(Self {
                 d2d,
                 dwrite,
@@ -407,7 +387,8 @@ impl Renderer {
                 fmt_badge,
                 fmt_header,
                 palette,
-                background,
+                background: palette.background,
+                translucent,
                 target: None,
             })
         }
@@ -471,7 +452,6 @@ impl Renderer {
                     selection: brush(&p.selection)?,
                     border: brush(&p.border)?,
                     scrollbar: brush(&p.scrollbar)?,
-                    bg_tint: brush(&bg)?,
                     bg_solid: brush(&D2D1_COLOR_F { a: 1.0, ..bg })?,
                 },
                 icons: HashMap::new(),
@@ -583,9 +563,9 @@ impl Renderer {
             sections,
             scroll,
             panel,
-            backdrop,
         } = frame;
         let (query, caret_visible, selected, scroll) = (*query, *caret_visible, *selected, *scroll);
+        let translucent = self.translucent;
         let Self {
             dwrite,
             fmt_input,
@@ -621,7 +601,6 @@ impl Renderer {
                 &b.selection,
                 &b.border,
                 &b.scrollbar,
-                &b.bg_tint,
                 &b.bg_solid,
             ] {
                 brush.SetOpacity(opacity);
@@ -637,27 +616,21 @@ impl Renderer {
             };
 
             rt.BeginDraw();
-            // Start fully transparent so the corners DWM rounds away stay
-            // clear, then lay down the background: the pre-blurred snapshot
-            // stretched to fill the window (the upscale is part of the blur),
-            // with the tint over it - or a solid fill when there is no
-            // backdrop. This is the whole "acrylic": no compositor effect,
-            // just pixels we drew.
             rt.Clear(None);
-            match backdrop {
-                Some(bd) => {
-                    if let Some(bmp) = backdrop_bitmap(rt, bd) {
-                        rt.DrawBitmap(
-                            &bmp,
-                            Some(&full),
-                            opacity,
-                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                            None,
-                        );
-                    }
-                    rt.FillRectangle(&full, &b.bg_tint);
-                }
-                None => rt.FillRectangle(&full, &b.bg_solid),
+            if translucent {
+                // The live compositor acrylic (set on the HWND via
+                // SetWindowCompositionAttribute) shows through the window, so
+                // we do not paint a background over it. But a layered window
+                // passes mouse messages through any pixel whose alpha is 0 -
+                // a fully clear background would send the wheel and clicks to
+                // whatever is behind apex. So lay down an all-but-invisible
+                // fill (alpha ~1/255): the blur still reads through it, but
+                // every pixel is now opaque enough to catch the mouse.
+                b.bg_solid.SetOpacity(HIT_TEST_ALPHA);
+                rt.FillRectangle(&full, &b.bg_solid);
+                b.bg_solid.SetOpacity(1.0);
+            } else {
+                rt.FillRectangle(&full, &b.bg_solid);
             }
 
             // Search input (query text or placeholder).
@@ -778,11 +751,28 @@ impl Renderer {
                     };
                     draw_text(rt, &item.title, fmt_title, &title_rect, &b.text);
 
-                    // Alias pill, immediately after the title.
+                    // Walk a cursor along the row: title, then the dimmed
+                    // category, then the alias pill - the Raycast order.
+                    let mut cursor =
+                        title_rect.left + measure(dwrite, fmt_title, &item.title);
+
+                    // Category, in the same face as the title but dimmed.
+                    if !item.category.is_empty() {
+                        cursor += CATEGORY_GAP;
+                        let cat_rect = D2D_RECT_F {
+                            left: cursor,
+                            top: y,
+                            right: width - PAD_X,
+                            bottom: y + ROW_H,
+                        };
+                        draw_text(rt, &item.category, fmt_title, &cat_rect, &b.dim);
+                        cursor += measure(dwrite, fmt_title, &item.category);
+                    }
+
+                    // Alias pill, after the title (and category).
                     if let Some(badge) = &item.badge {
-                        let title_w = measure(dwrite, fmt_title, &item.title);
                         let badge_w = measure(dwrite, fmt_badge, badge);
-                        let left = title_rect.left + title_w + BADGE_GAP;
+                        let left = cursor + BADGE_GAP;
                         let pill = D2D_RECT_F {
                             left,
                             top: y + (ROW_H - BADGE_H) / 2.0,
@@ -792,8 +782,8 @@ impl Renderer {
                         rt.FillRoundedRectangle(
                             &D2D1_ROUNDED_RECT {
                                 rect: pill,
-                                radiusX: 5.0,
-                                radiusY: 5.0,
+                                radiusX: 6.0,
+                                radiusY: 6.0,
                             },
                             &b.badge_bg,
                         );
@@ -1133,32 +1123,6 @@ unsafe fn draw_field(
             );
         }
         rt.PopAxisAlignedClip();
-    }
-}
-
-/// Turn the blurred snapshot into a device bitmap. Made fresh each frame -
-/// it is tiny and changes every summon, so caching would cost more than it
-/// saves.
-unsafe fn backdrop_bitmap(rt: &ID2D1RenderTarget, bd: &Backdrop) -> Option<ID2D1Bitmap> {
-    unsafe {
-        let props = D2D1_BITMAP_PROPERTIES {
-            pixelFormat: D2D1_PIXEL_FORMAT {
-                format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-            },
-            dpiX: 96.0,
-            dpiY: 96.0,
-        };
-        rt.CreateBitmap(
-            D2D_SIZE_U {
-                width: bd.width,
-                height: bd.height,
-            },
-            Some(bd.bgra.as_ptr() as *const core::ffi::c_void),
-            bd.width * 4,
-            &props,
-        )
-        .ok()
     }
 }
 

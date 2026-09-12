@@ -25,7 +25,7 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::System::SystemInformation::GetTickCount64;
@@ -179,10 +179,9 @@ pub fn run(config: &crate::config::Config) -> Result<()> {
             &corner as *const _ as *const core::ffi::c_void,
             size_of_val(&corner) as u32,
         );
-        // Acrylic is rendered by apex itself now (a blurred snapshot baked
-        // into the window bitmap on each summon - see `capture_behind` and
-        // `render`), not by the compositor, so there is no DWM backdrop to
-        // set here. This flag just says whether to capture that snapshot.
+        // Acrylic is the compositor's live blur (see `set_acrylic`), applied
+        // per-show. This flag just says whether to ask for it, and the
+        // renderer leaves the background transparent so the blur shows.
         let translucent = config.acrylic();
         ACRYLIC.store(translucent, Relaxed);
 
@@ -265,155 +264,72 @@ fn spawn_hook_thread() -> std::thread::JoinHandle<()> {
     })
 }
 
-/// Grab a blurred snapshot of the desktop behind where the window is about
-/// to appear, to bake in as the acrylic background. Called while the window
-/// is positioned but still hidden, so the screen there shows what is behind
-/// it. `x, y, w, h` are physical pixels.
-///
-/// This is the whole point of the rewrite: rather than asking DWM for a live
-/// backdrop (which lagged, dropped to solid on re-show, and sometimes never
-/// appeared), apex renders the frost itself from a captured bitmap. The
-/// capture is downscaled hard and box-blurred; the renderer stretches it
-/// back up with bilinear filtering, which finishes the blur.
-unsafe fn capture_behind(x: i32, y: i32, w: i32, h: i32) -> Option<render::Backdrop> {
-    if w <= 0 || h <= 0 {
-        return None;
-    }
+// --- Live acrylic backdrop -------------------------------------------------
+//
+// The backdrop is the compositor's, not ours: SetWindowCompositionAttribute
+// with ACCENT_ENABLE_ACRYLICBLURBEHIND asks DWM to blur whatever is behind the
+// window, live - a video, another window, a workspace switch all update in
+// real time, which a captured snapshot cannot. Same accent policy Windows
+// Terminal and Flow Launcher use; unlike DWMWA_SYSTEMBACKDROP_TYPE it composes
+// under our layered window. The entry point is an undocumented user32 export,
+// resolved by name.
+
+#[repr(C)]
+struct AccentPolicy {
+    state: u32,
+    flags: u32,
+    /// AABBGGRR: the tint painted over the blur.
+    gradient_color: u32,
+    animation_id: u32,
+}
+
+#[repr(C)]
+struct CompositionAttribData {
+    attrib: u32,
+    data: *mut core::ffi::c_void,
+    size: usize,
+}
+
+const ACCENT_ENABLE_ACRYLICBLURBEHIND: u32 = 4;
+const WCA_ACCENT_POLICY: u32 = 19;
+
+/// The tint painted over the live blur, `AABBGGRR`, from the palette colour
+/// and the `[appearance] opacity` config.
+fn acrylic_color(dark: bool, tint: Option<f32>) -> u32 {
+    let (r, g, b): (u32, u32, u32) = if dark {
+        (0x12, 0x12, 0x16)
+    } else {
+        (0xF6, 0xF6, 0xF8)
+    };
+    let a = (tint.unwrap_or(0.5).clamp(0.0, 1.0) * 255.0) as u32;
+    (a << 24) | (b << 16) | (g << 8) | r
+}
+
+/// Turn on the compositor's acrylic blur behind the window, tinted with
+/// `color`. Returns whether the entry point was found and the call succeeded.
+/// Applied on each show so it survives a hide/re-show.
+unsafe fn set_acrylic(hwnd: HWND, color: u32) -> bool {
     unsafe {
-        let screen = GetDC(None);
-        if screen.is_invalid() {
-            return None;
-        }
-        let mem = CreateCompatibleDC(Some(screen));
-        let info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: w,
-                biHeight: -h, // top-down
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
+        type SetAttr = unsafe extern "system" fn(HWND, *mut CompositionAttribData) -> BOOL;
+        let Ok(user32) = GetModuleHandleW(w!("user32.dll")) else {
+            return false;
         };
-        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-        let dib = CreateDIBSection(Some(screen), &info, DIB_RGB_COLORS, &mut bits, None, 0);
-        let backdrop = (|| {
-            let dib = dib.ok()?;
-            let prev = SelectObject(mem, dib.into());
-            let ok = BitBlt(mem, 0, 0, w, h, Some(screen), x, y, SRCCOPY).is_ok();
-            let _ = GdiFlush();
-            let result = if ok && !bits.is_null() {
-                let raw = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize);
-                Some(downscale_blur(raw, w as u32, h as u32))
-            } else {
-                None
-            };
-            SelectObject(mem, prev);
-            let _ = DeleteObject(dib.into());
-            result
-        })();
-        let _ = DeleteDC(mem);
-        ReleaseDC(None, screen);
-        backdrop
-    }
-}
-
-/// Longest side of the downscaled snapshot. Small on purpose: heavy
-/// downscaling is most of the blur, and the renderer's bilinear upscale
-/// smooths what is left. ~84px erases even sharp edges into a soft frost at
-/// any window size while staying a sub-millisecond amount of pixels to blur.
-const BLUR_SIZE: u32 = 84;
-
-/// Box-average `raw` (top-down BGRA, `w`x`h`) down to at most [`BLUR_SIZE`] on
-/// its longest side, force it opaque, then box-blur it a couple of times.
-fn downscale_blur(raw: &[u8], w: u32, h: u32) -> render::Backdrop {
-    let scale = (w.max(h) as f32 / BLUR_SIZE as f32).max(1.0);
-    let sw = ((w as f32 / scale) as u32).max(1);
-    let sh = ((h as f32 / scale) as u32).max(1);
-    let mut small = vec![0u8; (sw * sh * 4) as usize];
-    for ty in 0..sh {
-        // Source block for this row.
-        let y0 = (ty * h / sh) as usize;
-        let y1 = (((ty + 1) * h / sh).max(y0 as u32 + 1)).min(h) as usize;
-        for tx in 0..sw {
-            let x0 = (tx * w / sw) as usize;
-            let x1 = (((tx + 1) * w / sw).max(x0 as u32 + 1)).min(w) as usize;
-            let (mut b, mut g, mut r, mut n) = (0u32, 0u32, 0u32, 0u32);
-            for sy in y0..y1 {
-                let row = sy * w as usize * 4;
-                for sx in x0..x1 {
-                    let i = row + sx * 4;
-                    b += raw[i] as u32;
-                    g += raw[i + 1] as u32;
-                    r += raw[i + 2] as u32;
-                    n += 1;
-                }
-            }
-            let n = n.max(1);
-            let o = ((ty * sw + tx) * 4) as usize;
-            small[o] = (b / n) as u8;
-            small[o + 1] = (g / n) as u8;
-            small[o + 2] = (r / n) as u8;
-            small[o + 3] = 255;
-        }
-    }
-    for _ in 0..3 {
-        box_blur(&mut small, sw, sh, 2);
-    }
-    render::Backdrop {
-        width: sw,
-        height: sh,
-        bgra: small,
-    }
-}
-
-/// One separable box-blur pass over BGRA pixels, radius `r`, alpha left as-is.
-fn box_blur(px: &mut [u8], w: u32, h: u32, r: i32) {
-    let (w, h) = (w as i32, h as i32);
-    let mut tmp = px.to_vec();
-    // Horizontal.
-    for y in 0..h {
-        for x in 0..w {
-            let (mut b, mut g, mut rr, mut n) = (0u32, 0u32, 0u32, 0u32);
-            for dx in -r..=r {
-                let xx = x + dx;
-                if xx >= 0 && xx < w {
-                    let i = ((y * w + xx) * 4) as usize;
-                    b += px[i] as u32;
-                    g += px[i + 1] as u32;
-                    rr += px[i + 2] as u32;
-                    n += 1;
-                }
-            }
-            let n = n.max(1);
-            let o = ((y * w + x) * 4) as usize;
-            tmp[o] = (b / n) as u8;
-            tmp[o + 1] = (g / n) as u8;
-            tmp[o + 2] = (rr / n) as u8;
-        }
-    }
-    // Vertical.
-    for y in 0..h {
-        for x in 0..w {
-            let (mut b, mut g, mut rr, mut n) = (0u32, 0u32, 0u32, 0u32);
-            for dy in -r..=r {
-                let yy = y + dy;
-                if yy >= 0 && yy < h {
-                    let i = ((yy * w + x) * 4) as usize;
-                    b += tmp[i] as u32;
-                    g += tmp[i + 1] as u32;
-                    rr += tmp[i + 2] as u32;
-                    n += 1;
-                }
-            }
-            let n = n.max(1);
-            let o = ((y * w + x) * 4) as usize;
-            px[o] = (b / n) as u8;
-            px[o + 1] = (g / n) as u8;
-            px[o + 2] = (rr / n) as u8;
-        }
+        let Some(proc) = GetProcAddress(user32, s!("SetWindowCompositionAttribute")) else {
+            return false;
+        };
+        let set_attr: SetAttr = std::mem::transmute(proc);
+        let mut accent = AccentPolicy {
+            state: ACCENT_ENABLE_ACRYLICBLURBEHIND,
+            flags: 0,
+            gradient_color: color,
+            animation_id: 0,
+        };
+        let mut data = CompositionAttribData {
+            attrib: WCA_ACCENT_POLICY,
+            data: &mut accent as *mut _ as *mut core::ffi::c_void,
+            size: size_of::<AccentPolicy>(),
+        };
+        set_attr(hwnd, &mut data).as_bool()
     }
 }
 
@@ -625,7 +541,6 @@ unsafe fn repaint(hwnd: HWND) {
             sections: &app.sections,
             scroll: app.scroll,
             panel,
-            backdrop: app.backdrop.as_ref(),
         };
         if let Some(r) = app.renderer.as_mut() {
             r.present(hwnd, &frame, &place);
@@ -1313,14 +1228,13 @@ unsafe fn show(hwnd: HWND) {
         // Place while still hidden, paint the first frame into the layered
         // surface, and only then show: the window never appears blank.
         let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE);
-        // With the window positioned but not yet visible, the screen where it
-        // will land still shows what's behind it: capture and blur that now,
-        // so the very first painted frame already carries the frost.
-        if ACRYLIC.load(Relaxed) {
-            let bd = capture_behind(x, y, w, h);
-            if let Some(app) = app_mut(hwnd) {
-                app.backdrop = bd;
-            }
+        // Ask the compositor to blur behind the window, tinted per the current
+        // theme. Re-applied each show because the accent policy does not
+        // always survive a hide/re-show.
+        if ACRYLIC.load(Relaxed)
+            && let Some((dark, tint)) = app_mut(hwnd).map(|a| (a.dark, a.tint))
+        {
+            set_acrylic(hwnd, acrylic_color(dark, tint));
         }
         VISIBLE.store(true, Relaxed);
         repaint(hwnd);
@@ -1469,8 +1383,6 @@ unsafe fn hide(hwnd: HWND) {
             // Drop the whole renderer (factories included) so the process
             // returns to baseline memory while hidden.
             app.renderer = None;
-            // Discard the captured backdrop; the next summon grabs a fresh one.
-            app.backdrop = None;
         }
         BUSY.store(false, Relaxed);
     }

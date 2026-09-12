@@ -12,10 +12,10 @@ Ultra-fast, ultra-lightweight launcher for Windows. Raycast, but native.
 
 ## Status
 
-`v0.4.0`, pre-release. Working today: global hotkey (runs elevated so it works
+`v0.5.0`, pre-release. Working today: global hotkey (runs elevated so it works
 over admin windows), fuzzy app search with icons (desktop + Store apps),
 frecency ranking, quicklinks, apex commands, a tray icon, aliases, an actions
-panel, and a self-rendered acrylic backdrop. See [ROADMAP.md](ROADMAP.md) for
+panel, and a live acrylic backdrop. See [ROADMAP.md](ROADMAP.md) for
 what's shipped and what's next.
 
 ## Install
@@ -205,11 +205,11 @@ quicklinks = true
 commands = true
 ```
 
-The frosted background is rendered by apex itself — it captures and blurs
-the screen behind the window on each summon — so it works on any Windows
-version and does not depend on the system "Transparency effects" setting.
-The blur is a snapshot from the moment you summon, not a live effect. Use
-`opacity` to set how much of it shows through the tint.
+The frosted background is the desktop compositor's live acrylic blur, asked
+for on the window itself (`SetWindowCompositionAttribute` with
+`ACCENT_ENABLE_ACRYLICBLURBEHIND`). It updates in real time — a video, a
+window change or a workspace switch behind apex all blur through live, not a
+frozen snapshot. Use `opacity` to set how much of it shows through the tint.
 
 Apex only ever rewrites the sections it owns - `[aliases]`, `[quicklinks.*]`,
 `[sources]`, `[hidden]`, and single `[general]` keys - by line surgery. Every

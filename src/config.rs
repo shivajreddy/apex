@@ -29,8 +29,8 @@ start_on_startup = true
 tray_icon = true
 
 [appearance]
-# "acrylic" blurs whatever is behind the window (Windows 11 22H2 or later;
-# older systems and "Transparency effects" off fall back to a solid tint).
+# "acrylic" asks the compositor to blur whatever is behind the window, live
+# ("Transparency effects" off falls back to a plain tint, no blur).
 # "none" paints the window solid.
 backdrop = "acrylic"
 # "system" follows Windows' light/dark setting for apps; "dark" or "light"

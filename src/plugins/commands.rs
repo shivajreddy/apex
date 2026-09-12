@@ -130,8 +130,12 @@ impl Plugin for Commands {
             if let Some(score) = c.score(&query) {
                 out.push(ResultItem {
                     plugin: ID,
-                    title: c.label.to_string(),
+                    // Titles read "Apex: Reload"; show "Reload" with "Apex" as
+                    // the category, the way Raycast lists an extension's
+                    // commands. Search still matches the full label.
+                    title: c.label.strip_prefix("Apex: ").unwrap_or(c.label).to_string(),
                     badge: None,
+                    category: "Apex".to_string(),
                     subtitle: "Command".to_string(),
                     payload: c.id.to_string(),
                     score,
@@ -345,6 +349,7 @@ mod tests {
             plugin: ID,
             title: String::new(),
             badge: None,
+            category: String::new(),
             subtitle: String::new(),
             payload: id.to_string(),
             score: 0,
