@@ -46,6 +46,11 @@ const PANEL_PAD: f32 = 6.0;
 const PANEL_MARGIN: f32 = 8.0;
 /// Width of the text caret.
 const CARET_W: f32 = 2.0;
+// Scrollbar: a thin rounded thumb on the right edge of the list.
+const SCROLLBAR_W: f32 = 4.0;
+const SCROLLBAR_MARGIN: f32 = 4.0;
+const SCROLLBAR_PAD: f32 = 4.0;
+const SCROLLBAR_MIN_THUMB: f32 = 28.0;
 
 // Forms stack a dim label over an editable value, so they need more width
 // than the actions panel - links in particular are long.
@@ -202,6 +207,8 @@ pub struct Palette {
     /// reads as frosted even over a dark backdrop, where the blur alone is
     /// invisible.
     border: D2D1_COLOR_F,
+    /// The scrollbar thumb.
+    scrollbar: D2D1_COLOR_F,
 }
 
 // The tint is deliberately translucent (alpha well below 1) so the acrylic
@@ -220,6 +227,7 @@ const DARK: Palette = Palette {
     badge_fg: rgba(0xF4F4F6, 0.65),
     selection: rgba(0x4C8DFF, 0.45),
     border: rgba(0xFFFFFF, 0.12),
+    scrollbar: rgba(0xFFFFFF, 0.28),
 };
 
 const LIGHT: Palette = Palette {
@@ -233,6 +241,7 @@ const LIGHT: Palette = Palette {
     badge_fg: rgba(0x1B1B1F, 0.70),
     selection: rgba(0x3B82F6, 0.35),
     border: rgba(0x000000, 0.14),
+    scrollbar: rgba(0x000000, 0.30),
 };
 
 pub struct Renderer {
@@ -274,6 +283,7 @@ struct Brushes {
     badge_fg: ID2D1SolidColorBrush,
     selection: ID2D1SolidColorBrush,
     border: ID2D1SolidColorBrush,
+    scrollbar: ID2D1SolidColorBrush,
     /// Tint drawn over the blurred backdrop (translucent), and the whole
     /// window fill when there is no backdrop (opaque).
     bg_tint: ID2D1SolidColorBrush,
@@ -460,6 +470,7 @@ impl Renderer {
                     badge_fg: brush(&p.badge_fg)?,
                     selection: brush(&p.selection)?,
                     border: brush(&p.border)?,
+                    scrollbar: brush(&p.scrollbar)?,
                     bg_tint: brush(&bg)?,
                     bg_solid: brush(&D2D1_COLOR_F { a: 1.0, ..bg })?,
                 },
@@ -609,6 +620,7 @@ impl Renderer {
                 &b.badge_fg,
                 &b.selection,
                 &b.border,
+                &b.scrollbar,
                 &b.bg_tint,
                 &b.bg_solid,
             ] {
@@ -808,6 +820,34 @@ impl Renderer {
                     }
                 }
                 rt.PopAxisAlignedClip();
+
+                // Scrollbar, when the list is taller than the viewport. A
+                // thin rounded thumb on the right edge, sized and positioned
+                // by how far through the content the scroll is - Raycast-style.
+                let content_h = list_content_height(results.len(), sections.len());
+                if content_h > view_h {
+                    let track_top = list_top + SCROLLBAR_PAD;
+                    let track_h = view_h - SCROLLBAR_PAD * 2.0;
+                    let thumb_h = (view_h / content_h * track_h).max(SCROLLBAR_MIN_THUMB);
+                    let travel = (track_h - thumb_h).max(0.0);
+                    let progress = (scroll / (content_h - view_h)).clamp(0.0, 1.0);
+                    let thumb_top = track_top + travel * progress;
+                    let x1 = width - SCROLLBAR_MARGIN;
+                    let x0 = x1 - SCROLLBAR_W;
+                    rt.FillRoundedRectangle(
+                        &D2D1_ROUNDED_RECT {
+                            rect: D2D_RECT_F {
+                                left: x0,
+                                top: thumb_top,
+                                right: x1,
+                                bottom: thumb_top + thumb_h,
+                            },
+                            radiusX: SCROLLBAR_W / 2.0,
+                            radiusY: SCROLLBAR_W / 2.0,
+                        },
+                        &b.scrollbar,
+                    );
+                }
 
                 // Bottom bar with key hints.
                 let hint = match panel {

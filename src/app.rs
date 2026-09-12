@@ -469,14 +469,16 @@ impl App {
         self.selected = keep.min(self.results.len().saturating_sub(1));
     }
 
-    /// Move selection by `delta`, wrapping around, scrolling to follow.
+    /// Move selection by `delta`, clamped to the ends (no wrap-around), and
+    /// scroll to keep it visible - Up on the first row stays put, Down on the
+    /// last stays put, the way Raycast behaves.
     pub fn move_selection(&mut self, delta: i32) {
         if self.results.is_empty() {
             self.selected = 0;
             return;
         }
-        let len = self.results.len() as i32;
-        self.selected = (self.selected as i32 + delta).rem_euclid(len) as usize;
+        let last = self.results.len() as i32 - 1;
+        self.selected = (self.selected as i32 + delta).clamp(0, last) as usize;
         self.ensure_visible();
     }
 
@@ -871,5 +873,25 @@ mod tests {
     fn no_results_means_no_panel() {
         let mut a = app();
         assert!(!a.open_actions());
+    }
+
+    #[test]
+    fn arrow_selection_clamps_and_does_not_wrap() {
+        let mut a = app();
+        for _ in 0..3 {
+            a.results.push(row(SHELL));
+        }
+        // Up at the first row stays on the first row (no wrap to the last).
+        a.selected = 0;
+        a.move_selection(-1);
+        assert_eq!(a.selected, 0);
+        // Down past the last row stays on the last row.
+        a.selected = 2;
+        a.move_selection(1);
+        assert_eq!(a.selected, 2);
+        // Normal moves still work.
+        a.selected = 0;
+        a.move_selection(1);
+        assert_eq!(a.selected, 1);
     }
 }

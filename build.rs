@@ -25,7 +25,12 @@ fn main() {
         res.set_icon("assets/apex.ico");
         res.set("ProductName", "Apex");
         res.set("FileDescription", "Apex - ultra-fast launcher");
-        res.set_manifest(MANIFEST);
+        // APEX_NO_MANIFEST builds a non-elevated exe for local UI testing
+        // (the medium-integrity test harness can't accept a UAC prompt).
+        println!("cargo:rerun-if-env-changed=APEX_NO_MANIFEST");
+        if std::env::var_os("APEX_NO_MANIFEST").is_none() {
+            res.set_manifest(MANIFEST);
+        }
         res.compile().expect("failed to embed Windows resources");
     }
 }
