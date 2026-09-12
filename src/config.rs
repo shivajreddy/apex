@@ -21,7 +21,9 @@ const DEFAULT_FILE: &str = r#"# Apex configuration
 [general]
 # Create/refresh a Start menu entry for apex on launch.
 start_menu = true
-# Launch apex automatically at sign-in.
+# Start apex at sign-in. Apex runs elevated (so the hotkey works over admin
+# windows like Task Manager), so this uses a scheduled logon task with
+# highest privileges - it starts apex elevated with no UAC prompt at sign-in.
 start_on_startup = true
 # Show a tray icon (right-click for Open / Reload / Config / Quit).
 tray_icon = true

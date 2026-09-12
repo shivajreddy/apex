@@ -323,30 +323,17 @@ fn reveal(app_id: &str) -> bool {
     }
 }
 
-/// Launch an entry via the shell. Returns true on success.
+/// Launch an entry. Returns true on success.
 ///
 /// Source-folder entries carry a real path and are run directly; AppsFolder
 /// ids are not paths and have to go through the `shell:AppsFolder` verb.
+/// Goes through [`crate::launch::open`], which hands the target to Explorer
+/// so it runs unelevated even though apex is elevated.
 fn launch(app_id: &str) -> bool {
     let target = if std::path::Path::new(app_id).exists() {
         app_id.to_string()
     } else {
         format!("shell:AppsFolder\\{app_id}")
     };
-    let wide: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe {
-        let inst = ShellExecuteW(
-            None,
-            w!("open"),
-            PCWSTR(wide.as_ptr()),
-            None,
-            None,
-            SW_SHOWNORMAL,
-        );
-        let ok = inst.0 as isize > 32;
-        if !ok {
-            crate::dlog!("search: failed to launch {target}");
-        }
-        ok
-    }
+    crate::launch::open(&target, None)
 }

@@ -2,18 +2,20 @@
 //!
 //! Ensured on every launch (idempotent, ~1ms):
 //! - `start_menu`: Start menu shortcut so apex is searchable/pinnable.
-//! - `start_on_startup`: HKCU Run registry value so apex starts at sign-in.
+//! - `start_on_startup`: an elevated logon task so apex starts at sign-in.
 //!
-//! Disabling a flag removes the corresponding registration.
+//! Apex requires administrator (its manifest), so start-at-login cannot use
+//! the `HKCU` `Run` key - Windows will not launch an elevation-required exe
+//! from it. Instead a scheduled task with highest privileges, triggered at
+//! logon, starts apex elevated with no UAC prompt at sign-in. Because apex is
+//! already elevated when this runs, creating the task needs no prompt either.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IPersistFile};
-use windows::Win32::System::Registry::{
-    HKEY_CURRENT_USER, REG_SZ, RegDeleteKeyValueW, RegSetKeyValueW,
-};
+use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RegDeleteKeyValueW};
 use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
 use windows::core::{Interface, PCWSTR, w};
 
@@ -21,13 +23,18 @@ use crate::config::Config;
 
 const RUN_KEY: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
 const RUN_VALUE: PCWSTR = w!("Apex");
+const TASK_NAME: &str = "Apex Elevated Logon";
 
 pub fn ensure(config: &Config) {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
     ensure_start_menu(config.general_flag("start_menu", true), &exe);
-    ensure_run_at_login(config.general_flag("start_on_startup", true), &exe);
+    ensure_logon_task(config.general_flag("start_on_startup", true), &exe);
+    // Apex used to start via the Run key; a requireAdministrator exe cannot,
+    // so remove any leftover value from an older install - the task is the
+    // only startup path now.
+    remove_run_key();
 }
 
 fn start_menu_lnk() -> Option<PathBuf> {
@@ -62,29 +69,61 @@ fn write_shortcut(lnk: &Path, exe: &Path) -> windows::core::Result<()> {
     }
 }
 
-fn ensure_run_at_login(enabled: bool, exe: &Path) {
+/// Create or remove the elevated logon task that starts apex at sign-in.
+///
+/// `schtasks` is run as a plain child: apex is already elevated, so `/create
+/// /rl highest` needs no separate prompt. When enabled it is re-created each
+/// launch (`/f`) so the task always points at the exe's current location, the
+/// same way the Start-menu shortcut is re-written each launch.
+fn ensure_logon_task(enabled: bool, exe: &Path) {
+    if enabled {
+        let ok = run_schtasks(&[
+            "/create",
+            "/tn",
+            TASK_NAME,
+            "/tr",
+            &format!("\"{}\"", exe.display()),
+            "/sc",
+            "onlogon",
+            "/rl",
+            "highest",
+            "/f",
+        ]);
+        if !ok {
+            crate::dlog!("setup: schtasks create failed");
+        }
+    } else if task_exists() {
+        if !run_schtasks(&["/delete", "/tn", TASK_NAME, "/f"]) {
+            crate::dlog!("setup: schtasks delete failed");
+        }
+    }
+}
+
+/// Whether the logon task is registered. Querying needs no elevation.
+fn task_exists() -> bool {
+    std::process::Command::new("schtasks.exe")
+        .args(["/query", "/tn", TASK_NAME])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn run_schtasks(args: &[&str]) -> bool {
+    std::process::Command::new("schtasks.exe")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Remove the legacy `HKCU\...\Run` value if present. Harmless when absent.
+fn remove_run_key() {
     unsafe {
-        if enabled {
-            // Registry value names are case-insensitive; delete-then-set
-            // migrates an old lowercase "apex" value to "Apex".
-            let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE);
-            let exe_w = wide(exe.as_os_str());
-            let status = RegSetKeyValueW(
-                HKEY_CURRENT_USER,
-                RUN_KEY,
-                RUN_VALUE,
-                REG_SZ.0,
-                Some(exe_w.as_ptr() as *const core::ffi::c_void),
-                (exe_w.len() * 2) as u32,
-            );
-            if status != ERROR_SUCCESS {
-                crate::dlog!("setup: run-at-login registration failed: {status:?}");
-            }
-        } else {
-            let status = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE);
-            if status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND {
-                crate::dlog!("setup: run-at-login removal failed: {status:?}");
-            }
+        let status = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE);
+        if status != windows::Win32::Foundation::ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND {
+            crate::dlog!("setup: run-key cleanup failed: {status:?}");
         }
     }
 }

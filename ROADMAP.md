@@ -217,17 +217,17 @@ Polish the launcher until it's the fastest path to any app.
 - [x] **Fade/scale animation** on summon — scale 96.5% → 100% and content
       opacity 60% → 100% over 110 ms, eased. Per-pixel, because a layered
       window's constant alpha below 255 makes the compositor drop the blur.
-- [ ] **`run_as_admin` setting** — elevated logon task, so the hotkey works
-      over Task Manager and other elevated windows.
-      *Attempted and reverted* (`e1866bf`, `431200f`): an elevated apex
-      became unreliable to summon — it appeared but seemingly failed to take
-      foreground, so the next keystroke dismissed it. Never root-caused. Two
-      things a second attempt needs that the first lacked: a way to test
-      elevated behaviour before enabling it, and an answer for why
-      `force_foreground` fails from a high-integrity process. Note also that
-      launched apps inherit the elevated token, so any retry needs the
-      de-elevation path (hand the target to `explorer.exe`) or it will
-      silently run everything as administrator.
+- [x] **Runs as administrator** — mandatory, via a `requireAdministrator`
+      manifest, so the hotkey works over Task Manager and other elevated
+      windows. Start-at-login uses a scheduled logon task with highest
+      privileges (no UAC prompt at sign-in). Launched apps are handed to
+      Explorer so they run unelevated (an `open_with` quicklink is the one
+      documented exception).
+      The earlier opt-in attempt (`e1866bf`, reverted `431200f`) failed
+      because an elevated apex appeared but did not take foreground and the
+      next keystroke dismissed it — the show-then-dismiss race since fixed by
+      the post-summon guard window and the dedicated hook thread. Reused the
+      reverted de-elevation launcher and task code.
 
 ### v0.3 — "More than apps"
 
@@ -269,14 +269,9 @@ Additional plugins. Disabled ones are never constructed and cost nothing.
 
 ## Known limitations
 
-- **Elevated windows.** While an elevated window (e.g. Task Manager) has
-  focus, Windows UIPI hides input from non-elevated apps: the hotkey falls
-  through to the shell and Apex can't take focus. Running Apex elevated
-  avoids it; `run_as_admin` (v0.2) and a signed `uiAccess` build (v1.0)
-  are the real fixes.
-- **Acrylic needs Windows 11 22H2** (`DWMWA_SYSTEMBACKDROP_TYPE`). Earlier
-  systems get a solid window automatically; with "Transparency effects" off
-  the compositor substitutes a solid colour behind the tint.
+- **The acrylic backdrop is a snapshot**, captured and blurred at summon
+  time, not a live effect: content that moves behind an open apex is not
+  re-blurred. Imperceptible for a briefly-shown launcher.
 - **The index refreshes on start and on `Apex: Reload`**, not live: an app
   installed while apex is running appears after either.
 - **Aliases** are bare TOML keys, so they're normalized to lowercase
