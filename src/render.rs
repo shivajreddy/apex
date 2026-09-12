@@ -38,6 +38,8 @@ pub const HEADER_H: f32 = 26.0;
 const BADGE_H: f32 = 19.0;
 const BADGE_PAD_X: f32 = 7.0;
 const BADGE_GAP: f32 = 9.0;
+/// Downward nudge for alias-pill text so it sits at its optical centre.
+const BADGE_TEXT_DY: f32 = 1.5;
 const PANEL_W: f32 = 300.0;
 const PANEL_ROW: f32 = 32.0;
 const PANEL_PAD: f32 = 6.0;
@@ -783,7 +785,16 @@ impl Renderer {
                             },
                             &b.badge_bg,
                         );
-                        draw_text(rt, badge, fmt_badge, &pill, &b.badge_fg);
+                        // Nudge the glyphs down to their optical centre:
+                        // DirectWrite centres the line box, but alias text is
+                        // all no-descender letters (c, vs, tm...), so the ink
+                        // otherwise floats high in the pill.
+                        let text_rect = D2D_RECT_F {
+                            top: pill.top + BADGE_TEXT_DY,
+                            bottom: pill.bottom + BADGE_TEXT_DY,
+                            ..pill
+                        };
+                        draw_text(rt, badge, fmt_badge, &text_rect, &b.badge_fg);
                     }
 
                     if !item.subtitle.is_empty() {
