@@ -69,6 +69,8 @@ pub enum ShellCommand {
     ShowHidden,
     /// List configured source folders so they can be removed.
     ShowSources,
+    /// List every source and its items, so entries can be turned on or off.
+    ShowManage,
 }
 
 /// What the UI should do after a plugin handled an action.
@@ -129,6 +131,15 @@ pub trait Plugin {
     /// Implementations must skip payloads already present in `out` to avoid
     /// repeating a row that history already placed above.
     fn browse(&mut self, _limit: usize, _out: &mut Vec<ResultItem>) {}
+
+    /// Append every item this plugin can produce, for the sources view
+    /// where each is shown with an on/off switch. Unlike [`Plugin::browse`]
+    /// this is not a padding list: plugins that stay out of the default
+    /// list (apex's own commands) still belong here. The default is the
+    /// full browse.
+    fn catalogue(&mut self, out: &mut Vec<ResultItem>) {
+        self.browse(usize::MAX, out);
+    }
 
     /// Reload whatever this plugin caches from disk.
     ///

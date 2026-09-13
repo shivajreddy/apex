@@ -3,11 +3,12 @@
 //!
 //! The scene is drawn into a 32-bit premultiplied DIB and copied into the
 //! window in `WM_PAINT` (see [`Renderer::blit`]). DWM honours the DIB's
-//! alpha (see `window::enable_backdrop`), so wherever the frame is
+//! alpha (see `window::setup_frame`), so wherever the frame is
 //! transparent the compositor's live blur shows through - when translucent
 //! the background is just a tint over it. Software Direct2D into a DIB
 //! creates no swap chain, so it is cheaper than an hwnd target.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -35,12 +36,11 @@ const BAR_H: f32 = 34.0;
 pub const HEADER_H: f32 = 26.0;
 // Gap between the title and the dimmed category that follows it.
 const CATEGORY_GAP: f32 = 8.0;
-// Alias pill drawn immediately after a result's title (and category).
+// Alias pill drawn immediately after a result's title (and category). The
+// text is upper-cased and its ink centred in the pill (see `ink_bounds`).
 const BADGE_H: f32 = 20.0;
 const BADGE_PAD_X: f32 = 8.0;
 const BADGE_GAP: f32 = 9.0;
-/// Downward nudge for alias-pill text so it sits at its optical centre.
-const BADGE_TEXT_DY: f32 = 1.5;
 const PANEL_W: f32 = 300.0;
 const PANEL_ROW: f32 = 32.0;
 const PANEL_PAD: f32 = 6.0;
@@ -56,6 +56,9 @@ const SCROLLBAR_MIN_THUMB: f32 = 36.0;
 /// The thumb's halo, in the opposite polarity to the thumb, so it stays
 /// legible whether the backdrop behind it is light or dark.
 const SCROLLBAR_HALO: f32 = 1.0;
+/// Width of the strip along the right edge that counts as the scrollbar for
+/// the mouse - wider than the thumb, so it is easy to grab.
+pub const SCROLLBAR_HIT_W: f32 = 16.0;
 
 // Forms stack a dim label over an editable value, so they need more width
 // than the actions panel - links in particular are long.
@@ -90,7 +93,7 @@ pub fn list_viewport_height(_rows: usize, _headers: usize) -> f32 {
 ///
 /// A section header occupies `HEADER_H` immediately above the row it starts
 /// at, so a row's offset depends on how many headers precede it.
-pub fn row_offset(sections: &[(usize, &'static str)], index: usize) -> f32 {
+pub fn row_offset<T>(sections: &[(usize, T)], index: usize) -> f32 {
     let headers = sections.iter().filter(|(start, _)| *start <= index).count();
     LIST_PAD + headers as f32 * HEADER_H + index as f32 * ROW_H
 }
@@ -100,6 +103,50 @@ pub fn row_offset(sections: &[(usize, &'static str)], index: usize) -> f32 {
 /// row, or is empty. A fixed window stops the window resizing as you type.
 pub fn content_height(_rows: usize, _headers: usize) -> f32 {
     INPUT_H + 1.0 + LIST_VIEWPORT_H + BAR_H
+}
+
+/// Where the scrollbar is, in DIPs. Shared by the painter and the mouse
+/// hit-testing so a click lands on exactly what is drawn.
+pub struct Scrollbar {
+    pub x0: f32,
+    pub x1: f32,
+    pub track_top: f32,
+    pub track_h: f32,
+    pub thumb_top: f32,
+    pub thumb_h: f32,
+}
+
+impl Scrollbar {
+    /// How far the thumb can move along the track.
+    pub fn travel(&self) -> f32 {
+        (self.track_h - self.thumb_h).max(0.0)
+    }
+}
+
+/// The scrollbar for a list of `rows` and `headers` scrolled to `scroll`, or
+/// `None` when the list fits and there is no scrollbar.
+pub fn scrollbar(rows: usize, headers: usize, scroll: f32) -> Option<Scrollbar> {
+    let view_h = list_viewport_height(rows, headers);
+    let content_h = list_content_height(rows, headers);
+    if content_h <= view_h {
+        return None;
+    }
+    let track_top = INPUT_H + 1.0 + SCROLLBAR_PAD;
+    let track_h = view_h - SCROLLBAR_PAD * 2.0;
+    let thumb_h = (view_h / content_h * track_h)
+        .max(SCROLLBAR_MIN_THUMB)
+        .min(track_h);
+    let travel = (track_h - thumb_h).max(0.0);
+    let progress = (scroll / (content_h - view_h)).clamp(0.0, 1.0);
+    let x1 = WINDOW_WIDTH - SCROLLBAR_MARGIN;
+    Some(Scrollbar {
+        x0: x1 - SCROLLBAR_W,
+        x1,
+        track_top,
+        track_h,
+        thumb_top: track_top + travel * progress,
+        thumb_h,
+    })
 }
 
 fn form_panel_height(fields: usize) -> f32 {
@@ -121,7 +168,13 @@ pub struct Frame<'a> {
     pub results: &'a [ResultItem],
     pub selected: usize,
     /// `(first row index, heading)`, ascending. Empty for a typed query.
-    pub sections: &'a [(usize, &'static str)],
+    pub sections: &'a [(usize, Cow<'static, str>)],
+    /// Per row, whether it is drawn dimmed (turned off in the sources
+    /// view). Shorter than `results` means the rest are not.
+    pub dimmed: &'a [bool],
+    /// The verb Enter performs on a row ("Open", or "Toggle" in the sources
+    /// view), for the bottom bar.
+    pub enter_hint: &'a str,
     /// How far the list is scrolled, in DIPs.
     pub scroll: f32,
     pub panel: Option<PanelView<'a>>,
@@ -183,6 +236,8 @@ pub struct Palette {
     panel: D2D1_COLOR_F,
     badge_bg: D2D1_COLOR_F,
     badge_fg: D2D1_COLOR_F,
+    /// Hairline edge of the alias pill.
+    badge_border: D2D1_COLOR_F,
     /// Selected text.
     selection: D2D1_COLOR_F,
     /// Hairline rim just inside the window edge - the "glass edge" that
@@ -207,6 +262,7 @@ const DARK: Palette = Palette {
     panel: rgba(0x26262B, 0.94),
     badge_bg: rgba(0xFFFFFF, 0.13),
     badge_fg: rgba(0xF4F4F6, 0.65),
+    badge_border: rgba(0xFFFFFF, 0.16),
     selection: rgba(0x4C8DFF, 0.45),
     border: rgba(0xFFFFFF, 0.12),
     scrollbar: rgba(0xFFFFFF, 0.50),
@@ -223,6 +279,7 @@ const LIGHT: Palette = Palette {
     panel: rgba(0xF0F0F3, 0.96),
     badge_bg: rgba(0x000000, 0.09),
     badge_fg: rgba(0x1B1B1F, 0.70),
+    badge_border: rgba(0x000000, 0.14),
     selection: rgba(0x3B82F6, 0.35),
     border: rgba(0x000000, 0.14),
     scrollbar: rgba(0x000000, 0.42),
@@ -272,6 +329,7 @@ struct Brushes {
     panel: ID2D1SolidColorBrush,
     badge_bg: ID2D1SolidColorBrush,
     badge_fg: ID2D1SolidColorBrush,
+    badge_border: ID2D1SolidColorBrush,
     selection: ID2D1SolidColorBrush,
     border: ID2D1SolidColorBrush,
     scrollbar: ID2D1SolidColorBrush,
@@ -374,10 +432,9 @@ impl Renderer {
             let fmt_panel = make(14.0, DWRITE_FONT_WEIGHT_NORMAL)?;
             fmt_panel.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
             fmt_panel.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
-            // Centred both ways so the text sits in the middle of the pill.
-            let fmt_badge = make(11.5, DWRITE_FONT_WEIGHT_NORMAL)?;
-            fmt_badge.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-            fmt_badge.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            // Top-left aligned: the pill positions the text by its measured
+            // ink bounds, so it needs a fixed, known origin.
+            let fmt_badge = make(11.0, DWRITE_FONT_WEIGHT_NORMAL)?;
             let fmt_header = make(11.5, DWRITE_FONT_WEIGHT_SEMI_BOLD)?;
             fmt_header.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
 
@@ -457,6 +514,7 @@ impl Renderer {
                     panel: brush(&p.panel)?,
                     badge_bg: brush(&p.badge_bg)?,
                     badge_fg: brush(&p.badge_fg)?,
+                    badge_border: brush(&p.badge_border)?,
                     selection: brush(&p.selection)?,
                     border: brush(&p.border)?,
                     scrollbar: brush(&p.scrollbar)?,
@@ -543,7 +601,7 @@ impl Renderer {
 
     /// Copy the last drawn frame into `hdc`, the window's paint DC. The DIB
     /// is premultiplied BGRA and `BitBlt` copies its alpha verbatim, which DWM
-    /// honours for this window (see `window::enable_backdrop`).
+    /// honours for this window (see `window::setup_frame`).
     pub fn blit(&self, hdc: HDC) {
         if let Some(t) = &self.target {
             unsafe {
@@ -569,6 +627,8 @@ impl Renderer {
             results,
             selected,
             sections,
+            dimmed,
+            enter_hint,
             scroll,
             panel,
         } = frame;
@@ -606,6 +666,7 @@ impl Renderer {
                 &b.panel,
                 &b.badge_bg,
                 &b.badge_fg,
+                &b.badge_border,
                 &b.selection,
                 &b.border,
                 &b.scrollbar,
@@ -697,7 +758,7 @@ impl Renderer {
                     }
                     draw_text(
                         rt,
-                        title,
+                        title.as_ref(),
                         fmt_header,
                         &D2D_RECT_F {
                             left: PAD_X,
@@ -731,6 +792,8 @@ impl Renderer {
                             &b.select,
                         );
                     }
+                    // A row turned off in the sources view is drawn faded.
+                    let off = dimmed.get(i).copied().unwrap_or(false);
                     if let Some(icon) = &item.icon
                         && let Some(bmp) = icon_bitmap(rt, &mut t.icons, icon)
                     {
@@ -743,7 +806,7 @@ impl Renderer {
                                 right: PAD_X + ICON_SIZE,
                                 bottom: top + ICON_SIZE,
                             }),
-                            opacity,
+                            if off { opacity * 0.35 } else { opacity },
                             D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
                             None,
                         );
@@ -754,7 +817,13 @@ impl Renderer {
                         right: width - PAD_X,
                         bottom: y + ROW_H,
                     };
-                    draw_text(rt, &item.title, fmt_title, &title_rect, &b.text);
+                    draw_text(
+                        rt,
+                        &item.title,
+                        fmt_title,
+                        &title_rect,
+                        if off { &b.dim } else { &b.text },
+                    );
 
                     // Walk a cursor along the row: title, then the dimmed
                     // category, then the alias pill - the Raycast order.
@@ -774,34 +843,62 @@ impl Renderer {
                         cursor += measure(dwrite, fmt_title, &item.category);
                     }
 
-                    // Alias pill, after the title (and category).
+                    // Alias pill, after the title (and category): the alias
+                    // in capitals, its ink centred both ways. Centring the
+                    // ink rather than DirectWrite's line box is what keeps
+                    // capitals (no descenders) from floating high.
                     if let Some(badge) = &item.badge {
-                        let badge_w = measure(dwrite, fmt_badge, badge);
-                        let left = cursor + BADGE_GAP;
-                        let pill = D2D_RECT_F {
-                            left,
-                            top: y + (ROW_H - BADGE_H) / 2.0,
-                            right: left + badge_w + BADGE_PAD_X * 2.0,
-                            bottom: y + (ROW_H + BADGE_H) / 2.0,
-                        };
-                        rt.FillRoundedRectangle(
-                            &D2D1_ROUNDED_RECT {
-                                rect: pill,
-                                radiusX: 6.0,
-                                radiusY: 6.0,
-                            },
-                            &b.badge_bg,
-                        );
-                        // Nudge the glyphs down to their optical centre:
-                        // DirectWrite centres the line box, but alias text is
-                        // all no-descender letters (c, vs, tm...), so the ink
-                        // otherwise floats high in the pill.
-                        let text_rect = D2D_RECT_F {
-                            top: pill.top + BADGE_TEXT_DY,
-                            bottom: pill.bottom + BADGE_TEXT_DY,
-                            ..pill
-                        };
-                        draw_text(rt, badge, fmt_badge, &text_rect, &b.badge_fg);
+                        let text = badge.to_uppercase();
+                        if let Some(ink) = ink_bounds(dwrite, fmt_badge, &text) {
+                            let left = cursor + BADGE_GAP;
+                            let pill = D2D_RECT_F {
+                                left,
+                                top: y + (ROW_H - BADGE_H) / 2.0,
+                                right: left + ink.width + BADGE_PAD_X * 2.0,
+                                bottom: y + (ROW_H + BADGE_H) / 2.0,
+                            };
+                            rt.FillRoundedRectangle(
+                                &D2D1_ROUNDED_RECT {
+                                    rect: pill,
+                                    radiusX: 6.0,
+                                    radiusY: 6.0,
+                                },
+                                &b.badge_bg,
+                            );
+                            // Hairline edge, inset half a DIP so the stroke
+                            // stays crisp - the key-cap look.
+                            rt.DrawRoundedRectangle(
+                                &D2D1_ROUNDED_RECT {
+                                    rect: D2D_RECT_F {
+                                        left: pill.left + 0.5,
+                                        top: pill.top + 0.5,
+                                        right: pill.right - 0.5,
+                                        bottom: pill.bottom - 0.5,
+                                    },
+                                    radiusX: 5.5,
+                                    radiusY: 5.5,
+                                },
+                                &b.badge_border,
+                                1.0,
+                                None,
+                            );
+                            // Layout origin such that the ink box lands in
+                            // the middle of the pill.
+                            let origin_x = pill.left + BADGE_PAD_X - ink.left;
+                            let origin_y = (pill.top + pill.bottom - ink.height) / 2.0 - ink.top;
+                            draw_text(
+                                rt,
+                                &text,
+                                fmt_badge,
+                                &D2D_RECT_F {
+                                    left: origin_x,
+                                    top: origin_y,
+                                    right: origin_x + INK_BOX,
+                                    bottom: origin_y + INK_BOX,
+                                },
+                                &b.badge_fg,
+                            );
+                        }
                     }
 
                     if !item.subtitle.is_empty() {
@@ -819,16 +916,7 @@ impl Renderer {
                 // Scrollbar, when the list is taller than the viewport. A
                 // thin rounded thumb on the right edge, sized and positioned
                 // by how far through the content the scroll is - Raycast-style.
-                let content_h = list_content_height(results.len(), sections.len());
-                if content_h > view_h {
-                    let track_top = list_top + SCROLLBAR_PAD;
-                    let track_h = view_h - SCROLLBAR_PAD * 2.0;
-                    let thumb_h = (view_h / content_h * track_h).max(SCROLLBAR_MIN_THUMB);
-                    let travel = (track_h - thumb_h).max(0.0);
-                    let progress = (scroll / (content_h - view_h)).clamp(0.0, 1.0);
-                    let thumb_top = track_top + travel * progress;
-                    let x1 = width - SCROLLBAR_MARGIN;
-                    let x0 = x1 - SCROLLBAR_W;
+                if let Some(sb) = scrollbar(results.len(), sections.len(), scroll) {
                     let r = SCROLLBAR_W / 2.0;
                     let pill = |rect: D2D_RECT_F, radius: f32| D2D1_ROUNDED_RECT {
                         rect,
@@ -840,20 +928,20 @@ impl Renderer {
                     rt.FillRoundedRectangle(
                         &pill(
                             D2D_RECT_F {
-                                left: x0,
-                                top: track_top,
-                                right: x1,
-                                bottom: track_top + track_h,
+                                left: sb.x0,
+                                top: sb.track_top,
+                                right: sb.x1,
+                                bottom: sb.track_top + sb.track_h,
                             },
                             r,
                         ),
                         &b.scrollbar_track,
                     );
                     let thumb = D2D_RECT_F {
-                        left: x0,
-                        top: thumb_top,
-                        right: x1,
-                        bottom: thumb_top + thumb_h,
+                        left: sb.x0,
+                        top: sb.thumb_top,
+                        right: sb.x1,
+                        bottom: sb.thumb_top + sb.thumb_h,
                     };
                     rt.FillRoundedRectangle(
                         &pill(
@@ -871,11 +959,12 @@ impl Renderer {
                 }
 
                 // Bottom bar with key hints.
+                let row_hint = format!("{enter_hint} \u{21b5}      Actions Ctrl+K");
                 let hint = match panel {
                     Some(PanelView::Form { .. }) => "Save \u{21b5}      Field Tab",
                     Some(PanelView::TextInput { .. }) => "Confirm \u{21b5}",
                     Some(PanelView::Actions { .. }) => "Run \u{21b5}",
-                    None => "Open \u{21b5}      Actions Ctrl+K",
+                    None => row_hint.as_str(),
                 };
                 let bar_top = height - BAR_H;
                 rt.FillRectangle(
@@ -1154,6 +1243,45 @@ unsafe fn draw_field(
             );
         }
         rt.PopAxisAlignedClip();
+    }
+}
+
+/// Side of the (generous) layout box used to measure ink; the text is never
+/// wrapped or clipped by it.
+const INK_BOX: f32 = 512.0;
+
+/// Where the glyphs actually are, relative to the layout origin.
+struct Ink {
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+}
+
+/// The ink bounds of `text` in `format`: the box the visible glyph pixels
+/// occupy, relative to the top-left of a layout laid out in an `INK_BOX`
+/// square. DirectWrite's overhang metrics are the distances from that box's
+/// edges to the outermost ink, positive outwards.
+fn ink_bounds(dwrite: &IDWriteFactory, format: &IDWriteTextFormat, text: &str) -> Option<Ink> {
+    if text.is_empty() {
+        return None;
+    }
+    unsafe {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let layout = dwrite
+            .CreateTextLayout(&units, format, INK_BOX, INK_BOX)
+            .ok()?;
+        let oh = layout.GetOverhangMetrics().ok()?;
+        let left = -oh.left;
+        let top = -oh.top;
+        let right = INK_BOX + oh.right;
+        let bottom = INK_BOX + oh.bottom;
+        Some(Ink {
+            left,
+            top,
+            width: (right - left).max(0.0),
+            height: (bottom - top).max(0.0),
+        })
     }
 }
 

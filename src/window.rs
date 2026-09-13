@@ -160,7 +160,7 @@ pub fn run(config: &crate::config::Config) -> Result<()> {
 
         // WS_EX_TOOLWINDOW keeps apex out of the taskbar and Alt+Tab.
         // WS_CAPTION is there only so DWM will put its live backdrop behind
-        // the window (see `enable_backdrop`): no frame is ever laid out.
+        // the window (see `setup_frame`): no frame is ever laid out.
         // Deliberately not WS_EX_LAYERED - see the backdrop section.
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
@@ -190,11 +190,10 @@ pub fn run(config: &crate::config::Config) -> Result<()> {
         app.dark = app.forced_dark.unwrap_or_else(|| !system_light_theme());
         // Theme first: the backdrop's material is chosen by it.
         set_dark_mode(hwnd, app.dark);
-        // Neutralise the WS_CAPTION whether or not a backdrop is used, then
-        // ask for the live backdrop if configured (see `enable_backdrop`).
-        // If the system can't provide one, the renderer paints solid.
-        prepare_frame(hwnd);
-        app.translucent = config.acrylic() && enable_backdrop(hwnd);
+        // Frame attributes and, if configured, the live backdrop - one
+        // ordered sequence (see `setup_frame`). If the system can't provide
+        // a backdrop, the renderer paints solid.
+        app.translucent = setup_frame(hwnd, config.acrylic());
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
 
         if config.general_flag("tray_icon", true) {
@@ -317,15 +316,43 @@ unsafe fn set_dark_mode(hwnd: HWND, dark: bool) {
     }
 }
 
-/// Neutralise the WS_CAPTION the window carries for DWM's sake: no border,
-/// no caption colour, no DWM show/hide fade. Unconditional - the style is
-/// there whether or not a backdrop is in use.
-unsafe fn prepare_frame(hwnd: HWND) {
+/// Set up the window's frame for DWM, and ask for the live backdrop when
+/// `acrylic` is on. Returns whether a live blur is in place; when false the
+/// renderer paints a solid background.
+///
+/// ORDER MATTERS. The glass (frame extended into the whole client area,
+/// alpha honoured) must be established before anything triggers a frame
+/// change: a `SWP_FRAMECHANGED` issued earlier - even a harmless-looking one
+/// after only setting the border colour - left the compositor with an
+/// opaque, non-glass frame and the backdrop never showed, reading as a
+/// solid window. That regression shipped once; this function is one
+/// sequence so it cannot be split that way again.
+unsafe fn setup_frame(hwnd: HWND, acrylic: bool) -> bool {
     unsafe {
+        if acrylic {
+            // Sheet of glass: the whole client area counts as frame, so DWM
+            // composes our pixels with their alpha instead of as opaque.
+            let glass = MARGINS {
+                cxLeftWidth: -1,
+                cxRightWidth: -1,
+                cyTopHeight: -1,
+                cyBottomHeight: -1,
+            };
+            let _ = DwmExtendFrameIntoClientArea(hwnd, &glass);
+            dwm_set(hwnd, DWMWA_REDIRECTIONBITMAP_ALPHA, &BOOL(1));
+        }
+        // Neutralise the WS_CAPTION the window carries for DWM's sake: no
+        // border, no caption colour, no DWM show/hide fade. Applied whether
+        // or not there is a backdrop - the style is there either way.
         dwm_set(hwnd, DWMWA_BORDER_COLOR, &DWMWA_COLOR_NONE);
         dwm_set(hwnd, DWMWA_CAPTION_COLOR, &DWMWA_COLOR_NONE);
         dwm_set(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, &BOOL(1));
+        let live = acrylic
+            && (dwm_set(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &DWMSBT_TRANSIENTWINDOW)
+                || set_accent_blur(hwnd));
+        // Only now: one frame change so DWM applies all of the above.
         frame_changed(hwnd);
+        live
     }
 }
 
@@ -342,27 +369,6 @@ unsafe fn frame_changed(hwnd: HWND) {
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         );
-    }
-}
-
-/// Ask the compositor for a live blur behind the window. Returns whether one
-/// is in place; when false the renderer paints a solid background instead.
-unsafe fn enable_backdrop(hwnd: HWND) -> bool {
-    unsafe {
-        // Sheet of glass: the whole client area counts as frame, so DWM
-        // composes our pixels with their alpha instead of as opaque.
-        let glass = MARGINS {
-            cxLeftWidth: -1,
-            cxRightWidth: -1,
-            cyTopHeight: -1,
-            cyBottomHeight: -1,
-        };
-        let _ = DwmExtendFrameIntoClientArea(hwnd, &glass);
-        dwm_set(hwnd, DWMWA_REDIRECTIONBITMAP_ALPHA, &BOOL(1));
-        let live = dwm_set(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &DWMSBT_TRANSIENTWINDOW)
-            || set_accent_blur(hwnd);
-        frame_changed(hwnd);
-        live
     }
 }
 
@@ -653,6 +659,8 @@ unsafe fn repaint(hwnd: HWND) {
             results: &app.results,
             selected: app.selected,
             sections: &app.sections,
+            dimmed: &app.dimmed,
+            enter_hint: app.enter_hint(),
             scroll: app.scroll,
             panel,
         };
@@ -750,7 +758,7 @@ unsafe extern "system" fn wndproc(
                 LRESULT(0)
             }
             // Copy the last drawn frame into the window. DWM honours its
-            // alpha (see `enable_backdrop`), so the live backdrop shows
+            // alpha (see `setup_frame`), so the live backdrop shows
             // through wherever the frame is transparent.
             WM_PAINT => {
                 let mut ps = PAINTSTRUCT::default();
@@ -776,13 +784,24 @@ unsafe extern "system" fn wndproc(
             // WM_MOUSEMOVE, which would otherwise yank the selection away
             // from the top row before the user has touched anything.
             WM_MOUSEMOVE => {
+                // A scrollbar drag in progress: the pointer owns the thumb
+                // (the mouse is captured, so this arrives even off-window).
+                if let Some(app) = app_mut(hwnd)
+                    && app.scroll_drag.is_some()
+                {
+                    let (_, y) = client_dips(hwnd, lparam);
+                    if app.scrollbar_drag(y) {
+                        repaint(hwnd);
+                    }
+                    return LRESULT(0);
+                }
                 let pos = lparam.0 as u32;
                 if LAST_MOUSE.swap(pos as isize, Relaxed) != pos as isize
                     && mode_kind(hwnd) == ModeKind::Search
                 {
-                    let (_, y) = client_dips(hwnd, lparam);
+                    let (x, y) = client_dips(hwnd, lparam);
                     if let Some(app) = app_mut(hwnd)
-                        && let Some(row) = app.row_at(y)
+                        && let Some(row) = app.row_at(x, y)
                         && app.select(row)
                     {
                         repaint(hwnd);
@@ -790,7 +809,37 @@ unsafe extern "system" fn wndproc(
                 }
                 LRESULT(0)
             }
+            // Scrollbar: press to grab the thumb (or jump it to the pointer),
+            // then drag. Capture the mouse so the drag survives leaving the
+            // window; WM_LBUTTONUP / WM_CAPTURECHANGED end it.
+            WM_LBUTTONDOWN => {
+                if mode_kind(hwnd) == ModeKind::Search {
+                    let (x, y) = client_dips(hwnd, lparam);
+                    if let Some(app) = app_mut(hwnd)
+                        && app.in_scrollbar(x, y)
+                    {
+                        let moved = app.scrollbar_press(y);
+                        SetCapture(hwnd);
+                        if moved {
+                            repaint(hwnd);
+                        }
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_CAPTURECHANGED => {
+                if let Some(app) = app_mut(hwnd) {
+                    app.scroll_drag = None;
+                }
+                LRESULT(0)
+            }
             WM_LBUTTONUP => {
+                // Same care as hide(): no App borrow across ReleaseCapture,
+                // whose WM_CAPTURECHANGED re-enters app_mut.
+                if app_mut(hwnd).is_some_and(|a| a.scrollbar_release()) {
+                    let _ = ReleaseCapture();
+                    return LRESULT(0);
+                }
                 if mode_kind(hwnd) == ModeKind::Search {
                     let (x, y) = client_dips(hwnd, lparam);
                     if y < render::INPUT_H {
@@ -810,7 +859,7 @@ unsafe extern "system" fn wndproc(
                         return LRESULT(0);
                     }
                     let hit = app_mut(hwnd).and_then(|a| {
-                        let row = a.row_at(y)?;
+                        let row = a.row_at(x, y)?;
                         a.select(row);
                         Some(a.activate_selected())
                     });
@@ -914,7 +963,8 @@ unsafe fn run_shell_command(hwnd: HWND, cmd: ShellCommand) {
             // hidden set.
             ShellCommand::ClearHistory
             | ShellCommand::ShowHidden
-            | ShellCommand::ShowSources => repaint(hwnd),
+            | ShellCommand::ShowSources
+            | ShellCommand::ShowManage => repaint(hwnd),
         }
     }
 }
@@ -1022,10 +1072,9 @@ unsafe fn tray_menu(hwnd: HWND) {
 unsafe fn reload_plugins(hwnd: HWND) {
     unsafe {
         if let Some(app) = app_mut(hwnd) {
-            for p in &mut app.plugins {
-                p.refresh();
-            }
+            app.reload();
         }
+        repaint(hwnd);
     }
 }
 
@@ -1509,6 +1558,12 @@ unsafe fn hide(hwnd: HWND) {
         let _ = KillTimer(Some(hwnd), CARET_TIMER_ID);
         let _ = KillTimer(Some(hwnd), ANIM_TIMER_ID);
         let _ = ShowWindow(hwnd, SW_HIDE);
+        // A drag can't outlive the window (Esc mid-drag). Released with no
+        // App borrow live: ReleaseCapture delivers WM_CAPTURECHANGED
+        // synchronously, and that handler fetches the App again.
+        if app_mut(hwnd).is_some_and(|a| a.scrollbar_release()) {
+            let _ = ReleaseCapture();
+        }
         if let Some(app) = app_mut(hwnd) {
             app.summon = None;
             // Fresh query next time the launcher opens.

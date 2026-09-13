@@ -92,6 +92,11 @@ fn all() -> Vec<Command> {
             "unhide restore show excluded",
         ),
         Command::new(
+            "manage",
+            "Apex: Sources & Commands",
+            "extensions plugins manage enable disable toggle on off catalogue",
+        ),
+        Command::new(
             "clear_history",
             "Apex: Clear Launch History",
             "frecency reset forget ranking",
@@ -119,6 +124,24 @@ impl Commands {
     }
 }
 
+impl Commands {
+    /// The row for a command. Titles read "Apex: Reload"; show "Reload" with
+    /// "Apex" as the category, the way Raycast lists an extension's
+    /// commands. Search still matches the full label.
+    fn item(&self, c: &Command, score: i32) -> ResultItem {
+        ResultItem {
+            plugin: ID,
+            title: c.label.strip_prefix("Apex: ").unwrap_or(c.label).to_string(),
+            badge: None,
+            category: "Apex".to_string(),
+            subtitle: "Command".to_string(),
+            payload: c.id.to_string(),
+            score,
+            icon: self.icon.clone(),
+        }
+    }
+}
+
 impl Plugin for Commands {
     fn id(&self) -> &'static str {
         ID
@@ -128,21 +151,29 @@ impl Plugin for Commands {
         let query = fuzzy::fold_case(q);
         for c in &self.commands {
             if let Some(score) = c.score(&query) {
-                out.push(ResultItem {
-                    plugin: ID,
-                    // Titles read "Apex: Reload"; show "Reload" with "Apex" as
-                    // the category, the way Raycast lists an extension's
-                    // commands. Search still matches the full label.
-                    title: c.label.strip_prefix("Apex: ").unwrap_or(c.label).to_string(),
-                    badge: None,
-                    category: "Apex".to_string(),
-                    subtitle: "Command".to_string(),
-                    payload: c.id.to_string(),
-                    score,
-                    icon: self.icon.clone(),
-                });
+                out.push(self.item(c, score));
             }
         }
+    }
+
+    // Commands stay out of the default list (no `browse`), but the sources
+    // view lists them so each can be turned off - except the two that open
+    // the Hidden and Sources views themselves, which are the way back and
+    // are never toggleable.
+    fn catalogue(&mut self, out: &mut Vec<ResultItem>) {
+        for c in &self.commands {
+            if !matches!(c.id, "manage" | "hidden") {
+                out.push(self.item(c, 0));
+            }
+        }
+    }
+
+    // So a command that has been hidden shows up in the Hidden view and can
+    // be restored. Commands never reach launch history (nothing they do
+    // returns `Close`), so this does not put them into Suggestions.
+    fn item_for(&mut self, payload: &str) -> Option<ResultItem> {
+        let c = self.commands.iter().find(|c| c.id == payload)?;
+        Some(self.item(c, 0))
     }
 
     fn activate(&mut self, item: &ResultItem) -> ActionResult {
@@ -154,6 +185,7 @@ impl Plugin for Commands {
             "clear_history" => ActionResult::Shell(ShellCommand::ClearHistory),
             "hidden" => ActionResult::Shell(ShellCommand::ShowHidden),
             "sources" => ActionResult::Shell(ShellCommand::ShowSources),
+            "manage" => ActionResult::Shell(ShellCommand::ShowManage),
             "add_source" => source_form("Add Source Folder", ""),
             "config" => {
                 open_config(false);
@@ -421,11 +453,28 @@ mod tests {
     }
 
     #[test]
-    fn commands_stay_out_of_history_and_the_default_list() {
+    fn commands_stay_out_of_the_default_list_but_resolve_for_the_hidden_view() {
         let mut c = commands();
-        assert!(c.item_for("reload").is_none());
+        // No browse: never padded into the default list.
         let mut out = Vec::new();
         c.browse(8, &mut out);
         assert!(out.is_empty());
+        // item_for resolves real commands so a hidden one can be listed and
+        // restored; nothing they do reaches launch history, so this does not
+        // surface them as Suggestions.
+        assert!(c.item_for("reload").is_some());
+        assert!(c.item_for("no-such-command").is_none());
+    }
+
+    #[test]
+    fn the_catalogue_omits_the_two_view_commands() {
+        let mut c = commands();
+        let mut out = Vec::new();
+        c.catalogue(&mut out);
+        let ids: Vec<&str> = out.iter().map(|i| i.payload.as_str()).collect();
+        assert!(!ids.contains(&"manage"), "the way back is never toggleable");
+        assert!(!ids.contains(&"hidden"));
+        assert!(ids.contains(&"reload"));
+        assert_eq!(out.len(), all().len() - 2);
     }
 }

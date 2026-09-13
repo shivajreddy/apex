@@ -5,6 +5,7 @@ use crate::editor::{Edit, FormEntry, TextField};
 use crate::frecency::{self, Frecency};
 use crate::plugin::{Action, ActionResult, FormField, Plugin, ResultItem, ShellCommand};
 use crate::render::Renderer;
+use std::borrow::Cow;
 
 /// Hard cap on materialised rows. Generous: the default list holds every
 /// installed app, and the list scrolls. Plugins already build a `ResultItem`
@@ -26,9 +27,16 @@ const HIDDEN: &str = "hidden";
 const ACTION_HIDE: &str = "__hide";
 const ACTION_UNHIDE: &str = "__unhide";
 const ACTION_REMOVE_SOURCE: &str = "__remove_source";
+const ACTION_TOGGLE: &str = "__toggle";
+const ACTION_SOURCE_OFF: &str = "__source_off";
+const ACTION_SOURCE_ON: &str = "__source_on";
 
 /// Owner of rows the shell builds itself, which no plugin can activate.
 const SHELL: &str = "__shell";
+
+/// The application plugin, whose catalogue the sources view splits per
+/// source folder.
+const SEARCH: &str = "search";
 
 /// Identity of a result across plugins.
 ///
@@ -39,6 +47,49 @@ fn key(plugin: &str, payload: &str) -> String {
     format!("{plugin}/{payload}")
 }
 
+/// Entries that must always stay reachable: the commands that open the
+/// Hidden and Sources views. Without them, turning something off could not
+/// be undone from inside apex.
+const PROTECTED: [&str; 2] = ["commands/manage", "commands/hidden"];
+
+/// `keys` with the protected entries removed.
+fn protect(mut keys: Vec<String>) -> Vec<String> {
+    keys.retain(|k| !PROTECTED.contains(&k.as_str()));
+    keys
+}
+
+/// Heading for a plugin's items in the sources view.
+fn source_name(id: &str) -> Cow<'static, str> {
+    match id {
+        SEARCH => "Applications".into(),
+        "commands" => "Apex Commands".into(),
+        "quicklinks" => "Quicklinks".into(),
+        other => other.to_string().into(),
+    }
+}
+
+/// Whether `path` is a file directly inside `folder`. Exact parent, not a
+/// prefix: source folders are scanned one level deep, so a nested source
+/// (`D:\Tools` and `D:\Tools\Sub`) must keep its own entries under its own
+/// heading. Case-insensitive, as Windows paths are.
+fn in_folder(path: &str, folder: &str) -> bool {
+    let seps: &[char] = &['\\', '/'];
+    let folder = folder.trim_end_matches(seps);
+    std::path::Path::new(path)
+        .parent()
+        .and_then(|p| p.to_str())
+        .is_some_and(|parent| parent.trim_end_matches(seps).eq_ignore_ascii_case(folder))
+}
+
+/// The last component of a folder path, for its heading.
+fn folder_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path)
+        .to_string()
+}
+
 /// Which catalogue the result list is showing.
 #[derive(PartialEq, Clone, Copy)]
 pub enum Listing {
@@ -47,6 +98,8 @@ pub enum Listing {
     Hidden,
     /// Configured source folders, so they can be removed.
     Sources,
+    /// Every source and its items, each with an on/off state.
+    Manage,
 }
 
 pub enum Mode {
@@ -108,9 +161,15 @@ pub struct App {
     pub selected: usize,
     /// `(first row index, heading)`. Only the default list is sectioned; a
     /// typed query is one ranked list, so headings would be arbitrary.
-    pub sections: Vec<(usize, &'static str)>,
+    pub sections: Vec<(usize, Cow<'static, str>)>,
+    /// Per row, whether it is turned off (sources view only; empty
+    /// elsewhere). Drawn faded.
+    pub dimmed: Vec<bool>,
     /// List scroll offset in DIPs.
     pub scroll: f32,
+    /// A scrollbar-thumb drag in progress: the pointer's offset from the
+    /// thumb's top edge, in DIPs, so the thumb follows without jumping.
+    pub scroll_drag: Option<f32>,
     /// `plugin/payload` keys the user has hidden. Filtered out of every
     /// listing, here rather than per-plugin so one action covers them all.
     hidden: std::collections::HashSet<String>,
@@ -146,12 +205,35 @@ impl App {
             results: Vec::new(),
             selected: 0,
             sections: Vec::new(),
+            dimmed: Vec::new(),
             scroll: 0.0,
+            scroll_drag: None,
             hidden: config.list_values(HIDDEN).into_iter().collect(),
             listing: Listing::Normal,
             folder_icon: None,
             frecency: Frecency::load(),
         }
+    }
+
+    /// Reload everything from disk - every plugin, and the hidden set, since
+    /// hand-edits to `[hidden]` count as config too - and return to the
+    /// default list. Behind both `Apex: Reload` and the tray's Reload, so a
+    /// config edit made to recover from an over-eager "Turn Off" takes
+    /// effect either way.
+    pub fn reload(&mut self) {
+        self.mode = Mode::Search;
+        for p in &mut self.plugins {
+            p.refresh();
+        }
+        self.hidden = crate::config::Config::load()
+            .list_values(HIDDEN)
+            .into_iter()
+            .collect();
+        self.listing = Listing::Normal;
+        // Clear back to the default list: the reload is otherwise invisible,
+        // since the query still matches the command row.
+        self.query.clear();
+        self.refresh_results();
     }
 
     /// Rebuild the most-used list just before the window appears.
@@ -228,8 +310,14 @@ impl App {
         self.query.set_caret(pos, select);
     }
 
+    /// Reset for the next summon: search mode, empty query, and the default
+    /// list. The review listings (Hidden, Sources, Manage) are entered by a
+    /// command and must not come back on their own - in the sources view
+    /// Enter writes config rather than launching, so a launcher that
+    /// reopened there would turn a habitual Enter into a silent toggle.
     pub fn clear_query(&mut self) {
         self.mode = Mode::Search;
+        self.listing = Listing::Normal;
         self.query.clear();
         self.refresh_results();
     }
@@ -241,31 +329,52 @@ impl App {
         let Some(item) = self.results.get(self.selected) else {
             return false;
         };
-        // Rows the shell builds itself - source folders - have no owning
-        // plugin. They still get the shell-level action appended below, so a
+        // The sources view is about turning things on and off, not running
+        // them, so it offers only that. Elsewhere the owning plugin's actions
+        // come first; rows the shell builds itself - source folders - have no
+        // owning plugin and still get the shell-level action below, so a
         // missing plugin means "no plugin actions", not "no panel".
-        let mut actions = self
-            .plugins
-            .iter()
-            .find(|p| p.id() == item.plugin)
-            .map(|p| p.actions(item))
-            .unwrap_or_default();
+        let mut actions = if self.listing == Listing::Manage {
+            Vec::new()
+        } else {
+            self.plugins
+                .iter()
+                .find(|p| p.id() == item.plugin)
+                .map(|p| p.actions(item))
+                .unwrap_or_default()
+        };
         // Shell-level, so it is offered on every row whatever produced it,
         // rather than each plugin reimplementing the same entry.
-        actions.push(match self.listing {
-            Listing::Hidden => Action {
+        match self.listing {
+            Listing::Manage => {
+                let off = self.hidden.contains(&key(item.plugin, &item.payload));
+                let source = self.section_title(self.selected);
+                actions.push(Action {
+                    id: ACTION_TOGGLE,
+                    label: if off { "Turn On" } else { "Turn Off" }.to_string(),
+                });
+                actions.push(Action {
+                    id: ACTION_SOURCE_OFF,
+                    label: format!("Turn Off All in {source}"),
+                });
+                actions.push(Action {
+                    id: ACTION_SOURCE_ON,
+                    label: format!("Turn On All in {source}"),
+                });
+            }
+            Listing::Hidden => actions.push(Action {
                 id: ACTION_UNHIDE,
                 label: "Unhide".to_string(),
-            },
-            Listing::Sources => Action {
+            }),
+            Listing::Sources => actions.push(Action {
                 id: ACTION_REMOVE_SOURCE,
                 label: "Remove Source Folder".to_string(),
-            },
-            Listing::Normal => Action {
+            }),
+            Listing::Normal => actions.push(Action {
                 id: ACTION_HIDE,
                 label: "Hide from Apex".to_string(),
-            },
-        });
+            }),
+        }
         self.mode = Mode::Actions {
             actions,
             selected: 0,
@@ -302,6 +411,18 @@ impl App {
             }
             ACTION_REMOVE_SOURCE => {
                 self.remove_source();
+                return UiOutcome::Stay;
+            }
+            ACTION_TOGGLE => {
+                self.toggle_selected();
+                return UiOutcome::Stay;
+            }
+            ACTION_SOURCE_OFF => {
+                self.set_source(true);
+                return UiOutcome::Stay;
+            }
+            ACTION_SOURCE_ON => {
+                self.set_source(false);
                 return UiOutcome::Stay;
             }
             _ => {}
@@ -374,23 +495,14 @@ impl App {
                     self.show_sources();
                     return UiOutcome::Stay;
                 }
+                if cmd == ShellCommand::ShowManage {
+                    self.show_manage();
+                    return UiOutcome::Stay;
+                }
                 UiOutcome::Shell(cmd)
             }
             ActionResult::Refresh => {
-                self.mode = Mode::Search;
-                for p in &mut self.plugins {
-                    p.refresh();
-                }
-                // Hand-edits to [hidden] count as config too.
-                self.hidden = crate::config::Config::load()
-                    .list_values(HIDDEN)
-                    .into_iter()
-                    .collect();
-                self.listing = Listing::Normal;
-                // Clear back to the default list: the reload is otherwise
-                // invisible, since the query still matches the command row.
-                self.query.clear();
-                self.refresh_results();
+                self.reload();
                 UiOutcome::Stay
             }
             ActionResult::RequestText { prompt, action_id } => {
@@ -480,6 +592,7 @@ impl App {
     fn refresh_results(&mut self) {
         self.results.clear();
         self.sections.clear();
+        self.dimmed.clear();
         self.selected = 0;
         self.scroll = 0.0;
         let now = frecency::now();
@@ -496,6 +609,10 @@ impl App {
             }
             Listing::Sources => {
                 self.fill_sources();
+                return;
+            }
+            Listing::Manage => {
+                self.fill_manage();
                 return;
             }
             Listing::Normal => {}
@@ -550,7 +667,7 @@ impl App {
             }
         }
         if !self.results.is_empty() {
-            self.sections.push((0, SUGGESTIONS));
+            self.sections.push((0, SUGGESTIONS.into()));
         }
 
         // Everything else, in each plugin's own order. `browse` skips
@@ -567,7 +684,7 @@ impl App {
         // filtered, so nothing before `commands_start` can be removed.
         self.drop_hidden();
         if self.results.len() > commands_start {
-            self.sections.push((commands_start, COMMANDS));
+            self.sections.push((commands_start, COMMANDS.into()));
         }
         self.results.truncate(MAX_RESULTS);
     }
@@ -597,7 +714,7 @@ impl App {
             }
         }
         if !self.results.is_empty() {
-            self.sections.push((0, "Hidden"));
+            self.sections.push((0, "Hidden".into()));
         }
     }
 
@@ -628,7 +745,7 @@ impl App {
             });
         }
         if !self.results.is_empty() {
-            self.sections.push((0, "Source folders"));
+            self.sections.push((0, "Source folders".into()));
         }
     }
 
@@ -684,16 +801,154 @@ impl App {
         self.refresh_results();
     }
 
+    /// What Enter does to a row, for the bottom bar's hint.
+    pub fn enter_hint(&self) -> &'static str {
+        if self.listing == Listing::Manage {
+            "Toggle"
+        } else {
+            "Open"
+        }
+    }
+
+    /// Switch to the sources view: every source and its items.
+    pub fn show_manage(&mut self) {
+        self.listing = Listing::Manage;
+        self.query.clear();
+        self.refresh_results();
+    }
+
+    /// List every source apex draws from, each as a section of its items,
+    /// marking the ones that are turned off. Apex commands and quicklinks
+    /// first, then each source folder, then the (long) application list.
+    fn fill_manage(&mut self) {
+        let folders = crate::config::Config::load().list_values(crate::config::SOURCES);
+        let mut groups: Vec<(Cow<'static, str>, Vec<ResultItem>)> = Vec::new();
+        let first = ["commands", "quicklinks"];
+        for id in first {
+            if let Some(p) = self.plugins.iter_mut().find(|p| p.id() == id) {
+                let mut items = Vec::new();
+                p.catalogue(&mut items);
+                if !items.is_empty() {
+                    groups.push((source_name(id), items));
+                }
+            }
+        }
+        for p in &mut self.plugins {
+            let id = p.id();
+            if id == SEARCH || first.contains(&id) {
+                continue;
+            }
+            let mut items = Vec::new();
+            p.catalogue(&mut items);
+            if !items.is_empty() {
+                groups.push((source_name(id), items));
+            }
+        }
+        // Applications last, with each source folder's entries split out
+        // under the folder's own heading.
+        if let Some(p) = self.plugins.iter_mut().find(|p| p.id() == SEARCH) {
+            let mut items = Vec::new();
+            p.catalogue(&mut items);
+            let mut per_folder: Vec<(String, Vec<ResultItem>)> =
+                folders.iter().map(|f| (f.clone(), Vec::new())).collect();
+            let mut apps = Vec::new();
+            for item in items {
+                match per_folder
+                    .iter_mut()
+                    .find(|(folder, _)| in_folder(&item.payload, folder))
+                {
+                    Some((_, v)) => v.push(item),
+                    None => apps.push(item),
+                }
+            }
+            for (folder, v) in per_folder {
+                if !v.is_empty() {
+                    groups.push((format!("Folder: {}", folder_name(&folder)).into(), v));
+                }
+            }
+            if !apps.is_empty() {
+                groups.push((source_name(SEARCH), apps));
+            }
+        }
+        for (title, items) in groups {
+            self.sections.push((self.results.len(), title));
+            for mut item in items {
+                let off = self.hidden.contains(&key(item.plugin, &item.payload));
+                item.subtitle = if off { "Off" } else { "On" }.to_string();
+                self.dimmed.push(off);
+                self.results.push(item);
+            }
+        }
+    }
+
+    /// The rows under the heading that `index` falls in.
+    fn section_range(&self, index: usize) -> std::ops::Range<usize> {
+        let start = self
+            .sections
+            .iter()
+            .rev()
+            .find(|(s, _)| *s <= index)
+            .map_or(0, |(s, _)| *s);
+        let end = self
+            .sections
+            .iter()
+            .map(|(s, _)| *s)
+            .filter(|s| *s > index)
+            .min()
+            .unwrap_or(self.results.len());
+        start..end
+    }
+
+    /// The heading that `index` falls under.
+    fn section_title(&self, index: usize) -> String {
+        self.sections
+            .iter()
+            .rev()
+            .find(|(s, _)| *s <= index)
+            .map(|(_, t)| t.to_string())
+            .unwrap_or_default()
+    }
+
+    /// Flip the selected row between on and off.
+    fn toggle_selected(&mut self) {
+        let Some(item) = self.results.get(self.selected) else {
+            return;
+        };
+        let k = key(item.plugin, &item.payload);
+        let hide = !self.hidden.contains(&k);
+        self.set_keys(vec![k], hide);
+    }
+
+    /// Turn every row of the selected row's source on or off.
+    fn set_source(&mut self, hide: bool) {
+        let range = self.section_range(self.selected);
+        let keys = self.results[range]
+            .iter()
+            .map(|i| key(i.plugin, &i.payload))
+            .collect();
+        self.set_keys(keys, hide);
+    }
+
     /// Hide or restore the selected entry, and persist the change.
     fn set_hidden(&mut self, hide: bool) {
         let Some(item) = self.results.get(self.selected) else {
             return;
         };
         let k = key(item.plugin, &item.payload);
-        if hide {
-            self.hidden.insert(k);
-        } else {
-            self.hidden.remove(&k);
+        self.set_keys(vec![k], hide);
+    }
+
+    /// Hide or restore `keys`, persist, and rebuild the list in place. The
+    /// commands that open the Hidden and Sources views can never be hidden:
+    /// they are the way back.
+    fn set_keys(&mut self, keys: Vec<String>, hide: bool) {
+        let keys = if hide { protect(keys) } else { keys };
+        for k in keys {
+            if hide {
+                self.hidden.insert(k);
+            } else {
+                self.hidden.remove(&k);
+            }
         }
         let mut values: Vec<String> = self.hidden.iter().cloned().collect();
         values.sort();
@@ -701,8 +956,15 @@ impl App {
 
         self.mode = Mode::Search;
         let keep = self.selected;
+        let scroll = self.scroll;
         self.refresh_results();
         self.selected = keep.min(self.results.len().saturating_sub(1));
+        // In the sources view rows only change state, never position, so
+        // stay where the user was instead of jumping back to the top.
+        if self.listing == Listing::Manage {
+            self.scroll = scroll;
+            self.ensure_visible();
+        }
     }
 
     // ---- scrolling and hit-testing --------------------------------------
@@ -746,11 +1008,67 @@ impl App {
         self.scroll != before
     }
 
-    /// Row under a client-space y coordinate, in DIPs.
-    pub fn row_at(&self, y: f32) -> Option<usize> {
+    fn scrollbar(&self) -> Option<crate::render::Scrollbar> {
+        crate::render::scrollbar(self.results.len(), self.sections.len(), self.scroll)
+    }
+
+    /// Whether a client point (DIPs) is on the scrollbar: the strip along
+    /// the list's right edge, when the list overflows.
+    pub fn in_scrollbar(&self, x: f32, y: f32) -> bool {
         let list_top = crate::render::INPUT_H + 1.0;
         let (view, _) = self.list_metrics();
-        if y < list_top || y > list_top + view {
+        x >= crate::render::WINDOW_WIDTH - crate::render::SCROLLBAR_HIT_W
+            && y >= list_top
+            && y <= list_top + view
+            && self.scrollbar().is_some()
+    }
+
+    /// Mouse down on the scrollbar at `y`: grab the thumb where it is, or,
+    /// on the track, jump the thumb under the pointer and grab its middle.
+    /// True if the scroll changed.
+    pub fn scrollbar_press(&mut self, y: f32) -> bool {
+        let Some(sb) = self.scrollbar() else {
+            return false;
+        };
+        let on_thumb = y >= sb.thumb_top && y < sb.thumb_top + sb.thumb_h;
+        self.scroll_drag = Some(if on_thumb {
+            y - sb.thumb_top
+        } else {
+            sb.thumb_h / 2.0
+        });
+        if on_thumb { false } else { self.scrollbar_drag(y) }
+    }
+
+    /// Pointer at `y` during a drag: keep the grabbed point of the thumb
+    /// under it. True if the scroll changed.
+    pub fn scrollbar_drag(&mut self, y: f32) -> bool {
+        let Some(grab) = self.scroll_drag else {
+            return false;
+        };
+        let Some(sb) = self.scrollbar() else {
+            return false;
+        };
+        let travel = sb.travel();
+        if travel <= 0.0 {
+            return false;
+        }
+        let progress = ((y - grab - sb.track_top) / travel).clamp(0.0, 1.0);
+        let before = self.scroll;
+        self.scroll = progress * self.max_scroll();
+        self.scroll != before
+    }
+
+    /// End a drag. True if one was in progress.
+    pub fn scrollbar_release(&mut self) -> bool {
+        self.scroll_drag.take().is_some()
+    }
+
+    /// Row under a client-space point, in DIPs. The scrollbar strip is not
+    /// a row: a click there scrolls, it never opens what is under it.
+    pub fn row_at(&self, x: f32, y: f32) -> Option<usize> {
+        let list_top = crate::render::INPUT_H + 1.0;
+        let (view, _) = self.list_metrics();
+        if y < list_top || y > list_top + view || self.in_scrollbar(x, y) {
             return None;
         }
         let target = y - list_top + self.scroll;
@@ -793,6 +1111,11 @@ impl App {
     /// the owning plugin, then apply the outcome - which is also what records
     /// the launch, so Enter and Ctrl+K > Open stay consistent by construction.
     pub fn activate_selected(&mut self) -> UiOutcome {
+        // In the sources view Enter flips the row; nothing is launched.
+        if self.listing == Listing::Manage {
+            self.toggle_selected();
+            return UiOutcome::Stay;
+        }
         let result = self.dispatch(|p, item| p.activate(item));
         self.apply(result)
     }
@@ -831,6 +1154,51 @@ mod tests {
         }
     }
 
+    /// An app whose list overflows the viewport, so it has a scrollbar.
+    fn overflowing() -> App {
+        let mut a = app();
+        a.results = (0..40).map(|_| row("search")).collect();
+        a
+    }
+
+    #[test]
+    fn scrollbar_strip_is_not_a_row() {
+        let a = overflowing();
+        let y = crate::render::INPUT_H + 1.0 + 100.0;
+        let x_bar = crate::render::WINDOW_WIDTH - 6.0;
+        assert!(a.in_scrollbar(x_bar, y));
+        assert!(!a.in_scrollbar(200.0, y));
+        assert_eq!(a.row_at(x_bar, y), None, "a click on the bar must not hit a row");
+        assert!(a.row_at(200.0, y).is_some());
+        // No overflow, no scrollbar: the strip is ordinary row space.
+        let mut short = app();
+        short.results = (0..3).map(|_| row("search")).collect();
+        assert!(!short.in_scrollbar(x_bar, y));
+    }
+
+    #[test]
+    fn pressing_the_track_jumps_and_dragging_follows() {
+        let mut a = overflowing();
+        let sb = a.scrollbar().unwrap();
+        // Press at the very bottom of the track: the thumb jumps under the
+        // pointer, i.e. the list scrolls to the end.
+        assert!(a.scrollbar_press(sb.track_top + sb.track_h));
+        assert!((a.scroll - a.max_scroll()).abs() < 0.01);
+        assert!(a.scroll_drag.is_some());
+        // Drag back to the top of the track: scroll returns to 0.
+        assert!(a.scrollbar_drag(sb.track_top));
+        assert_eq!(a.scroll, 0.0);
+        assert!(a.scrollbar_release());
+        assert!(!a.scrollbar_release(), "release is idempotent");
+        // Pressing on the thumb itself grabs it without moving anything.
+        let sb = a.scrollbar().unwrap();
+        assert!(!a.scrollbar_press(sb.thumb_top + 2.0));
+        assert_eq!(a.scroll, 0.0);
+        // ...and a drag by half the travel scrolls halfway.
+        assert!(a.scrollbar_drag(sb.thumb_top + 2.0 + sb.travel() / 2.0));
+        assert!((a.scroll - a.max_scroll() / 2.0).abs() < 0.5);
+    }
+
     /// Regression: source rows carry no owning plugin, and open_actions used
     /// to bail out when it could not find one - so Ctrl+K did nothing at all.
     #[test]
@@ -854,6 +1222,7 @@ mod tests {
             (Listing::Normal, ACTION_HIDE),
             (Listing::Hidden, ACTION_UNHIDE),
             (Listing::Sources, ACTION_REMOVE_SOURCE),
+            (Listing::Manage, ACTION_TOGGLE),
         ] {
             let mut a = app();
             a.listing = listing;
@@ -890,5 +1259,109 @@ mod tests {
         a.selected = 0;
         a.move_selection(1);
         assert_eq!(a.selected, 1);
+    }
+
+    /// A plugin that stays out of the default list but has a catalogue -
+    /// the shape of apex's own commands.
+    struct Stub;
+    impl Plugin for Stub {
+        fn id(&self) -> &'static str {
+            "stub"
+        }
+        fn query(&mut self, _q: &str, _out: &mut Vec<ResultItem>) {}
+        fn activate(&mut self, _item: &ResultItem) -> ActionResult {
+            ActionResult::Done
+        }
+        fn catalogue(&mut self, out: &mut Vec<ResultItem>) {
+            for name in ["alpha", "beta"] {
+                let mut r = row("stub");
+                r.title = name.into();
+                r.payload = name.into();
+                out.push(r);
+            }
+        }
+    }
+
+    #[test]
+    fn sources_view_catalogues_each_plugin_and_marks_hidden_rows_off() {
+        let mut a = App::new(
+            vec![Box::new(Stub) as Box<dyn Plugin>],
+            &crate::config::Config::from_text(""),
+        );
+        a.hidden.insert("stub/beta".to_string());
+        a.show_manage();
+        assert!(a.listing == Listing::Manage);
+        assert_eq!(a.results.len(), 2, "every catalogued item, hidden or not");
+        assert_eq!(a.sections.len(), 1);
+        assert_eq!(a.sections[0].0, 0);
+        assert_eq!(a.sections[0].1, "stub");
+        assert_eq!(a.results[0].subtitle, "On");
+        assert_eq!(a.results[1].subtitle, "Off");
+        assert_eq!(a.dimmed, vec![false, true]);
+        // Ctrl+K offers the toggle first, worded for the row's state, then
+        // the whole-source switches.
+        a.selected = 1;
+        assert!(a.open_actions());
+        match &a.mode {
+            Mode::Actions { actions, .. } => {
+                assert_eq!(actions[0].id, ACTION_TOGGLE);
+                assert_eq!(actions[0].label, "Turn On");
+                assert_eq!(actions[1].label, "Turn Off All in stub");
+                assert_eq!(actions[2].label, "Turn On All in stub");
+            }
+            _ => panic!("expected the actions panel"),
+        }
+    }
+
+    #[test]
+    fn section_range_covers_the_rows_under_one_heading() {
+        let mut a = app();
+        for _ in 0..5 {
+            a.results.push(row(SHELL));
+        }
+        a.sections = vec![(0, "A".into()), (3, "B".into())];
+        assert_eq!(a.section_range(1), 0..3);
+        assert_eq!(a.section_range(4), 3..5);
+        assert_eq!(a.section_title(4), "B");
+    }
+
+    #[test]
+    fn folder_membership_is_case_insensitive_and_one_level_deep() {
+        assert!(in_folder(r"D:\Tools\x.exe", r"D:\Tools"));
+        assert!(in_folder(r"d:\tools\x.exe", r"D:\Tools\"));
+        assert!(in_folder(r"D:\x.exe", r"D:\"), "drive root as a source");
+        // A nested source folder owns its own entries: the parent must not
+        // claim them, or "Turn Off All" in the parent would hide them too.
+        assert!(!in_folder(r"D:\Tools\Sub\y.exe", r"D:\Tools"));
+        assert!(in_folder(r"D:\Tools\Sub\y.exe", r"D:\Tools\Sub"));
+        assert!(!in_folder(r"D:\Toolsmith\x.exe", r"D:\Tools"));
+        assert!(!in_folder(r"D:\Tools", r"D:\Tools"));
+        assert_eq!(folder_name(r"D:\Portable\Tools"), "Tools");
+    }
+
+    #[test]
+    fn the_recovery_commands_cannot_be_turned_off() {
+        // A request to hide them is dropped; anything else goes through.
+        let keys = protect(vec![
+            "commands/manage".to_string(),
+            "commands/hidden".to_string(),
+            "commands/reload".to_string(),
+        ]);
+        assert_eq!(keys, vec!["commands/reload".to_string()]);
+    }
+
+    #[test]
+    fn dismissing_the_window_leaves_the_sources_view() {
+        let mut a = App::new(
+            vec![Box::new(Stub) as Box<dyn Plugin>],
+            &crate::config::Config::from_text(""),
+        );
+        a.show_manage();
+        assert!(a.listing == Listing::Manage);
+        // What hide() calls: the next summon must open on the default list,
+        // where Enter launches rather than toggles.
+        a.clear_query();
+        assert!(a.listing == Listing::Normal);
+        assert!(a.dimmed.is_empty());
     }
 }

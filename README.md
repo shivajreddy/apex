@@ -12,7 +12,7 @@ Ultra-fast, ultra-lightweight launcher for Windows. Raycast, but native.
 
 ## Status
 
-`v0.5.1`, pre-release. Working today: global hotkey (runs elevated so it works
+`v0.6.0`, pre-release. Working today: global hotkey (runs elevated so it works
 over admin windows), fuzzy app search with icons (desktop + Store apps),
 frecency ranking, quicklinks, apex commands, a tray icon, aliases, an actions
 panel, and a live acrylic backdrop. See [ROADMAP.md](ROADMAP.md) for
@@ -80,7 +80,8 @@ Start-Process "$env:LOCALAPPDATA\Programs\Apex\apex.exe"
 | `Tab` | next field, in forms |
 
 The mouse works too: hover to highlight, click to launch, wheel to scroll,
-click in the query to place the caret.
+drag the scrollbar (or click its track to jump), click in the query to place
+the caret.
 
 Summoning apex with an empty query lists your most-used entries under
 `Suggestions`, then everything else - every app, quicklink and command -
@@ -139,6 +140,13 @@ uninstallers and bundled helpers you will never launch. `Ctrl+K` on any row
 offers **Hide from Apex**; `Apex: Manage Hidden Entries` lists what you hid,
 with **Unhide** to put it back.
 
+For the whole picture, `Apex: Sources & Commands` lists every source apex
+draws from - its own commands, quicklinks, each source folder, and the
+applications - as sections, with each entry marked **On** or **Off**. `Enter`
+flips the highlighted entry (turned-off rows are drawn faded), and `Ctrl+K`
+also offers **Turn Off All** / **Turn On All** for that source. It is the
+same switch as hiding: an entry that is off never appears in results.
+
 ### Source folders
 
 Portable apps and loose scripts never get a Start Menu entry, so apex cannot
@@ -174,6 +182,7 @@ hidden synonyms (`startup` finds Toggle Start at Login, `exit` finds Quit).
 | `Apex: Add Source Folder` | index an extra folder of apps and scripts |
 | `Apex: Manage Source Folders` | review source folders, and remove them |
 | `Apex: Manage Hidden Entries` | review what you have hidden, and restore it |
+| `Apex: Sources & Commands` | every source and its items, each with an on/off switch |
 
 Reload picks up hand-edits to `config.toml`, so editing it in your dotfiles
 and reloading is enough. `[general]` and `[hotkey]` still need a restart.
