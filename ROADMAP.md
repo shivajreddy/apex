@@ -56,7 +56,7 @@ of private memory; reading the index file adds none.
   self-rendered frost is there on the first frame, every summon, on any
   Windows version. `[appearance] backdrop = "none"` paints it solid;
   `opacity` sets the tint strength over the blur.
-- Instant show and hide by default. An optional 110 ms scale-and-fade
+- Instant show and hide by default. An optional 110 ms fade-in
   settle is available with `[appearance] animation = true`, but off by
   default — an instant summon reads as snappier.
 - Light and dark palettes, following Windows' app theme setting at each

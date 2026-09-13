@@ -1,23 +1,22 @@
 //! Direct2D + DirectWrite rendering. All layout is in logical DIPs; the
 //! render target is DPI-aware so drawing scales per-monitor automatically.
 //!
-//! The scene is drawn into a 32-bit DIB with real per-pixel alpha and handed
-//! to the window with `UpdateLayeredWindow`. When translucent, the window
-//! pixels are left clear where the background would be, so the live DWM
-//! acrylic set on the HWND (see `window::set_acrylic`) blurs whatever is
-//! behind the window in real time. The DIB route creates no swap chain, so
-//! it is cheaper than an hwnd target.
+//! The scene is drawn into a 32-bit premultiplied DIB and copied into the
+//! window in `WM_PAINT` (see [`Renderer::blit`]). DWM honours the DIB's
+//! alpha (see `window::enable_backdrop`), so wherever the frame is
+//! transparent the compositor's live blur shows through - when translucent
+//! the background is just a tint over it. Software Direct2D into a DIB
+//! creates no swap chain, so it is cheaper than an hwnd target.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use windows::Win32::Foundation::{COLORREF, D2DERR_RECREATE_TARGET, HWND, POINT, RECT, SIZE};
+use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 
 use crate::editor::{FormEntry, TextField};
@@ -36,10 +35,6 @@ const BAR_H: f32 = 34.0;
 pub const HEADER_H: f32 = 26.0;
 // Gap between the title and the dimmed category that follows it.
 const CATEGORY_GAP: f32 = 8.0;
-// Alpha of the otherwise-invisible background fill under the live acrylic:
-// enough that the layered window catches mouse events (a 0-alpha pixel is
-// click-through), far too little to dim the blur. 2/255 survives rounding.
-const HIT_TEST_ALPHA: f32 = 2.0 / 255.0;
 // Alias pill drawn immediately after a result's title (and category).
 const BADGE_H: f32 = 20.0;
 const BADGE_PAD_X: f32 = 8.0;
@@ -52,11 +47,15 @@ const PANEL_PAD: f32 = 6.0;
 const PANEL_MARGIN: f32 = 8.0;
 /// Width of the text caret.
 const CARET_W: f32 = 2.0;
-// Scrollbar: a thin rounded thumb on the right edge of the list.
-const SCROLLBAR_W: f32 = 4.0;
+// Scrollbar: a rounded thumb on a faint track at the right edge of the list,
+// Raycast-style - shown only when the list overflows.
+const SCROLLBAR_W: f32 = 6.0;
 const SCROLLBAR_MARGIN: f32 = 4.0;
 const SCROLLBAR_PAD: f32 = 4.0;
-const SCROLLBAR_MIN_THUMB: f32 = 28.0;
+const SCROLLBAR_MIN_THUMB: f32 = 36.0;
+/// The thumb's halo, in the opposite polarity to the thumb, so it stays
+/// legible whether the backdrop behind it is light or dark.
+const SCROLLBAR_HALO: f32 = 1.0;
 
 // Forms stack a dim label over an editable value, so they need more width
 // than the actions panel - links in particular are long.
@@ -145,20 +144,16 @@ pub enum PanelView<'a> {
     },
 }
 
-/// Where the frame goes on screen, in physical pixels.
+/// The frame's size on screen, in physical pixels.
 pub struct Placement {
-    pub x: i32,
-    pub y: i32,
     pub width: u32,
     pub height: u32,
     pub dpi: f32,
     /// Opacity of everything drawn, tint included, `0..=1`; the summon
-    /// animation ramps it. Applied per pixel rather than as the layered
-    /// window's constant alpha, because a constant alpha below 255 makes the
-    /// compositor drop the blur and show the desktop through sharply.
+    /// animation ramps it, per pixel.
     pub opacity: f32,
-    /// Uniform scale about the window's centre, `0 < scale <= 1`; the
-    /// summon animation grows it to 1.
+    /// Uniform scale of the scene, `0 < scale <= 1`, drawn into the DIB's
+    /// top-left corner. Always 1 today: the window is painted in place.
     pub scale: f32,
 }
 
@@ -175,10 +170,9 @@ const fn rgba(rgb: u32, a: f32) -> D2D1_COLOR_F {
 /// The colours of one appearance. Two exist, following Windows' light/dark
 /// setting for apps; `[appearance] theme` pins either.
 pub struct Palette {
-    /// Solid window background, used only when the backdrop is "none". With
-    /// acrylic the compositor paints the tint (see `window::acrylic_color`)
-    /// and the window pixels here are left clear, so only the RGB matters -
-    /// the fill forces full alpha.
+    /// Window background colour. Painted opaque when there is no live blur,
+    /// and as a tint at `[appearance] opacity` over the blur otherwise, so
+    /// only the RGB matters here - the alpha is set at brush creation.
     background: D2D1_COLOR_F,
     text: D2D1_COLOR_F,
     dim: D2D1_COLOR_F,
@@ -195,14 +189,15 @@ pub struct Palette {
     /// reads as frosted even over a dark backdrop, where the blur alone is
     /// invisible.
     border: D2D1_COLOR_F,
-    /// The scrollbar thumb.
+    /// The scrollbar thumb, its faint track, and the thumb's halo (opposite
+    /// polarity, so the thumb reads over a light or a dark backdrop).
     scrollbar: D2D1_COLOR_F,
+    scrollbar_track: D2D1_COLOR_F,
+    scrollbar_halo: D2D1_COLOR_F,
 }
 
-// `background` is the solid fill for backdrop = "none"; its alpha is ignored
-// (the fill forces full opacity). With acrylic the compositor paints the tint
-// behind the clear window, so over a dark desktop the blur is just dark - the
-// rim below is what keeps it reading as glass rather than a solid slab.
+// Over a dark desktop a dark tint on a dark blur is just dark, so the rim
+// below is what keeps the window reading as glass rather than a solid slab.
 const DARK: Palette = Palette {
     background: rgba(0x121216, 0.50),
     text: rgba(0xF4F4F6, 1.0),
@@ -214,7 +209,9 @@ const DARK: Palette = Palette {
     badge_fg: rgba(0xF4F4F6, 0.65),
     selection: rgba(0x4C8DFF, 0.45),
     border: rgba(0xFFFFFF, 0.12),
-    scrollbar: rgba(0xFFFFFF, 0.28),
+    scrollbar: rgba(0xFFFFFF, 0.50),
+    scrollbar_track: rgba(0xFFFFFF, 0.06),
+    scrollbar_halo: rgba(0x000000, 0.22),
 };
 
 const LIGHT: Palette = Palette {
@@ -228,7 +225,9 @@ const LIGHT: Palette = Palette {
     badge_fg: rgba(0x1B1B1F, 0.70),
     selection: rgba(0x3B82F6, 0.35),
     border: rgba(0x000000, 0.14),
-    scrollbar: rgba(0x000000, 0.30),
+    scrollbar: rgba(0x000000, 0.42),
+    scrollbar_track: rgba(0x000000, 0.06),
+    scrollbar_halo: rgba(0xFFFFFF, 0.30),
 };
 
 pub struct Renderer {
@@ -242,12 +241,14 @@ pub struct Renderer {
     fmt_badge: IDWriteTextFormat,
     fmt_header: IDWriteTextFormat,
     palette: &'static Palette,
-    /// The palette's background, used only for the solid (non-acrylic) fill.
+    /// The palette's background: the solid fill when there is no blur, and
+    /// the RGB of the tint over it when there is.
     background: D2D1_COLOR_F,
-    /// Whether the compositor is providing a live acrylic blur behind the
-    /// window. When true the window background is left transparent so the
-    /// blur shows; when false it is filled solid.
+    /// Whether the compositor is providing a live blur behind the window.
+    /// When true the background is a tint over it; when false, solid.
     translucent: bool,
+    /// Alpha of that tint, `[appearance] opacity`.
+    tint: f32,
     target: Option<Target>,
 }
 
@@ -274,7 +275,11 @@ struct Brushes {
     selection: ID2D1SolidColorBrush,
     border: ID2D1SolidColorBrush,
     scrollbar: ID2D1SolidColorBrush,
-    /// The opaque window fill, used only when acrylic is off.
+    scrollbar_track: ID2D1SolidColorBrush,
+    scrollbar_halo: ID2D1SolidColorBrush,
+    /// The tint over the live blur when translucent.
+    bg_tint: ID2D1SolidColorBrush,
+    /// The opaque window fill, used only when the blur is off.
     bg_solid: ID2D1SolidColorBrush,
 }
 
@@ -333,10 +338,11 @@ impl Drop for Dib {
 }
 
 impl Renderer {
-    /// `translucent` leaves the window background transparent so the
-    /// compositor's acrylic blur shows; without it the window is painted
-    /// solid. `dark` picks the palette.
-    pub fn new(translucent: bool, dark: bool) -> Result<Self> {
+    /// `translucent` means the compositor is blurring behind the window, so
+    /// the background is painted as a tint at `tint` (`[appearance]
+    /// opacity`, default 0.5) over it; otherwise it is painted solid. `dark`
+    /// picks the palette.
+    pub fn new(translucent: bool, dark: bool, tint: Option<f32>) -> Result<Self> {
         unsafe {
             let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
@@ -389,6 +395,7 @@ impl Renderer {
                 palette,
                 background: palette.background,
                 translucent,
+                tint: tint.unwrap_or(0.5).clamp(0.0, 1.0),
                 target: None,
             })
         }
@@ -440,6 +447,7 @@ impl Renderer {
             };
             let p = self.palette;
             let bg = self.background;
+            let tint = self.tint;
             self.target = Some(Target {
                 brushes: Brushes {
                     text: brush(&p.text)?,
@@ -452,6 +460,9 @@ impl Renderer {
                     selection: brush(&p.selection)?,
                     border: brush(&p.border)?,
                     scrollbar: brush(&p.scrollbar)?,
+                    scrollbar_track: brush(&p.scrollbar_track)?,
+                    scrollbar_halo: brush(&p.scrollbar_halo)?,
+                    bg_tint: brush(&D2D1_COLOR_F { a: tint, ..bg })?,
                     bg_solid: brush(&D2D1_COLOR_F { a: 1.0, ..bg })?,
                 },
                 icons: HashMap::new(),
@@ -517,39 +528,36 @@ impl Renderer {
                 self.target = None;
                 return;
             }
-            let Some(t) = &self.target else { return };
+            if self.target.is_none() {
+                return;
+            }
             // GDI-compatible target: make sure the DIB bits are final before
             // the window reads them.
             let _ = GdiFlush();
+            // Mark the window dirty; the caller pumps the paint (see
+            // `window::repaint`) once it no longer holds the App, since
+            // WM_PAINT fetches it again.
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
 
-            // The window shrinks about its centre while scaling; the content
-            // was drawn scaled into the top-left corner of the DIB.
-            let w = (place.width as f32 * place.scale).round().max(1.0) as i32;
-            let h = (place.height as f32 * place.scale).round().max(1.0) as i32;
-            let dst = POINT {
-                x: place.x + (place.width as i32 - w) / 2,
-                y: place.y + (place.height as i32 - h) / 2,
-            };
-            let size = SIZE { cx: w, cy: h };
-            let src = POINT { x: 0, y: 0 };
-            let blend = BLENDFUNCTION {
-                BlendOp: AC_SRC_OVER as u8,
-                BlendFlags: 0,
-                SourceConstantAlpha: 255,
-                AlphaFormat: AC_SRC_ALPHA as u8,
-            };
-            if let Err(e) = UpdateLayeredWindow(
-                hwnd,
-                None,
-                Some(&dst),
-                Some(&size),
-                Some(t.dib.hdc),
-                Some(&src),
-                COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
-            ) {
-                crate::dlog!("present: UpdateLayeredWindow failed: {e}");
+    /// Copy the last drawn frame into `hdc`, the window's paint DC. The DIB
+    /// is premultiplied BGRA and `BitBlt` copies its alpha verbatim, which DWM
+    /// honours for this window (see `window::enable_backdrop`).
+    pub fn blit(&self, hdc: HDC) {
+        if let Some(t) = &self.target {
+            unsafe {
+                let _ = BitBlt(
+                    hdc,
+                    0,
+                    0,
+                    t.dib.width as i32,
+                    t.dib.height as i32,
+                    Some(t.dib.hdc),
+                    0,
+                    0,
+                    SRCCOPY,
+                );
             }
         }
     }
@@ -582,9 +590,9 @@ impl Renderer {
         let rt = &t.rt;
         let b = &t.brushes;
         unsafe {
-            // The summon animation scales the scene by drawing it at a
-            // proportionally lower DPI, which shrinks everything uniformly
-            // into the DIB's top-left corner - the part `present` shows.
+            // `scale` is 1 today (the summon animation only fades); a lower
+            // value would draw the scene at a proportionally lower DPI,
+            // shrinking it uniformly into the DIB's top-left corner.
             let dpi = t.dpi * place.scale;
             rt.SetDpi(dpi, dpi);
             // And fades it by drawing everything, tint included, with less
@@ -601,7 +609,12 @@ impl Renderer {
                 &b.selection,
                 &b.border,
                 &b.scrollbar,
-                &b.bg_solid,
+                &b.scrollbar_track,
+                &b.scrollbar_halo,
+                &b.bg_tint,
+                // Not bg_solid: without a backdrop the window's alpha is
+                // ignored, so a faded fill would show as a darkened slab
+                // rather than a fade. The foreground fades in over it.
             ] {
                 brush.SetOpacity(opacity);
             }
@@ -618,17 +631,9 @@ impl Renderer {
             rt.BeginDraw();
             rt.Clear(None);
             if translucent {
-                // The live compositor acrylic (set on the HWND via
-                // SetWindowCompositionAttribute) shows through the window, so
-                // we do not paint a background over it. But a layered window
-                // passes mouse messages through any pixel whose alpha is 0 -
-                // a fully clear background would send the wheel and clicks to
-                // whatever is behind apex. So lay down an all-but-invisible
-                // fill (alpha ~1/255): the blur still reads through it, but
-                // every pixel is now opaque enough to catch the mouse.
-                b.bg_solid.SetOpacity(HIT_TEST_ALPHA);
-                rt.FillRectangle(&full, &b.bg_solid);
-                b.bg_solid.SetOpacity(1.0);
+                // The compositor's live blur shows through wherever the frame
+                // is transparent; this is the tint over it.
+                rt.FillRectangle(&full, &b.bg_tint);
             } else {
                 rt.FillRectangle(&full, &b.bg_solid);
             }
@@ -824,19 +829,45 @@ impl Renderer {
                     let thumb_top = track_top + travel * progress;
                     let x1 = width - SCROLLBAR_MARGIN;
                     let x0 = x1 - SCROLLBAR_W;
+                    let r = SCROLLBAR_W / 2.0;
+                    let pill = |rect: D2D_RECT_F, radius: f32| D2D1_ROUNDED_RECT {
+                        rect,
+                        radiusX: radius,
+                        radiusY: radius,
+                    };
+                    // Faint track the whole viewport tall: the gutter reads
+                    // as one even when the thumb is small.
                     rt.FillRoundedRectangle(
-                        &D2D1_ROUNDED_RECT {
-                            rect: D2D_RECT_F {
+                        &pill(
+                            D2D_RECT_F {
                                 left: x0,
-                                top: thumb_top,
+                                top: track_top,
                                 right: x1,
-                                bottom: thumb_top + thumb_h,
+                                bottom: track_top + track_h,
                             },
-                            radiusX: SCROLLBAR_W / 2.0,
-                            radiusY: SCROLLBAR_W / 2.0,
-                        },
-                        &b.scrollbar,
+                            r,
+                        ),
+                        &b.scrollbar_track,
                     );
+                    let thumb = D2D_RECT_F {
+                        left: x0,
+                        top: thumb_top,
+                        right: x1,
+                        bottom: thumb_top + thumb_h,
+                    };
+                    rt.FillRoundedRectangle(
+                        &pill(
+                            D2D_RECT_F {
+                                left: thumb.left - SCROLLBAR_HALO,
+                                top: thumb.top - SCROLLBAR_HALO,
+                                right: thumb.right + SCROLLBAR_HALO,
+                                bottom: thumb.bottom + SCROLLBAR_HALO,
+                            },
+                            r + SCROLLBAR_HALO,
+                        ),
+                        &b.scrollbar_halo,
+                    );
+                    rt.FillRoundedRectangle(&pill(thumb, r), &b.scrollbar);
                 }
 
                 // Bottom bar with key hints.

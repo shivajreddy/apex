@@ -12,7 +12,7 @@ Ultra-fast, ultra-lightweight launcher for Windows. Raycast, but native.
 
 ## Status
 
-`v0.5.0`, pre-release. Working today: global hotkey (runs elevated so it works
+`v0.5.1`, pre-release. Working today: global hotkey (runs elevated so it works
 over admin windows), fuzzy app search with icons (desktop + Store apps),
 frecency ranking, quicklinks, apex commands, a tray icon, aliases, an actions
 panel, and a live acrylic backdrop. See [ROADMAP.md](ROADMAP.md) for
@@ -193,7 +193,7 @@ tray_icon = true         # tray icon: Open / Reload / Open Config / Quit
 backdrop = "acrylic"     # blur what's behind the window; "none" for solid
 theme = "system"         # follow Windows' light/dark setting; or "dark", "light"
 opacity = 0.5            # tint over the blur: 0.0 clear .. 1.0 solid
-animation = true         # scale-and-fade on summon; false shows it instantly
+animation = true         # fade in on summon; false shows it instantly
 
 [hotkey]
 modifiers = "ctrl"       # ctrl, alt, shift, win, joined with '+'; or "none"
@@ -205,11 +205,13 @@ quicklinks = true
 commands = true
 ```
 
-The frosted background is the desktop compositor's live acrylic blur, asked
-for on the window itself (`SetWindowCompositionAttribute` with
-`ACCENT_ENABLE_ACRYLICBLURBEHIND`). It updates in real time — a video, a
-window change or a workspace switch behind apex all blur through live, not a
-frozen snapshot. Use `opacity` to set how much of it shows through the tint.
+The frosted background is Windows 11's own system backdrop
+(`DWMWA_SYSTEMBACKDROP_TYPE`, the same material Flow Launcher and PowerToys
+use), composited live by DWM behind an ordinary window: a video, a window
+change or a workspace switch behind apex blurs through as it happens, and it
+is there on the very first frame of every summon. `opacity` is the tint apex
+paints over it. On Windows before 22H2 (22621) apex falls back to the older
+blur-behind; with "Transparency effects" off, Windows draws it as a flat tint.
 
 Apex only ever rewrites the sections it owns - `[aliases]`, `[quicklinks.*]`,
 `[sources]`, `[hidden]`, and single `[general]` keys - by line surgery. Every

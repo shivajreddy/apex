@@ -40,8 +40,8 @@ theme = "system"
 # shows more of the blurred desktop; higher is more opaque. Ignored when
 # backdrop = "none".
 opacity = 0.5
-# Scale-and-fade the window in when summoned. Off by default - an instant
-# show feels snappier. Set true to enable it.
+# Fade the window in when summoned. Off by default - an instant show feels
+# snappier. Set true to enable it.
 animation = false
 
 [hotkey]

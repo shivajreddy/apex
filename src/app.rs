@@ -86,7 +86,7 @@ pub struct App {
     /// window, in which case the background is painted as a tint rather
     /// than solid.
     pub translucent: bool,
-    /// Play the short scale-and-fade when summoned.
+    /// Play the short fade-in when summoned.
     pub animate: bool,
     /// `[appearance] theme` pinned to dark (`Some(true)`) or light; `None`
     /// follows Windows' setting for apps, re-read on every show.
@@ -168,7 +168,7 @@ impl App {
     /// Get the renderer, creating it if needed (first show or after hide).
     pub fn ensure_renderer(&mut self) -> Option<&mut Renderer> {
         if self.renderer.is_none() {
-            match Renderer::new(self.translucent, self.dark) {
+            match Renderer::new(self.translucent, self.dark, self.tint) {
                 Ok(r) => self.renderer = Some(r),
                 Err(e) => {
                     crate::dlog!("renderer creation failed: {e}");

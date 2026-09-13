@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering:
 
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::*;
+use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
@@ -98,17 +99,21 @@ static HOOK_THREAD: AtomicU32 = AtomicU32::new(0);
 static APP_ICON: AtomicIsize = AtomicIsize::new(0);
 /// Whether the tray icon is currently registered.
 static TRAY_SHOWN: AtomicBool = AtomicBool::new(false);
-/// Whether the acrylic backdrop is in use, so `show` can re-assert it: the
-/// DWM system backdrop is not reliably kept across a hide/re-show and has to
-/// be re-applied each time the window comes back.
-static ACRYLIC: AtomicBool = AtomicBool::new(false);
 /// Last WM_MOUSEMOVE lparam, so a stationary pointer is not treated as hover.
 static LAST_MOUSE: AtomicIsize = AtomicIsize::new(-1);
 
 pub fn run(config: &crate::config::Config) -> Result<()> {
     unsafe {
-        // Single instance: bail silently if apex is already running.
-        let mutex = CreateMutexW(None, true, w!("Local\\apex-launcher-mutex"))?;
+        // Single instance: bail silently if apex is already running. A dev
+        // build (APEX_NO_MANIFEST, see build.rs) takes a different name so it
+        // can run beside the installed apex for local UI testing - the
+        // installed one is elevated and cannot be stopped from a normal shell.
+        let name = if option_env!("APEX_NO_MANIFEST").is_some() {
+            w!("Local\\apex-launcher-mutex-dev")
+        } else {
+            w!("Local\\apex-launcher-mutex")
+        };
+        let mutex = CreateMutexW(None, true, name)?;
         if GetLastError() == ERROR_ALREADY_EXISTS {
             return Ok(());
         }
@@ -154,13 +159,14 @@ pub fn run(config: &crate::config::Config) -> Result<()> {
         }
 
         // WS_EX_TOOLWINDOW keeps apex out of the taskbar and Alt+Tab.
-        // WS_EX_LAYERED: the window is presented as a per-pixel-alpha bitmap
-        // (see `render`), which is what lets the compositor blur behind it.
+        // WS_CAPTION is there only so DWM will put its live backdrop behind
+        // the window (see `enable_backdrop`): no frame is ever laid out.
+        // Deliberately not WS_EX_LAYERED - see the backdrop section.
         let hwnd = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED,
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             class_name,
             w!("Apex"),
-            WS_POPUP,
+            WS_POPUP | WS_CAPTION,
             0,
             0,
             0,
@@ -179,23 +185,16 @@ pub fn run(config: &crate::config::Config) -> Result<()> {
             &corner as *const _ as *const core::ffi::c_void,
             size_of_val(&corner) as u32,
         );
-        // Acrylic is the compositor's live blur (see `set_acrylic`), applied
-        // per-show. This flag just says whether to ask for it, and the
-        // renderer leaves the background transparent so the blur shows.
-        let translucent = config.acrylic();
-        ACRYLIC.store(translucent, Relaxed);
-
         // Attach application state to the window.
         let mut app = Box::new(App::new(crate::plugins(config), config));
-        app.translucent = translucent;
         app.dark = app.forced_dark.unwrap_or_else(|| !system_light_theme());
-        let dark = BOOL(app.dark as i32);
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_USE_IMMERSIVE_DARK_MODE,
-            &dark as *const _ as *const core::ffi::c_void,
-            size_of_val(&dark) as u32,
-        );
+        // Theme first: the backdrop's material is chosen by it.
+        set_dark_mode(hwnd, app.dark);
+        // Neutralise the WS_CAPTION whether or not a backdrop is used, then
+        // ask for the live backdrop if configured (see `enable_backdrop`).
+        // If the system can't provide one, the renderer paints solid.
+        prepare_frame(hwnd);
+        app.translucent = config.acrylic() && enable_backdrop(hwnd);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
 
         if config.general_flag("tray_icon", true) {
@@ -264,21 +263,135 @@ fn spawn_hook_thread() -> std::thread::JoinHandle<()> {
     })
 }
 
-// --- Live acrylic backdrop -------------------------------------------------
+// --- Live backdrop ---------------------------------------------------------
 //
-// The backdrop is the compositor's, not ours: SetWindowCompositionAttribute
-// with ACCENT_ENABLE_ACRYLICBLURBEHIND asks DWM to blur whatever is behind the
-// window, live - a video, another window, a workspace switch all update in
-// real time, which a captured snapshot cannot. Same accent policy Windows
-// Terminal and Flow Launcher use; unlike DWMWA_SYSTEMBACKDROP_TYPE it composes
-// under our layered window. The entry point is an undocumented user32 export,
-// resolved by name.
+// The frosted background is the compositor's, not ours, and it is live: DWM
+// re-samples whatever is behind the window every frame, so a video, another
+// window or a workspace switch behind apex blurs through as it happens.
+//
+// It is the documented Windows 11 system backdrop (DWMWA_SYSTEMBACKDROP_TYPE,
+// the material Flow Launcher and PowerToys use) on an ordinary, non-layered
+// window. Three things make that work which are easy to get wrong - each
+// cost an earlier attempt:
+//  * DWM silently ignores the attribute on a frameless WS_POPUP. The window
+//    carries WS_CAPTION purely so DWM treats it as framed; WM_NCCALCSIZE
+//    returns 0 so no frame is laid out, and WM_NCHITTEST answers HTCLIENT
+//    everywhere so nothing behaves like a caption.
+//  * DWM flattens the material to a solid tint on a window it considers
+//    inactive, and some show paths reset that state: WM_NCACTIVATE is always
+//    answered as "active", and re-asserted after every show.
+//  * A normal window can't be painted while hidden, and DWM composes a new
+//    window before its first paint: show() cloaks, shows, paints, uncloaks.
+// The window's own pixels are a premultiplied DIB copied in with BitBlt; DWM
+// honours their alpha because the frame is extended over the whole client
+// area (and, on 26100+, DWMWA_REDIRECTIONBITMAP_ALPHA says so explicitly).
+// A layered window (UpdateLayeredWindow) is deliberately NOT used: the
+// undocumented accent policy over one only refreshed its blur when we
+// repainted, which read as a frozen snapshot.
+//
+// Windows before 22621 has no system backdrop; there the accent policy's
+// plain blur is used, and if that is unavailable too the window paints
+// itself solid.
+
+/// `DWMWA_REDIRECTIONBITMAP_ALPHA` (Windows 11 26100+): the window's
+/// redirection bitmap carries premultiplied alpha. Not in `windows` 0.62.
+const DWMWA_REDIRECTIONBITMAP_ALPHA: DWMWINDOWATTRIBUTE = DWMWINDOWATTRIBUTE(39);
+
+unsafe fn dwm_set<T>(hwnd: HWND, attr: DWMWINDOWATTRIBUTE, value: &T) -> bool {
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            attr,
+            value as *const T as *const core::ffi::c_void,
+            size_of::<T>() as u32,
+        )
+        .is_ok()
+    }
+}
+
+/// Pick the backdrop's dark or light material. Set before the backdrop
+/// type, and again whenever the theme changes.
+unsafe fn set_dark_mode(hwnd: HWND, dark: bool) {
+    unsafe {
+        dwm_set(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &BOOL(dark as i32));
+    }
+}
+
+/// Neutralise the WS_CAPTION the window carries for DWM's sake: no border,
+/// no caption colour, no DWM show/hide fade. Unconditional - the style is
+/// there whether or not a backdrop is in use.
+unsafe fn prepare_frame(hwnd: HWND) {
+    unsafe {
+        dwm_set(hwnd, DWMWA_BORDER_COLOR, &DWMWA_COLOR_NONE);
+        dwm_set(hwnd, DWMWA_CAPTION_COLOR, &DWMWA_COLOR_NONE);
+        dwm_set(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, &BOOL(1));
+        frame_changed(hwnd);
+    }
+}
+
+/// DWM applies attribute changes lazily to a window whose size did not
+/// change; a no-op frame change makes it take them now.
+unsafe fn frame_changed(hwnd: HWND) {
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+    }
+}
+
+/// Ask the compositor for a live blur behind the window. Returns whether one
+/// is in place; when false the renderer paints a solid background instead.
+unsafe fn enable_backdrop(hwnd: HWND) -> bool {
+    unsafe {
+        // Sheet of glass: the whole client area counts as frame, so DWM
+        // composes our pixels with their alpha instead of as opaque.
+        let glass = MARGINS {
+            cxLeftWidth: -1,
+            cxRightWidth: -1,
+            cyTopHeight: -1,
+            cyBottomHeight: -1,
+        };
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &glass);
+        dwm_set(hwnd, DWMWA_REDIRECTIONBITMAP_ALPHA, &BOOL(1));
+        let live = dwm_set(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &DWMSBT_TRANSIENTWINDOW)
+            || set_accent_blur(hwnd);
+        frame_changed(hwnd);
+        live
+    }
+}
+
+/// Tell DWM to render the window as active. The system backdrop is
+/// flattened to a solid tint on an "inactive" window, and some show paths
+/// reset that state right after SWP_SHOWWINDOW. A rendering hint only; real
+/// focus is unaffected.
+unsafe fn nc_activate(hwnd: HWND) {
+    unsafe {
+        SendMessageW(hwnd, WM_NCACTIVATE, Some(WPARAM(1)), Some(LPARAM(0)));
+    }
+}
+
+/// Hide the window from the user while DWM keeps composing it.
+unsafe fn cloak(hwnd: HWND, on: bool) {
+    unsafe {
+        dwm_set(hwnd, DWMWA_CLOAK, &BOOL(on as i32));
+    }
+}
+
+// Fallback for Windows before the system backdrop existed: the accent policy,
+// an undocumented user32 export resolved by name. Plain blur (state 3), not
+// the acrylic variant (4), whose backdrop only re-renders when the window is
+// invalidated.
 
 #[repr(C)]
 struct AccentPolicy {
     state: u32,
     flags: u32,
-    /// AABBGGRR: the tint painted over the blur.
     gradient_color: u32,
     animation_id: u32,
 }
@@ -290,25 +403,10 @@ struct CompositionAttribData {
     size: usize,
 }
 
-const ACCENT_ENABLE_ACRYLICBLURBEHIND: u32 = 4;
+const ACCENT_ENABLE_BLURBEHIND: u32 = 3;
 const WCA_ACCENT_POLICY: u32 = 19;
 
-/// The tint painted over the live blur, `AABBGGRR`, from the palette colour
-/// and the `[appearance] opacity` config.
-fn acrylic_color(dark: bool, tint: Option<f32>) -> u32 {
-    let (r, g, b): (u32, u32, u32) = if dark {
-        (0x12, 0x12, 0x16)
-    } else {
-        (0xF6, 0xF6, 0xF8)
-    };
-    let a = (tint.unwrap_or(0.5).clamp(0.0, 1.0) * 255.0) as u32;
-    (a << 24) | (b << 16) | (g << 8) | r
-}
-
-/// Turn on the compositor's acrylic blur behind the window, tinted with
-/// `color`. Returns whether the entry point was found and the call succeeded.
-/// Applied on each show so it survives a hide/re-show.
-unsafe fn set_acrylic(hwnd: HWND, color: u32) -> bool {
+unsafe fn set_accent_blur(hwnd: HWND) -> bool {
     unsafe {
         type SetAttr = unsafe extern "system" fn(HWND, *mut CompositionAttribData) -> BOOL;
         let Ok(user32) = GetModuleHandleW(w!("user32.dll")) else {
@@ -319,9 +417,9 @@ unsafe fn set_acrylic(hwnd: HWND, color: u32) -> bool {
         };
         let set_attr: SetAttr = std::mem::transmute(proc);
         let mut accent = AccentPolicy {
-            state: ACCENT_ENABLE_ACRYLICBLURBEHIND,
+            state: ACCENT_ENABLE_BLURBEHIND,
             flags: 0,
-            gradient_color: color,
+            gradient_color: 0,
             animation_id: 0,
         };
         let mut data = CompositionAttribData {
@@ -472,11 +570,12 @@ unsafe fn app_mut(hwnd: HWND) -> Option<&'static mut App> {
 
 /// Draw the current state and put it on screen.
 ///
-/// Layered windows are not painted through `WM_PAINT`: the whole bitmap is
-/// handed over in one call, which also positions and sizes the window, so
-/// this is where the height follows the content and where the summon
-/// animation's scale and opacity are applied. Called directly wherever the
-/// old design invalidated; each call is well under a millisecond.
+/// Draws the frame into the renderer's DIB, first resizing the window to the
+/// frame if the content height changed, then pumps a synchronous `WM_PAINT`
+/// that copies the DIB in (`Renderer::blit`). That `UpdateWindow` is issued
+/// only after this function's `App` borrow is over, because `WM_PAINT`
+/// fetches the `App` again. Called directly wherever the old design
+/// invalidated; each call is well under a millisecond.
 unsafe fn repaint(hwnd: HWND) {
     unsafe {
         if !VISIBLE.load(Relaxed) {
@@ -496,19 +595,34 @@ unsafe fn repaint(hwnd: HWND) {
                     let _ = KillTimer(Some(hwnd), ANIM_TIMER_ID);
                 }
                 let eased = 1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t);
-                (0.6 + 0.4 * eased, 0.965 + 0.035 * eased)
+                // Fade only: the window is painted in place, so a scale
+                // would mean moving the window every frame.
+                (0.6 + 0.4 * eased, 1.0)
             }
             _ => (1.0, 1.0),
         };
 
+        let scale_px = app.dpi / 96.0;
+        let width = (render::WINDOW_WIDTH * scale_px) as u32;
+        let height = (app.content_height() * scale_px) as u32;
+        // The frame is painted in place, so the window must already be the
+        // frame's size: a form can make the content taller than the list.
         let mut rc = RECT::default();
         let _ = GetWindowRect(hwnd, &mut rc);
-        let scale_px = app.dpi / 96.0;
+        if rc.right - rc.left != width as i32 || rc.bottom - rc.top != height as i32 {
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                width as i32,
+                height as i32,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
         let place = render::Placement {
-            x: rc.left,
-            y: rc.top,
-            width: (render::WINDOW_WIDTH * scale_px) as u32,
-            height: (app.content_height() * scale_px) as u32,
+            width,
+            height,
             dpi: app.dpi,
             opacity,
             scale,
@@ -545,6 +659,9 @@ unsafe fn repaint(hwnd: HWND) {
         if let Some(r) = app.renderer.as_mut() {
             r.present(hwnd, &frame, &place);
         }
+        // Pump the paint now that the App borrow above is done: WM_PAINT
+        // fetches the App again to copy the frame in (see `Renderer::blit`).
+        let _ = UpdateWindow(hwnd);
     }
 }
 
@@ -632,14 +749,28 @@ unsafe extern "system" fn wndproc(
                 repaint(hwnd);
                 LRESULT(0)
             }
-            // The bitmap is pushed with UpdateLayeredWindow, so there is
-            // nothing to draw here; validating keeps WM_PAINT from repeating.
+            // Copy the last drawn frame into the window. DWM honours its
+            // alpha (see `enable_backdrop`), so the live backdrop shows
+            // through wherever the frame is transparent.
             WM_PAINT => {
                 let mut ps = PAINTSTRUCT::default();
-                let _ = BeginPaint(hwnd, &mut ps);
+                let hdc = BeginPaint(hwnd, &mut ps);
+                if let Some(app) = app_mut(hwnd)
+                    && let Some(r) = app.renderer.as_ref()
+                {
+                    r.blit(hdc);
+                }
                 let _ = EndPaint(hwnd, &ps);
                 LRESULT(0)
             }
+            // WS_CAPTION exists only so DWM applies the system backdrop (it
+            // ignores frameless popups): lay out no frame, and let nothing
+            // behave like a caption.
+            WM_NCCALCSIZE if wparam.0 != 0 => LRESULT(0),
+            WM_NCHITTEST => LRESULT(HTCLIENT as isize),
+            // DWM flattens the backdrop on an "inactive" window; always render
+            // as active. lparam -1 skips the (empty) frame repaint.
+            WM_NCACTIVATE => DefWindowProcW(hwnd, msg, WPARAM(1), LPARAM(-1)),
             // Hover to highlight. Guarded on the cursor actually having
             // moved: showing the window under a stationary pointer emits
             // WM_MOUSEMOVE, which would otherwise yank the selection away
@@ -1225,19 +1356,18 @@ unsafe fn show(hwnd: HWND) {
         let y = work.top + (work.bottom - work.top) / 5;
 
         crate::dlog!("show: x={x} y={y} w={w} h={h} scale={scale}");
-        // Place while still hidden, paint the first frame into the layered
-        // surface, and only then show: the window never appears blank.
+        // Place while still hidden.
         let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE);
-        // Ask the compositor to blur behind the window, tinted per the current
-        // theme. Re-applied each show because the accent policy does not
-        // always survive a hide/re-show.
-        if ACRYLIC.load(Relaxed)
-            && let Some((dark, tint)) = app_mut(hwnd).map(|a| (a.dark, a.tint))
-        {
-            set_acrylic(hwnd, acrylic_color(dark, tint));
+        // The backdrop's material follows the theme, which may have changed.
+        if let Some(dark) = app_mut(hwnd).map(|a| a.dark) {
+            set_dark_mode(hwnd, dark);
         }
+        // A normal window can't be painted before it is visible, and DWM
+        // composes a new window before its first paint. So: cloak, show,
+        // paint synchronously, uncloak - the first frame the user sees is
+        // complete, backdrop included.
+        cloak(hwnd, true);
         VISIBLE.store(true, Relaxed);
-        repaint(hwnd);
         let _ = SetWindowPos(
             hwnd,
             Some(HWND_TOPMOST),
@@ -1245,8 +1375,11 @@ unsafe fn show(hwnd: HWND) {
             0,
             0,
             0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE,
         );
+        repaint(hwnd);
+        nc_activate(hwnd);
+        cloak(hwnd, false);
         force_foreground(hwnd);
         let _ = SetFocus(Some(hwnd));
 
