@@ -21,7 +21,7 @@ use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Com::{
-    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
+    CLSCTX_ALL, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance, CoInitializeEx,
 };
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
@@ -34,7 +34,8 @@ use windows::Win32::System::Threading::{AttachThreadInput, CreateMutexW, GetCurr
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
+    AppVisibility, IAppVisibility, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+    NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
@@ -89,6 +90,11 @@ static GUARD_UNTIL: AtomicU64 = AtomicU64::new(0);
 /// How long that guard lasts. Comfortably longer than the ~50ms it takes to
 /// show and win foreground, short enough to never swallow a real dismissal.
 const GUARD_MS: u64 = 250;
+/// `GetTickCount64` value before which toggle requests (hook chord, hotkey
+/// fallback) are ignored. Set while apex closes the Start menu by sending it
+/// Escape: with Ctrl still held from the summon chord that keystroke is
+/// Ctrl+Esc, which for a default-chord user is apex's own toggle.
+static SUPPRESS_TOGGLE_UNTIL: AtomicU64 = AtomicU64::new(0);
 /// Mouse hook handle; installed only while the window is visible.
 static MOUSE_HOOK: AtomicIsize = AtomicIsize::new(0);
 /// Single-instance mutex, kept so Restart can release it before relaunching.
@@ -496,7 +502,13 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
             let is_down = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN);
             let hwnd = HWND(HOOK_HWND.load(Relaxed) as *mut core::ffi::c_void);
 
-            if info.vkCode == HOOK_VK.load(Relaxed) {
+            // The keystroke apex injects itself (Escape to close the Start
+            // menu, see `dismiss_start_menu`) is not the chord and must reach
+            // the shell rather than be swallowed here. Only apex's own is
+            // excluded - injected keys from a macro tool still summon apex.
+            let own_injection =
+                (info.flags.0 & LLKHF_INJECTED.0) != 0 && toggle_suppressed();
+            if info.vkCode == HOOK_VK.load(Relaxed) && !own_injection {
                 if is_down {
                     if chord_matches(HOOK_MODS.load(Relaxed)) {
                         if !HOOK_HELD.swap(true, Relaxed) {
@@ -704,14 +716,18 @@ unsafe extern "system" fn wndproc(
     unsafe {
         match msg {
             WM_APP_TOGGLE => {
-                toggle(hwnd);
+                if !toggle_suppressed() {
+                    toggle(hwnd);
+                }
                 LRESULT(0)
             }
             WM_HOTKEY if wparam.0 as i32 == HOTKEY_ID => {
                 // Fallback path: fires when UIPI bypassed the keyboard hook
                 // (elevated window had focus); the hook swallows the chord
                 // otherwise, so this can't double-fire.
-                toggle(hwnd);
+                if !toggle_suppressed() {
+                    toggle(hwnd);
+                }
                 LRESULT(0)
             }
             WM_APP_TRAY => {
@@ -1375,6 +1391,70 @@ unsafe fn cursor_monitor_metrics() -> (f32, RECT) {
     }
 }
 
+/// Whether a toggle request arrived while apex was closing the Start menu -
+/// its own injected Escape read back as the chord.
+fn toggle_suppressed() -> bool {
+    unsafe { GetTickCount64() < SUPPRESS_TOGGLE_UNTIL.load(Relaxed) }
+}
+
+/// Whether the Start menu is open, per the shell's own `IAppVisibility`.
+unsafe fn start_menu_visible() -> bool {
+    unsafe {
+        CoCreateInstance::<_, IAppVisibility>(&AppVisibility, None, CLSCTX_ALL)
+            .and_then(|av| av.IsLauncherVisible())
+            .is_ok_and(|v| v.as_bool())
+    }
+}
+
+/// Text of a window's class or title, for identifying the Start window.
+unsafe fn window_str(hwnd: HWND, f: unsafe fn(HWND, &mut [u16]) -> i32) -> String {
+    let mut buf = [0u16; 64];
+    let n = unsafe { f(hwnd, &mut buf) }.max(0) as usize;
+    String::from_utf16_lossy(&buf[..n.min(buf.len())])
+}
+
+/// Close the Start menu if it is open. It sits in a shell band above every
+/// topmost window and keeps the foreground, so apex would come up behind it.
+///
+/// The only reliable way to close it is a keystroke: Escape, sent only when
+/// Start itself is the foreground window so it can't land anywhere else.
+/// With Ctrl still held from the summon chord that reads as Ctrl+Esc, the
+/// shell's own Start toggle - which also closes it. A Win-key tap, the other
+/// obvious choice, does nothing while Ctrl is down. Toggle requests are
+/// ignored for a moment because for a default-chord user that Ctrl+Esc is
+/// apex's own hotkey.
+unsafe fn dismiss_start_menu() {
+    unsafe {
+        if !start_menu_visible() {
+            return;
+        }
+        // The focused window is Start's own CoreWindow - titled "Search"
+        // (its search box) on Windows 11, "Start" on older builds.
+        let fg = GetForegroundWindow();
+        let is_start = window_str(fg, |h, b| GetClassNameW(h, b)) == "Windows.UI.Core.CoreWindow"
+            && matches!(
+                window_str(fg, |h, b| GetWindowTextW(h, b)).as_str(),
+                "Start" | "Search"
+            );
+        if !is_start {
+            crate::dlog!("start menu visible but not foreground; leaving it");
+            return;
+        }
+        crate::dlog!("closing the Start menu");
+        SUPPRESS_TOGGLE_UNTIL.store(GetTickCount64() + 250, Relaxed);
+        keybd_event(VK_ESCAPE.0 as u8, 0, KEYBD_EVENT_FLAGS(0), 0);
+        keybd_event(VK_ESCAPE.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+        // Give it a moment to actually go, so the foreground grab below
+        // isn't fighting the shell.
+        for _ in 0..30 {
+            if !start_menu_visible() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
 /// Show centered (upper third) on the monitor containing the cursor,
 /// scaled to that monitor's DPI.
 unsafe fn show(hwnd: HWND) {
@@ -1382,6 +1462,7 @@ unsafe fn show(hwnd: HWND) {
         // Held across the whole summon so a synchronous WM_ACTIVATE from
         // inside force_foreground cannot re-enter and hide the window.
         BUSY.store(true, Relaxed);
+        dismiss_start_menu();
         let (scale, work) = cursor_monitor_metrics();
 
         // Rebuild the most-used list before measuring: the app index may have
