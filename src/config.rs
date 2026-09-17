@@ -217,7 +217,10 @@ impl Config {
 /// Insert or replace an alias line. Removes any previous line with the same
 /// alias or the same app id (one alias per app).
 fn upsert_alias_text(text: &str, alias: &str, app_id: &str) -> String {
-    let mut lines = drop_alias_lines(text, |k, v| k == alias || v == app_id);
+    // Targets compare case-insensitively: a hand-written quicklink alias may
+    // carry the section header's original casing, and app ids are Windows
+    // paths / AppUserModelIDs.
+    let mut lines = drop_alias_lines(text, |k, v| k == alias || v.eq_ignore_ascii_case(app_id));
     let new_line = format!("{alias} = \"{app_id}\"");
     match alias_section_end(&lines) {
         Some(idx) => lines.insert(idx, new_line),
@@ -234,7 +237,7 @@ fn upsert_alias_text(text: &str, alias: &str, app_id: &str) -> String {
 
 /// Remove every alias pointing at `app_id`.
 fn remove_alias_text(text: &str, app_id: &str) -> String {
-    join_lines(drop_alias_lines(text, |_, v| v == app_id))
+    join_lines(drop_alias_lines(text, |_, v| v.eq_ignore_ascii_case(app_id)))
 }
 
 /// Lines of `text` minus `[aliases]` entries matching `drop(key, value)`.

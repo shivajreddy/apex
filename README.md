@@ -12,7 +12,7 @@ Ultra-fast, ultra-lightweight launcher for Windows. Raycast, but native.
 
 ## Status
 
-`v0.6.0`, pre-release. Working today: global hotkey (runs elevated so it works
+`v0.6.1`, pre-release. Working today: global hotkey (runs elevated so it works
 over admin windows), fuzzy app search with icons (desktop + Store apps),
 frecency ranking, quicklinks, apex commands, a tray icon, aliases, an actions
 panel, and a live acrylic backdrop. See [ROADMAP.md](ROADMAP.md) for
@@ -111,8 +111,10 @@ alone - in GlazeWM, a `window_rules` `ignore` on `window_process: 'apex'`.
 
 ### Aliases
 
-`Ctrl+K` on any app, `Set Alias…`, and type a short name. Typing that alias
-afterwards puts the app first.
+`Ctrl+K` on any app or quicklink, `Set Alias…`, and type a short name. Typing
+that alias afterwards puts it first. Aliases live in `[aliases]`; a
+quicklink's alias points at its key (`gh = "github"`). Esc in a form or prompt
+opened from the actions panel steps back to that panel.
 
 ### Quicklinks
 

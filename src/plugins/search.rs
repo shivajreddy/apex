@@ -15,11 +15,10 @@ use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{PCWSTR, w};
 
-use std::collections::HashMap;
 
 use crate::appindex::{self, AppIndex};
 use crate::fuzzy;
-use crate::plugin::{Action, ActionResult, Icon, Plugin, ResultItem};
+use crate::plugin::{Action, ActionResult, Aliases, Icon, Plugin, ResultItem};
 
 pub const ID: &str = "search";
 
@@ -53,9 +52,9 @@ impl AppEntry {
 pub struct Search {
     entries: Vec<AppEntry>,
     pending: Option<Receiver<Vec<AppEntry>>>,
-    /// alias (case-folded) -> app id. Loaded from `[aliases]`, updated by
-    /// the Set/Remove Alias actions (which also write the config file).
-    aliases: HashMap<String, String>,
+    /// The `[aliases]` table, shared with the quicklinks plugin. Updated by
+    /// the Set/Remove Alias actions, which also write the config file.
+    aliases: Aliases,
 }
 
 fn entries_of(index: AppIndex) -> Vec<AppEntry> {
@@ -102,7 +101,7 @@ fn spawn_index(use_cached: bool) -> Receiver<Vec<AppEntry>> {
 }
 
 impl Search {
-    pub fn new(aliases: HashMap<String, String>) -> Self {
+    pub fn new(aliases: Aliases) -> Self {
         Self {
             entries: Vec::new(),
             pending: Some(spawn_index(true)),
@@ -110,11 +109,8 @@ impl Search {
         }
     }
 
-    fn alias_of(&self, app_id: &str) -> Option<&str> {
-        self.aliases
-            .iter()
-            .find(|(_, id)| id.as_str() == app_id)
-            .map(|(a, _)| a.as_str())
+    fn alias_of(&self, app_id: &str) -> Option<String> {
+        self.aliases.of(app_id)
     }
 
     /// Swap in the newest index the background thread has delivered.
@@ -145,7 +141,8 @@ impl Plugin for Search {
         // Aliases come back from disk too, so editing the config by hand and
         // reloading is enough - no restart. Source folders are read by the
         // helper itself.
-        self.aliases = crate::config::Config::load().aliases_map();
+        self.aliases
+            .reload(crate::config::Config::load().aliases_map());
         // The current index stays in place until the rebuild lands, so the
         // list never blinks empty.
         self.pending = Some(spawn_index(false));
@@ -157,13 +154,13 @@ impl Plugin for Search {
         let query_str: String = query.iter().collect();
         for e in &self.entries {
             let alias = self.alias_of(&e.app_id);
-            let alias_hit = alias == Some(query_str.as_str());
+            let alias_hit = alias.as_deref() == Some(query_str.as_str());
             let fuzzy_score = fuzzy::score(&query, &e.name_folded, &e.bonus);
             if fuzzy_score.is_none() && !alias_hit {
                 continue;
             }
             let score = fuzzy_score.unwrap_or(0) + if alias_hit { ALIAS_BOOST } else { 0 };
-            out.push(make_item(e, alias, score));
+            out.push(make_item(e, alias.as_deref(), score));
         }
     }
 
@@ -171,7 +168,7 @@ impl Plugin for Search {
         self.poll_index();
         let e = self.entries.iter().find(|e| e.app_id == payload)?;
         // Score is irrelevant here: the shell orders these by frecency.
-        Some(make_item(e, self.alias_of(&e.app_id), 0))
+        Some(make_item(e, self.alias_of(&e.app_id).as_deref(), 0))
     }
 
     fn browse(&mut self, limit: usize, out: &mut Vec<ResultItem>) {
@@ -190,7 +187,7 @@ impl Plugin for Search {
             {
                 continue;
             }
-            out.push(make_item(e, self.alias_of(&e.app_id), 0));
+            out.push(make_item(e, self.alias_of(&e.app_id).as_deref(), 0));
             added += 1;
         }
     }
@@ -244,7 +241,7 @@ impl Plugin for Search {
                 action_id: "set_alias",
             },
             "remove_alias" => {
-                self.aliases.retain(|_, id| id != &item.payload);
+                self.aliases.remove(&item.payload);
                 crate::config::remove_alias_file(&item.payload);
                 ActionResult::Done
             }
@@ -256,8 +253,7 @@ impl Plugin for Search {
         if action_id == "set_alias" {
             let alias = crate::config::sanitize_key(text);
             if !alias.is_empty() {
-                self.aliases.retain(|_, id| id != &item.payload);
-                self.aliases.insert(alias.clone(), item.payload.clone());
+                self.aliases.set(&alias, &item.payload);
                 crate::config::upsert_alias_file(&alias, &item.payload);
             }
         }

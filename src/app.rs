@@ -170,6 +170,10 @@ pub struct App {
     /// A scrollbar-thumb drag in progress: the pointer's offset from the
     /// thumb's top edge, in DIPs, so the thumb follows without jumping.
     pub scroll_drag: Option<f32>,
+    /// The actions panel to go back to when a form or prompt it opened is
+    /// cancelled, so Esc steps back one level instead of closing everything.
+    /// `None` when the panel was opened some other way (Enter on a row).
+    actions_return: Option<(Vec<Action>, usize)>,
     /// `plugin/payload` keys the user has hidden. Filtered out of every
     /// listing, here rather than per-plugin so one action covers them all.
     hidden: std::collections::HashSet<String>,
@@ -208,6 +212,7 @@ impl App {
             dimmed: Vec::new(),
             scroll: 0.0,
             scroll_drag: None,
+            actions_return: None,
             hidden: config.list_values(HIDDEN).into_iter().collect(),
             listing: Listing::Normal,
             folder_icon: None,
@@ -317,6 +322,7 @@ impl App {
     /// reopened there would turn a habitual Enter into a silent toggle.
     pub fn clear_query(&mut self) {
         self.mode = Mode::Search;
+        self.actions_return = None;
         self.listing = Listing::Normal;
         self.query.clear();
         self.refresh_results();
@@ -375,6 +381,8 @@ impl App {
                 label: "Hide from Apex".to_string(),
             }),
         }
+        // A fresh panel: nothing to go back to yet.
+        self.actions_return = None;
         self.mode = Mode::Actions {
             actions,
             selected: 0,
@@ -382,8 +390,19 @@ impl App {
         true
     }
 
+    /// Esc in a panel. A form or prompt that was opened from the actions
+    /// panel goes back to that panel (as it was); anything else returns to
+    /// search.
     pub fn close_panel(&mut self) {
-        self.mode = Mode::Search;
+        let back = match self.mode {
+            Mode::Form { .. } | Mode::TextInput { .. } => self.actions_return.take(),
+            _ => None,
+        };
+        self.actions_return = None;
+        self.mode = match back {
+            Some((actions, selected)) => Mode::Actions { actions, selected },
+            None => Mode::Search,
+        };
     }
 
     pub fn panel_move(&mut self, delta: i32) {
@@ -395,8 +414,10 @@ impl App {
 
     /// Run the highlighted panel action.
     pub fn run_panel_action(&mut self) -> UiOutcome {
-        let action_id = match &self.mode {
-            Mode::Actions { actions, selected } => actions[*selected].id,
+        let (action_id, panel) = match &self.mode {
+            Mode::Actions { actions, selected } => {
+                (actions[*selected].id, (actions.clone(), *selected))
+            }
             _ => return UiOutcome::Stay,
         };
         // Shell-level actions never reach a plugin.
@@ -428,7 +449,13 @@ impl App {
             _ => {}
         }
         let result = self.dispatch(|p, item| p.run_action(action_id, item));
-        self.apply(result)
+        let outcome = self.apply(result);
+        // The action opened a form or a prompt: remember the panel it came
+        // from, so Esc there goes back to it rather than closing everything.
+        if matches!(self.mode, Mode::Form { .. } | Mode::TextInput { .. }) {
+            self.actions_return = Some(panel);
+        }
+        outcome
     }
 
     /// Commit the text-input buffer to its plugin action.
@@ -1111,6 +1138,8 @@ impl App {
     /// the owning plugin, then apply the outcome - which is also what records
     /// the launch, so Enter and Ctrl+K > Open stay consistent by construction.
     pub fn activate_selected(&mut self) -> UiOutcome {
+        // A panel opened by Enter has no actions panel behind it.
+        self.actions_return = None;
         // In the sources view Enter flips the row; nothing is launched.
         if self.listing == Listing::Manage {
             self.toggle_selected();
@@ -1269,8 +1298,22 @@ mod tests {
             "stub"
         }
         fn query(&mut self, _q: &str, _out: &mut Vec<ResultItem>) {}
+        // Enter opens a prompt directly; the one action opens the same
+        // prompt from the actions panel.
         fn activate(&mut self, _item: &ResultItem) -> ActionResult {
-            ActionResult::Done
+            ActionResult::RequestText {
+                prompt: "value".into(),
+                action_id: "prompt",
+            }
+        }
+        fn actions(&self, _item: &ResultItem) -> Vec<Action> {
+            vec![Action {
+                id: "prompt",
+                label: "Prompt\u{2026}".into(),
+            }]
+        }
+        fn run_action(&mut self, _action_id: &str, item: &ResultItem) -> ActionResult {
+            self.activate(item)
         }
         fn catalogue(&mut self, out: &mut Vec<ResultItem>) {
             for name in ["alpha", "beta"] {
@@ -1311,6 +1354,36 @@ mod tests {
             }
             _ => panic!("expected the actions panel"),
         }
+    }
+
+    #[test]
+    fn esc_in_a_prompt_returns_to_the_actions_panel_it_came_from() {
+        let mut a = App::new(
+            vec![Box::new(Stub) as Box<dyn Plugin>],
+            &crate::config::Config::from_text(""),
+        );
+        a.results.push(row("stub"));
+        // Ctrl+K, run the action, prompt opens.
+        assert!(a.open_actions());
+        assert!(a.run_panel_action() == UiOutcome::Stay);
+        assert!(matches!(a.mode, Mode::TextInput { .. }));
+        // Esc: back to the actions panel, same entries, not to search.
+        a.close_panel();
+        match &a.mode {
+            Mode::Actions { actions, selected } => {
+                assert_eq!(actions.len(), 2, "plugin action plus Hide from Apex");
+                assert_eq!(*selected, 0);
+            }
+            _ => panic!("expected to return to the actions panel"),
+        }
+        // Esc again from the panel closes it.
+        a.close_panel();
+        assert!(matches!(a.mode, Mode::Search));
+        // A prompt opened by Enter has no panel behind it: Esc closes it.
+        assert!(a.activate_selected() == UiOutcome::Stay);
+        assert!(matches!(a.mode, Mode::TextInput { .. }));
+        a.close_panel();
+        assert!(matches!(a.mode, Mode::Search));
     }
 
     #[test]

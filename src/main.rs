@@ -33,12 +33,16 @@ mod window;
 /// so they cost zero memory and zero startup time.
 fn plugins(config: &config::Config) -> Vec<Box<dyn plugin::Plugin>> {
     let mut list: Vec<Box<dyn plugin::Plugin>> = Vec::new();
+    // One alias table for every plugin that offers aliases, so an alias
+    // moved between an app and a quicklink is consistent everywhere at once.
+    let aliases = plugin::Aliases::new(config.aliases_map());
     if config.plugin_enabled(plugins::search::ID) {
-        list.push(Box::new(plugins::search::Search::new(config.aliases_map())));
+        list.push(Box::new(plugins::search::Search::new(aliases.clone())));
     }
     if config.plugin_enabled(plugins::quicklinks::ID) {
         list.push(Box::new(plugins::quicklinks::Quicklinks::new(
             config.subtables(plugins::quicklinks::ID),
+            aliases.clone(),
         )));
     }
     if config.plugin_enabled(plugins::commands::ID) {

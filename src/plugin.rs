@@ -36,7 +36,60 @@ pub struct ResultItem {
     pub icon: Option<std::sync::Arc<Icon>>,
 }
 
+/// The `[aliases]` table (alias -> target: an app id or a quicklink key),
+/// shared by every plugin that offers aliases. One table, not a copy per
+/// plugin: an alias moved from an app to a quicklink is then gone from the
+/// app at once, instead of both carrying it until the next reload.
+///
+/// Only memory lives here; the plugin that changes an alias also writes the
+/// config file (`config::upsert_alias_file` / `remove_alias_file`), which
+/// keeps this usable in tests without touching disk.
+#[derive(Clone, Default)]
+pub struct Aliases(std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>);
+
+impl Aliases {
+    pub fn new(map: std::collections::HashMap<String, String>) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(map)))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, String>> {
+        // A poisoned lock only means another thread panicked mid-update;
+        // the map is still a map.
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Replace the whole table, e.g. after re-reading the config file.
+    pub fn reload(&self, map: std::collections::HashMap<String, String>) {
+        *self.lock() = map;
+    }
+
+    /// The alias pointing at `target`, if any. Targets compare
+    /// case-insensitively: quicklink keys are lower-cased by the config
+    /// parser while a hand-written alias value may not be, and app ids are
+    /// Windows paths and AppUserModelIDs, which are case-insensitive anyway.
+    pub fn of(&self, target: &str) -> Option<String> {
+        self.lock()
+            .iter()
+            .find(|(_, t)| t.eq_ignore_ascii_case(target))
+            .map(|(a, _)| a.clone())
+    }
+
+    /// Point `alias` at `target`, keeping the file's rule of one alias per
+    /// target and one target per alias.
+    pub fn set(&self, alias: &str, target: &str) {
+        let mut map = self.lock();
+        map.retain(|a, t| a != alias && !t.eq_ignore_ascii_case(target));
+        map.insert(alias.to_string(), target.to_string());
+    }
+
+    /// Drop whatever alias points at `target`.
+    pub fn remove(&self, target: &str) {
+        self.lock().retain(|_, t| !t.eq_ignore_ascii_case(target));
+    }
+}
+
 /// An entry in the actions panel (Ctrl+K) for a selected result.
+#[derive(Clone)]
 pub struct Action {
     pub id: &'static str,
     pub label: String,

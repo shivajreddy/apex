@@ -27,7 +27,7 @@ use windows::Win32::UI::Shell::{SHSTOCKICONID, SIID_APPLICATION, SIID_FOLDER, SI
 use crate::config;
 use crate::fuzzy;
 use crate::icon;
-use crate::plugin::{Action, ActionResult, FormField, Icon, Plugin, ResultItem};
+use crate::plugin::{Action, ActionResult, Aliases, FormField, Icon, Plugin, ResultItem};
 
 pub const ID: &str = "quicklinks";
 
@@ -41,6 +41,10 @@ const CREATE_PAYLOAD: &str = "!create";
 
 /// Shown when a link has an empty `{}` token.
 const DEFAULT_ARG: &str = "query";
+
+/// Score boost for an exact alias hit; large enough to always rank first
+/// (the same figure the application plugin uses).
+const ALIAS_BOOST: i32 = 2000;
 
 struct Entry {
     /// Config section suffix, and the payload. Stable across renames so
@@ -73,11 +77,11 @@ impl Entry {
         }
     }
 
-    fn item(&self, score: i32) -> ResultItem {
+    fn item(&self, alias: Option<&str>, score: i32) -> ResultItem {
         ResultItem {
             plugin: ID,
             title: self.name.clone(),
-            badge: None,
+            badge: alias.map(str::to_string),
             category: String::new(),
             subtitle: "Quicklink".to_string(),
             payload: self.slug.clone(),
@@ -121,10 +125,14 @@ pub struct Quicklinks {
     create_folded: Vec<char>,
     create_bonus: Vec<i32>,
     icons: IconCache,
+    /// The `[aliases]` table, one instance shared with the application
+    /// plugin. An entry is ours when its target is one of our slugs (a slug
+    /// never looks like an app id); the table keeps one alias per target.
+    aliases: Aliases,
 }
 
 impl Quicklinks {
-    pub fn new(subtables: Vec<(String, HashMap<String, String>)>) -> Self {
+    pub fn new(subtables: Vec<(String, HashMap<String, String>)>, aliases: Aliases) -> Self {
         let mut icons = IconCache::default();
         let mut entries: Vec<Entry> = Vec::new();
         for (slug, kv) in subtables {
@@ -152,11 +160,22 @@ impl Quicklinks {
             create_folded: fuzzy::fold_case(CREATE_LABEL),
             create_bonus: fuzzy::bonuses(CREATE_LABEL),
             icons,
+            aliases,
         }
     }
 
     fn find(&self, slug: &str) -> Option<&Entry> {
         self.entries.iter().find(|e| e.slug == slug)
+    }
+
+    /// The alias pointing at `slug`, if any.
+    fn alias_of(&self, slug: &str) -> Option<String> {
+        self.aliases.of(slug)
+    }
+
+    /// The row for an entry, alias pill included.
+    fn make_item(&self, e: &Entry, score: i32) -> ResultItem {
+        e.item(self.alias_of(&e.slug).as_deref(), score)
     }
 
     fn create_item(&mut self, score: i32) -> ResultItem {
@@ -251,15 +270,25 @@ impl Plugin for Quicklinks {
 
     fn refresh(&mut self) {
         // Cheap and synchronous: this is one small file, unlike the app scan.
-        *self = Self::new(config::Config::load().subtables(ID));
+        let cfg = config::Config::load();
+        // The table is shared: reload it in place so the other plugin sees
+        // the re-read too, then rebuild the entries around the same handle.
+        self.aliases.reload(cfg.aliases_map());
+        *self = Self::new(cfg.subtables(ID), self.aliases.clone());
     }
 
     fn query(&mut self, q: &str, out: &mut Vec<ResultItem>) {
         let query = fuzzy::fold_case(q);
+        let query_str: String = query.iter().collect();
         for e in &self.entries {
-            if let Some(score) = fuzzy::score(&query, &e.name_folded, &e.bonus) {
-                out.push(e.item(score));
+            let alias = self.alias_of(&e.slug);
+            let alias_hit = alias.as_deref() == Some(query_str.as_str());
+            let fuzzy_score = fuzzy::score(&query, &e.name_folded, &e.bonus);
+            if fuzzy_score.is_none() && !alias_hit {
+                continue;
             }
+            let score = fuzzy_score.unwrap_or(0) + if alias_hit { ALIAS_BOOST } else { 0 };
+            out.push(e.item(alias.as_deref(), score));
         }
         if let Some(score) = fuzzy::score(&query, &self.create_folded, &self.create_bonus) {
             out.push(self.create_item(score));
@@ -267,7 +296,7 @@ impl Plugin for Quicklinks {
     }
 
     fn item_for(&mut self, payload: &str) -> Option<ResultItem> {
-        self.find(payload).map(|e| e.item(0))
+        self.find(payload).map(|e| self.make_item(e, 0))
     }
 
     fn browse(&mut self, limit: usize, out: &mut Vec<ResultItem>) {
@@ -279,7 +308,7 @@ impl Plugin for Quicklinks {
             if out.iter().any(|i| i.plugin == ID && i.payload == e.slug) {
                 continue;
             }
-            out.push(e.item(0));
+            out.push(self.make_item(e, 0));
             added += 1;
         }
     }
@@ -298,7 +327,9 @@ impl Plugin for Quicklinks {
                 label: CREATE_LABEL.to_string(),
             }];
         }
-        vec![
+        // No "Create" here: that belongs to the create row, not to the
+        // actions of an existing quicklink.
+        let mut actions = vec![
             Action {
                 id: "open",
                 label: "Open".to_string(),
@@ -311,11 +342,18 @@ impl Plugin for Quicklinks {
                 id: "delete",
                 label: "Delete Quicklink".to_string(),
             },
-            Action {
-                id: "create",
-                label: "Create Quicklink\u{2026}".to_string(),
-            },
-        ]
+        ];
+        if let Some(alias) = self.alias_of(&item.payload) {
+            actions.push(Action {
+                id: "remove_alias",
+                label: format!("Remove Alias \u{201c}{alias}\u{201d}"),
+            });
+        }
+        actions.push(Action {
+            id: "set_alias",
+            label: "Set Alias\u{2026}".to_string(),
+        });
+        actions
     }
 
     fn run_action(&mut self, action_id: &str, item: &ResultItem) -> ActionResult {
@@ -329,6 +367,21 @@ impl Plugin for Quicklinks {
             "delete" => {
                 config::remove_quicklink_file(&item.payload);
                 self.entries.retain(|e| e.slug != item.payload);
+                // Its alias would otherwise linger in the config, pointing
+                // at nothing.
+                if self.alias_of(&item.payload).is_some() {
+                    self.aliases.remove(&item.payload);
+                    config::remove_alias_file(&item.payload);
+                }
+                ActionResult::Done
+            }
+            "set_alias" => ActionResult::RequestText {
+                prompt: format!("Alias for {}", item.title),
+                action_id: "set_alias",
+            },
+            "remove_alias" => {
+                self.aliases.remove(&item.payload);
+                config::remove_alias_file(&item.payload);
                 ActionResult::Done
             }
             _ => ActionResult::Done,
@@ -336,14 +389,24 @@ impl Plugin for Quicklinks {
     }
 
     fn submit_text(&mut self, action_id: &str, item: &ResultItem, text: &str) -> ActionResult {
-        if action_id != "fill" {
-            return ActionResult::Done;
+        match action_id {
+            "set_alias" => {
+                let alias = config::sanitize_key(text);
+                if !alias.is_empty() {
+                    self.aliases.set(&alias, &item.payload);
+                    config::upsert_alias_file(&alias, &item.payload);
+                }
+                ActionResult::Done
+            }
+            "fill" => {
+                let Some(e) = self.find(&item.payload) else {
+                    return ActionResult::Done;
+                };
+                open(&fill(&e.link, text), &e.open_with);
+                ActionResult::Close
+            }
+            _ => ActionResult::Done,
         }
-        let Some(e) = self.find(&item.payload) else {
-            return ActionResult::Done;
-        };
-        open(&fill(&e.link, text), &e.open_with);
-        ActionResult::Close
     }
 
     fn submit_form(
@@ -454,7 +517,53 @@ mod tests {
                     )
                 })
                 .collect(),
+            Aliases::default(),
         )
+    }
+
+    #[test]
+    fn an_alias_pins_a_quicklink_first_and_shows_as_its_badge() {
+        let mut q = ql(&[
+            ("gh", &[("name", "Search GitHub"), ("link", "https://github.com/search?q={query}")]),
+            ("docs", &[("name", "Docs"), ("link", "https://docs.rs")]),
+        ]);
+        q.aliases.set("d", "docs");
+        // The alias alone finds it, ranked above anything fuzzy.
+        let mut out = Vec::new();
+        q.query("d", &mut out);
+        assert_eq!(out.first().map(|i| i.payload.as_str()), Some("docs"));
+        assert!(out[0].score >= ALIAS_BOOST);
+        assert_eq!(out[0].badge.as_deref(), Some("d"));
+        // Actions: no "Create" on an existing quicklink; alias actions present.
+        let item = q.item_for("docs").unwrap();
+        let ids: Vec<&str> = q.actions(&item).iter().map(|a| a.id).collect();
+        assert!(!ids.contains(&"create"));
+        assert!(ids.contains(&"set_alias"));
+        assert!(ids.contains(&"remove_alias"));
+        let other = q.item_for("gh").unwrap();
+        let ids: Vec<&str> = q.actions(&other).iter().map(|a| a.id).collect();
+        assert!(!ids.contains(&"remove_alias"), "no alias, nothing to remove");
+    }
+
+    #[test]
+    fn the_alias_table_is_one_shared_source_of_truth() {
+        // Both plugins get the same handle; a change through one is seen by
+        // the other at once, and moving an alias takes it off its old target.
+        let shared = Aliases::new(
+            [("x".to_string(), "Some.App".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let other_view = shared.clone();
+        shared.set("x", "docs");
+        assert_eq!(other_view.of("docs").as_deref(), Some("x"));
+        assert_eq!(other_view.of("Some.App"), None, "the app lost the alias");
+        // A hand-written value in the section header's original casing still
+        // resolves: targets compare case-insensitively.
+        shared.set("gh", "GitHub");
+        assert_eq!(shared.of("github").as_deref(), Some("gh"));
+        shared.remove("GITHUB");
+        assert_eq!(shared.of("github"), None);
     }
 
     #[test]
