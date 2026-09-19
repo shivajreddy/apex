@@ -66,6 +66,22 @@ pub fn open(target: &str, program: Option<&str>) -> bool {
     }
 }
 
+/// Open `target` as administrator - the one launch that must *not* shed
+/// privileges.
+///
+/// While apex is elevated a plain `ShellExecuteW` hands the child apex's own
+/// token, which is exactly "run as administrator", with nothing to prompt
+/// for. Unelevated (a dev build), the shell's `runas` verb raises the UAC
+/// prompt instead. Returns false when that prompt is declined - an ordinary
+/// outcome, not an error.
+pub fn open_as_admin(target: &str) -> bool {
+    if is_elevated() {
+        direct(target, None)
+    } else {
+        execute(w!("runas"), target, None)
+    }
+}
+
 /// Hand the target to Explorer, which is running unelevated, so it does the
 /// opening on our behalf.
 fn via_explorer(target: &str) -> bool {
@@ -74,12 +90,16 @@ fn via_explorer(target: &str) -> bool {
 }
 
 fn direct(file: &str, args: Option<&str>) -> bool {
+    execute(w!("open"), file, args)
+}
+
+fn execute(verb: PCWSTR, file: &str, args: Option<&str>) -> bool {
     let file_w = wide(file);
     let args_w = args.map(wide);
     unsafe {
         let inst = ShellExecuteW(
             None,
-            w!("open"),
+            verb,
             PCWSTR(file_w.as_ptr()),
             args_w
                 .as_ref()

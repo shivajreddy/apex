@@ -12,7 +12,7 @@ Ultra-fast, ultra-lightweight launcher for Windows. Raycast, but native.
 
 ## Status
 
-`v0.6.2`, pre-release. Working today: global hotkey (runs elevated so it works
+`v0.6.3`, pre-release. Working today: global hotkey (runs elevated so it works
 over admin windows), fuzzy app search with icons (desktop + Store apps),
 frecency ranking, quicklinks, apex commands, a tray icon, aliases, an actions
 panel, and a live acrylic backdrop. See [ROADMAP.md](ROADMAP.md) for
@@ -263,6 +263,10 @@ works everywhere.
   to the desktop shell running as you, and the app comes back at normal
   integrity. The one exception is a quicklink with `open_with`: Explorer
   can't forward a program-and-argument pair, so those launch elevated.
+- **Run as Administrator on demand.** `Ctrl+K` on any app offers **Run as
+  Administrator**, which starts it with apex's own elevated token - no UAC
+  prompt, since you already answered one for apex. Not offered for Store
+  apps, which cannot be elevated.
 - To stop apex running elevated, uninstall this build and the task:
   `schtasks /delete /tn "Apex Elevated Logon" /f`.
 
