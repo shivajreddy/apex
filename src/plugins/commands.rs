@@ -176,7 +176,7 @@ impl Plugin for Commands {
         Some(self.item(c, 0))
     }
 
-    fn activate(&mut self, item: &ResultItem) -> ActionResult {
+    fn activate(&mut self, item: &ResultItem, _args: &[String]) -> ActionResult {
         match item.payload.as_str() {
             "reload" => ActionResult::Refresh,
             "restart" => ActionResult::Shell(ShellCommand::Restart),
@@ -212,8 +212,8 @@ impl Plugin for Commands {
         }]
     }
 
-    fn run_action(&mut self, _action_id: &str, item: &ResultItem) -> ActionResult {
-        self.activate(item)
+    fn run_action(&mut self, _action_id: &str, item: &ResultItem, args: &[String]) -> ActionResult {
+        self.activate(item, args)
     }
 
     fn submit_form(
@@ -387,29 +387,32 @@ mod tests {
             score: 0,
             icon: None,
         };
-        assert!(matches!(c.activate(&item("reload")), ActionResult::Refresh));
         assert!(matches!(
-            c.activate(&item("quit")),
+            c.activate(&item("reload"), &[]),
+            ActionResult::Refresh
+        ));
+        assert!(matches!(
+            c.activate(&item("quit"), &[]),
             ActionResult::Shell(ShellCommand::Quit)
         ));
         assert!(matches!(
-            c.activate(&item("restart")),
+            c.activate(&item("restart"), &[]),
             ActionResult::Shell(ShellCommand::Restart)
         ));
         assert!(matches!(
-            c.activate(&item("tray")),
+            c.activate(&item("tray"), &[]),
             ActionResult::Shell(ShellCommand::ToggleTray)
         ));
         assert!(matches!(
-            c.activate(&item("clear_history")),
+            c.activate(&item("clear_history"), &[]),
             ActionResult::Shell(ShellCommand::ClearHistory)
         ));
         assert!(matches!(
-            c.activate(&item("hidden")),
+            c.activate(&item("hidden"), &[]),
             ActionResult::Shell(ShellCommand::ShowHidden)
         ));
         assert!(matches!(
-            c.activate(&item("sources")),
+            c.activate(&item("sources"), &[]),
             ActionResult::Shell(ShellCommand::ShowSources)
         ));
     }

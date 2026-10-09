@@ -5,14 +5,16 @@
 //! ```toml
 //! [quicklinks.github]
 //! name = 'Search GitHub'
-//! link = 'https://github.com/search?q={query}'
+//! link = 'https://github.com/search?q={argument name="query"}'
 //! open_with = 'chrome'          # optional
 //! ```
 //!
-//! A `{token}` in the link makes it take an argument: activating the
-//! quicklink prompts using the token's name, and the answer is substituted
-//! in (percent-encoded when the link is a URL). That single mechanism covers
-//! both web search and plain bookmarks.
+//! A placeholder in the link makes it take an argument, typed into a field
+//! after the query once the quicklink is selected, the way Raycast does it.
+//! Raycast's spelling works - `{argument name="query" default="rust"}`, with
+//! its modifiers (`| raw`) - and so does apex's original bare `{query}`. The
+//! value is substituted in, percent-encoded when the link is a URL. That
+//! single mechanism covers both web search and plain bookmarks.
 //!
 //! Quicklinks are created and edited from inside apex, which rewrites only
 //! the relevant `[quicklinks.*]` block - the rest of the file, comments
@@ -27,7 +29,7 @@ use windows::Win32::UI::Shell::{SHSTOCKICONID, SIID_APPLICATION, SIID_FOLDER, SI
 use crate::config;
 use crate::fuzzy;
 use crate::icon;
-use crate::plugin::{Action, ActionResult, Aliases, FormField, Icon, Plugin, ResultItem};
+use crate::plugin::{Action, ActionResult, Aliases, Argument, FormField, Icon, Plugin, ResultItem};
 
 pub const ID: &str = "quicklinks";
 
@@ -39,8 +41,17 @@ const CREATE_LABEL: &str = "Create Quicklink";
 /// `!` can never collide with a real one.
 const CREATE_PAYLOAD: &str = "!create";
 
-/// Shown when a link has an empty `{}` token.
+/// The name shown for an unnamed argument: `{argument}`, or a bare `{}`.
 const DEFAULT_ARG: &str = "query";
+
+/// Most arguments a link can take, as in Raycast: each is a field in the
+/// search bar, which has room for three beside the query. A placeholder for
+/// any further argument is left in the link as written.
+const MAX_ARGS: usize = 3;
+
+/// The form's link field. The label is the one place the placeholder
+/// syntax is visible from inside apex.
+const LINK_LABEL: &str = "Link  \u{b7}  include {argument} to take input";
 
 /// Score boost for an exact alias hit; large enough to always rank first
 /// (the same figure the application plugin uses).
@@ -216,31 +227,24 @@ impl Quicklinks {
             action_id,
             fields: vec![
                 FormField::new("Name", name),
-                FormField::new("Link", link),
+                FormField::new(LINK_LABEL, link),
                 FormField::new("Open with (optional)", open_with),
             ],
         }
     }
 
-    /// Open a quicklink, prompting first when its link takes an argument.
-    fn run(&self, slug: &str) -> ActionResult {
+    /// Open a quicklink with what was typed for its arguments - or, while a
+    /// required one is empty, ask for it instead.
+    fn run(&self, slug: &str, args: &[String]) -> ActionResult {
         let Some(e) = self.find(slug) else {
             return ActionResult::Done;
         };
-        match placeholder(&e.link) {
-            Some(token) => ActionResult::RequestText {
-                prompt: if token.is_empty() {
-                    DEFAULT_ARG.to_string()
-                } else {
-                    token.to_string()
-                },
-                action_id: "fill",
-            },
-            None => {
-                open(&e.link, &e.open_with);
-                ActionResult::Close
-            }
+        let template = Template::parse(&e.link);
+        if template.missing(args) {
+            return ActionResult::RequestArguments;
         }
+        open(&template.fill(args), &e.open_with);
+        ActionResult::Close
     }
 
     /// Write a quicklink to memory and to the config file.
@@ -313,11 +317,17 @@ impl Plugin for Quicklinks {
         }
     }
 
-    fn activate(&mut self, item: &ResultItem) -> ActionResult {
+    fn arguments(&self, item: &ResultItem) -> Vec<Argument> {
+        self.find(&item.payload)
+            .map(|e| Template::parse(&e.link).arguments())
+            .unwrap_or_default()
+    }
+
+    fn activate(&mut self, item: &ResultItem, args: &[String]) -> ActionResult {
         if item.payload == CREATE_PAYLOAD {
             return Self::form("New Quicklink", None, "create");
         }
-        self.run(&item.payload)
+        self.run(&item.payload, args)
     }
 
     fn actions(&self, item: &ResultItem) -> Vec<Action> {
@@ -356,9 +366,9 @@ impl Plugin for Quicklinks {
         actions
     }
 
-    fn run_action(&mut self, action_id: &str, item: &ResultItem) -> ActionResult {
+    fn run_action(&mut self, action_id: &str, item: &ResultItem, args: &[String]) -> ActionResult {
         match action_id {
-            "open" => self.run(&item.payload),
+            "open" => self.run(&item.payload, args),
             "create" => Self::form("New Quicklink", None, "create"),
             "edit" => match self.find(&item.payload) {
                 Some(e) => Self::form("Edit Quicklink", Some(e), "edit"),
@@ -389,24 +399,14 @@ impl Plugin for Quicklinks {
     }
 
     fn submit_text(&mut self, action_id: &str, item: &ResultItem, text: &str) -> ActionResult {
-        match action_id {
-            "set_alias" => {
-                let alias = config::sanitize_key(text);
-                if !alias.is_empty() {
-                    self.aliases.set(&alias, &item.payload);
-                    config::upsert_alias_file(&alias, &item.payload);
-                }
-                ActionResult::Done
+        if action_id == "set_alias" {
+            let alias = config::sanitize_key(text);
+            if !alias.is_empty() {
+                self.aliases.set(&alias, &item.payload);
+                config::upsert_alias_file(&alias, &item.payload);
             }
-            "fill" => {
-                let Some(e) = self.find(&item.payload) else {
-                    return ActionResult::Done;
-                };
-                open(&fill(&e.link, text), &e.open_with);
-                ActionResult::Close
-            }
-            _ => ActionResult::Done,
         }
+        ActionResult::Done
     }
 
     fn submit_form(
@@ -431,7 +431,7 @@ impl Plugin for Quicklinks {
                 action_id: if action_id == "edit" { "edit" } else { "create" },
                 fields: vec![
                     FormField::new("Name", &name),
-                    FormField::new("Link", &link),
+                    FormField::new(LINK_LABEL, &link),
                     FormField::new("Open with (optional)", &open_with),
                 ],
             };
@@ -448,27 +448,281 @@ impl Plugin for Quicklinks {
     }
 }
 
-/// The first `{token}` in a link. `None` when the link takes no argument.
-fn placeholder(link: &str) -> Option<&str> {
-    let start = link.find('{')?;
-    let end = link[start + 1..].find('}')? + start + 1;
-    Some(&link[start + 1..end])
+/// What a link asks for, and where each answer goes.
+struct Template<'a> {
+    link: &'a str,
+    holes: Vec<Placeholder>,
+    /// Per hole, the argument it reads; `None` past [`MAX_ARGS`], where the
+    /// placeholder is left as written.
+    slots: Vec<Option<usize>>,
+    /// Per argument, in order of first appearance: the name it goes by
+    /// (`None` for an unnamed `{argument}`) and its default value.
+    args: Vec<(Option<String>, Option<String>)>,
 }
 
-/// Substitute `value` for the link's placeholder token.
-///
-/// Percent-encodes only for URLs: a file path argument must keep its spaces
-/// and backslashes intact.
-fn fill(link: &str, value: &str) -> String {
-    let Some(token) = placeholder(link) else {
-        return link.to_string();
-    };
-    let encoded = if link.contains("://") {
-        percent_encode(value)
-    } else {
-        value.to_string()
-    };
-    link.replace(&format!("{{{token}}}"), &encoded)
+impl<'a> Template<'a> {
+    fn parse(link: &'a str) -> Self {
+        let holes = placeholders(link);
+        let mut args: Vec<(Option<String>, Option<String>)> = Vec::new();
+        let mut slots = Vec::with_capacity(holes.len());
+        for hole in &holes {
+            // A name seen before is the same argument; an unnamed one is
+            // always a new one.
+            let known = hole
+                .name
+                .as_ref()
+                .and_then(|n| args.iter().position(|(a, _)| a.as_ref() == Some(n)));
+            let slot = match known {
+                Some(i) => Some(i),
+                None if args.len() < MAX_ARGS => {
+                    args.push((hole.name.clone(), None));
+                    Some(args.len() - 1)
+                }
+                None => None,
+            };
+            // An argument keeps the first default any of its placeholders
+            // gives.
+            if let Some(i) = slot
+                && args[i].1.is_none()
+            {
+                args[i].1 = hole.default.clone();
+            }
+            slots.push(slot);
+        }
+        Self {
+            link,
+            holes,
+            slots,
+            args,
+        }
+    }
+
+    /// The fields to show for this link, in order.
+    fn arguments(&self) -> Vec<Argument> {
+        self.args
+            .iter()
+            .map(|(name, default)| Argument {
+                name: match name {
+                    Some(n) if !n.is_empty() => n.clone(),
+                    _ => DEFAULT_ARG.to_string(),
+                },
+                required: default.is_none(),
+            })
+            .collect()
+    }
+
+    /// Whether `values` leaves a required argument empty.
+    fn missing(&self, values: &[String]) -> bool {
+        self.args.iter().enumerate().any(|(i, (_, default))| {
+            default.is_none() && values.get(i).is_none_or(|v| v.is_empty())
+        })
+    }
+
+    /// The link with each placeholder replaced by its argument's value, or
+    /// by the default when that was left empty.
+    ///
+    /// Percent-encodes only for URLs, unless a modifier says otherwise: a
+    /// file path argument must keep its spaces and backslashes intact.
+    fn fill(&self, values: &[String]) -> String {
+        let url = self.link.contains("://");
+        let mut out = String::with_capacity(self.link.len());
+        let mut copied = 0;
+        for (hole, slot) in self.holes.iter().zip(&self.slots) {
+            let Some(i) = *slot else { continue };
+            let value = match values.get(i) {
+                Some(v) if !v.is_empty() => v.as_str(),
+                _ => self.args[i].1.as_deref().unwrap_or(""),
+            };
+            out.push_str(&self.link[copied..hole.span.start]);
+            out.push_str(&hole.render(value, url));
+            copied = hole.span.end;
+        }
+        out.push_str(&self.link[copied..]);
+        out
+    }
+}
+
+/// A `{...}` in a link that reads an argument.
+#[derive(Debug, PartialEq)]
+struct Placeholder {
+    /// Where it sits in the link, braces included.
+    span: std::ops::Range<usize>,
+    /// The argument it reads: placeholders sharing a name share a value. An
+    /// unnamed `{argument}` (`None`) is an argument of its own.
+    name: Option<String>,
+    /// Substituted when the argument is left empty, which makes it optional.
+    default: Option<String>,
+    modifiers: Vec<Modifier>,
+}
+
+impl Placeholder {
+    /// Read the text between a pair of braces. Raycast's spelling is the
+    /// word `argument` and then `key="value"` attributes; anything else is
+    /// apex's original bare form, where the token itself is the name -
+    /// except a GUID, which is a shell folder (`shell:::{...}`), not a
+    /// question.
+    fn parse(inner: &str, span: std::ops::Range<usize>) -> Option<Self> {
+        let (head, modifiers) = split_modifiers(inner);
+        let head = head.trim();
+        let modifiers = modifiers.split('|').filter_map(Modifier::parse).collect();
+        let (keyword, attrs) = head.split_once(char::is_whitespace).unwrap_or((head, ""));
+        if keyword.eq_ignore_ascii_case("argument") {
+            let attrs = attributes(attrs);
+            let get = |key: &str| {
+                attrs
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                    .map(|(_, v)| v.to_string())
+            };
+            Some(Self {
+                span,
+                name: get("name"),
+                default: get("default"),
+                modifiers,
+            })
+        } else if is_guid(head) {
+            None
+        } else {
+            Some(Self {
+                span,
+                name: Some(head.to_string()),
+                default: None,
+                modifiers,
+            })
+        }
+    }
+
+    /// What goes into the link in place of this placeholder.
+    fn render(&self, value: &str, url: bool) -> String {
+        let mut out = value.to_string();
+        // A URL percent-encodes by default; `raw` opts out, and an explicit
+        // `percent-encode` has already done it.
+        let mut formatted = false;
+        for m in &self.modifiers {
+            match m {
+                Modifier::Raw => formatted = true,
+                Modifier::Encode => {
+                    out = percent_encode(&out);
+                    formatted = true;
+                }
+                Modifier::Trim => out = out.trim().to_string(),
+                Modifier::Upper => out = out.to_uppercase(),
+                Modifier::Lower => out = out.to_lowercase(),
+            }
+        }
+        if url && !formatted {
+            percent_encode(&out)
+        } else {
+            out
+        }
+    }
+}
+
+/// A Raycast modifier, written after a `|` in a placeholder
+/// (`{argument | raw}`): a transform applied to the value before it goes
+/// into the link.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Modifier {
+    /// Substitute the value as typed, even into a URL.
+    Raw,
+    /// Percent-encode the value, even into a path.
+    Encode,
+    Trim,
+    Upper,
+    Lower,
+}
+
+impl Modifier {
+    /// `None` for a modifier apex does not know, which is then ignored: a
+    /// link written for Raycast still opens.
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "raw" => Some(Self::Raw),
+            "percent-encode" => Some(Self::Encode),
+            "trim" => Some(Self::Trim),
+            "uppercase" => Some(Self::Upper),
+            "lowercase" => Some(Self::Lower),
+            _ => None,
+        }
+    }
+}
+
+/// Every placeholder in `link`, in order. A `{` inside a pair restarts it,
+/// so `{{query}}` reads `query` and leaves the outer braces as they are.
+fn placeholders(link: &str) -> Vec<Placeholder> {
+    let mut out = Vec::new();
+    let mut open = None;
+    for (i, c) in link.char_indices() {
+        match c {
+            '{' => open = Some(i),
+            '}' => {
+                if let Some(start) = open.take()
+                    && let Some(p) = Placeholder::parse(&link[start + 1..i], start..i + 1)
+                {
+                    out.push(p);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Split a placeholder at its first `|`: what it reads, and the modifiers.
+/// A `|` inside a quoted attribute value does not count; a quote counts as
+/// one only straight after `=`, so an apostrophe in a bare name is just a
+/// letter.
+fn split_modifiers(inner: &str) -> (&str, &str) {
+    let mut quote = None;
+    let mut prev = ' ';
+    for (i, c) in inner.char_indices() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if matches!(c, '"' | '\'') && prev == '=' => quote = Some(c),
+            None if c == '|' => return (&inner[..i], &inner[i + 1..]),
+            None => {}
+        }
+        if !c.is_whitespace() {
+            prev = c;
+        }
+    }
+    (inner, "")
+}
+
+/// The `key=value` pairs of a Raycast placeholder, each value in either
+/// quote style or bare.
+fn attributes(mut s: &str) -> Vec<(&str, &str)> {
+    let mut out = Vec::new();
+    while let Some(eq) = s.find('=') {
+        // The key is the word right before the `=`, so stray text ahead of
+        // it costs only itself.
+        let key = s[..eq].split_whitespace().next_back().unwrap_or("");
+        let rest = s[eq + 1..].trim_start();
+        let (value, after) = match rest.chars().next() {
+            Some(q @ ('"' | '\'')) => match rest[1..].find(q) {
+                Some(end) => (&rest[1..1 + end], &rest[2 + end..]),
+                None => (&rest[1..], ""),
+            },
+            _ => {
+                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                (&rest[..end], &rest[end..])
+            }
+        };
+        out.push((key, value));
+        s = after;
+    }
+    out
+}
+
+/// Whether `s` is a GUID, such as the `20D04FE0-3AEA-1069-A2D8-08002B30309D`
+/// in `shell:::{...}` (This PC).
+fn is_guid(s: &str) -> bool {
+    s.len() == 36
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
 }
 
 fn percent_encode(s: &str) -> String {
@@ -566,34 +820,195 @@ mod tests {
         assert_eq!(shared.of("github"), None);
     }
 
+    fn arg(name: &str, required: bool) -> Argument {
+        Argument {
+            name: name.to_string(),
+            required,
+        }
+    }
+
+    fn args_of(link: &str) -> Vec<Argument> {
+        Template::parse(link).arguments()
+    }
+
+    fn fill(link: &str, values: &[&str]) -> String {
+        let values: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+        Template::parse(link).fill(&values)
+    }
+
     #[test]
-    fn placeholder_is_the_first_braced_token() {
-        assert_eq!(placeholder("https://x.dev/s?q={query}"), Some("query"));
-        assert_eq!(placeholder("https://x.dev/{user}/{repo}"), Some("user"));
-        assert_eq!(placeholder("https://x.dev/{}"), Some(""));
-        assert_eq!(placeholder("https://x.dev"), None);
-        assert_eq!(placeholder("no closing {brace"), None);
+    fn both_spellings_of_a_placeholder_take_an_argument() {
+        // apex's original bare token, named by its text.
+        assert_eq!(
+            args_of("https://x.dev/s?q={query}"),
+            vec![arg("query", true)]
+        );
+        // Raycast's, named by an attribute in either quote style, or bare.
+        assert_eq!(
+            args_of(r#"https://giphy.com/search/{argument name="search"}"#),
+            vec![arg("search", true)]
+        );
+        assert_eq!(
+            args_of("https://x.dev/{argument name='a b'}"),
+            vec![arg("a b", true)]
+        );
+        assert_eq!(
+            args_of("https://x.dev/{argument name=q}"),
+            vec![arg("q", true)]
+        );
+        // Unnamed: Raycast's `{argument}`, or apex's empty `{}`.
+        assert_eq!(
+            args_of("https://x.dev/{argument}"),
+            vec![arg(DEFAULT_ARG, true)]
+        );
+        assert_eq!(args_of("https://x.dev/{}"), vec![arg(DEFAULT_ARG, true)]);
+        // No placeholder, no argument; an unclosed brace is just a brace.
+        assert!(args_of("https://x.dev").is_empty());
+        assert!(args_of("no closing {brace").is_empty());
+    }
+
+    #[test]
+    fn a_shared_name_is_one_argument_and_three_is_the_most() {
+        // One name, one field, however often it appears and in either form.
+        assert_eq!(
+            args_of(r#"https://x.dev/{q}?also={argument name="q"}"#),
+            vec![arg("q", true)]
+        );
+        // Distinct names in order of first appearance.
+        assert_eq!(
+            args_of("https://github.com/{user}/{repo}"),
+            vec![arg("user", true), arg("repo", true)]
+        );
+        // Each unnamed `{argument}` is a field of its own.
+        assert_eq!(args_of("https://x.dev/{argument}/{argument}").len(), 2);
+        // Past three, a placeholder is left as written.
+        let link = "https://x.dev/{a}/{b}/{c}/{d}";
+        assert_eq!(args_of(link).len(), MAX_ARGS);
+        assert_eq!(fill(link, &["1", "2", "3"]), "https://x.dev/1/2/3/{d}");
+    }
+
+    #[test]
+    fn a_default_makes_an_argument_optional() {
+        let link = r#"https://translate.google.com/?sl={argument name="from" default="auto"}&tl={argument name="to"}"#;
+        assert_eq!(args_of(link), vec![arg("from", false), arg("to", true)]);
+        // Left empty, it fills in; typed, the typed value wins.
+        assert_eq!(
+            fill(link, &["", "de"]),
+            "https://translate.google.com/?sl=auto&tl=de"
+        );
+        assert_eq!(
+            fill(link, &["fr", "de"]),
+            "https://translate.google.com/?sl=fr&tl=de"
+        );
+        // Only an argument with no default stops the link opening.
+        let t = Template::parse(link);
+        assert!(t.missing(&["fr".into(), String::new()]));
+        assert!(!t.missing(&[String::new(), "de".into()]));
+        assert_eq!(
+            args_of(r#"https://x.dev/{argument default="x"}"#),
+            vec![arg(DEFAULT_ARG, false)]
+        );
     }
 
     #[test]
     fn fill_encodes_urls_but_not_paths() {
         assert_eq!(
-            fill("https://x.dev/s?q={query}", "rust lang&c"),
+            fill("https://x.dev/s?q={query}", &["rust lang&c"]),
             "https://x.dev/s?q=rust%20lang%26c"
         );
         assert_eq!(
-            fill(r"C:\notes\{name}.md", "my file"),
+            fill(r"C:\notes\{name}.md", &["my file"]),
             r"C:\notes\my file.md"
         );
-        assert_eq!(fill("https://x.dev", "ignored"), "https://x.dev");
+        assert_eq!(fill("https://x.dev", &["ignored"]), "https://x.dev");
     }
 
     #[test]
     fn fill_replaces_every_occurrence_of_the_token() {
         assert_eq!(
-            fill("https://x.dev/{q}?also={q}", "a b"),
+            fill("https://x.dev/{q}?also={q}", &["a b"]),
             "https://x.dev/a%20b?also=a%20b"
         );
+    }
+
+    #[test]
+    fn modifiers_transform_the_value_before_it_goes_in() {
+        // The default encodes a slash; `raw` keeps it, for a path in a URL.
+        assert_eq!(
+            fill("https://github.com/{repo}", &["rust-lang/rust"]),
+            "https://github.com/rust-lang%2Frust"
+        );
+        assert_eq!(
+            fill(
+                r#"https://github.com/{argument name="repo" | raw}"#,
+                &["rust-lang/rust"]
+            ),
+            "https://github.com/rust-lang/rust"
+        );
+        // `percent-encode` encodes even where the link is not a URL.
+        assert_eq!(
+            fill(
+                "mailto:me@x.dev?subject={s | percent-encode}",
+                &["hi there"]
+            ),
+            "mailto:me@x.dev?subject=hi%20there"
+        );
+        // They chain in order, and the URL's own encoding comes last.
+        assert_eq!(
+            fill("https://x.dev/{q | trim | uppercase}", &["  ab c "]),
+            "https://x.dev/AB%20C"
+        );
+        assert_eq!(
+            fill("https://x.dev/{q|lowercase}", &["ABC"]),
+            "https://x.dev/abc"
+        );
+        // An unknown modifier is ignored, and does not muddle the name.
+        assert_eq!(
+            args_of(r#"https://x.dev/{argument name="q" | json-stringify}"#),
+            vec![arg("q", true)]
+        );
+        // A `|` inside a quoted value is part of the value.
+        assert_eq!(
+            args_of(r#"https://x.dev/{argument name="a|b"}"#),
+            vec![arg("a|b", true)]
+        );
+    }
+
+    #[test]
+    fn a_guid_is_a_shell_folder_not_an_argument() {
+        let this_pc = "shell:::{20D04FE0-3AEA-1069-A2D8-08002B30309D}";
+        assert!(args_of(this_pc).is_empty());
+        assert_eq!(fill(this_pc, &[]), this_pc);
+        // In doubled braces, the inner pair is the placeholder.
+        assert_eq!(fill("https://x.dev/{{q}}", &["v"]), "https://x.dev/{v}");
+    }
+
+    #[test]
+    fn opening_with_a_required_argument_empty_asks_for_it_instead() {
+        let mut q = ql(&[(
+            "gify",
+            &[
+                ("name", "Gify"),
+                (
+                    "link",
+                    r#"https://giphy.com/search/{argument name="search"}"#,
+                ),
+            ],
+        )]);
+        let item = q.item_for("gify").unwrap();
+        assert_eq!(q.arguments(&item), vec![arg("search", true)]);
+        // Nothing typed: not opened, from Enter and the actions panel alike.
+        assert!(matches!(
+            q.activate(&item, &[String::new()]),
+            ActionResult::RequestArguments
+        ));
+        assert!(matches!(
+            q.run_action("open", &item, &[]),
+            ActionResult::RequestArguments
+        ));
+        // The create row takes none.
+        let create = q.create_item(0);
+        assert!(q.arguments(&create).is_empty());
     }
 
     #[test]

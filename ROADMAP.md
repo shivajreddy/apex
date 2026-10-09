@@ -145,8 +145,10 @@ of private memory; reading the index file adds none.
 **Quicklinks plugin**
 - Links, folders and programs opened by name, as `[quicklinks.<slug>]`
   sub-tables in the config
-- A `{token}` in the link takes an argument, prompting by the token's name and
-  percent-encoding only for URLs
+- Raycast-style arguments, typed inline in the search bar: up to three per
+  link, as `{argument name="..." default="..."}` or apex's bare `{token}`;
+  `Tab` moves into them, and an alias then `Space` jumps straight in.
+  Percent-encoded only for URLs, unless a modifier (`| raw`) says otherwise
 - Created and edited in-app through a multi-field form; slugs survive renames
   so launch history isn't orphaned
 - Optional `open_with` to route through a specific program

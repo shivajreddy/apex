@@ -12,7 +12,7 @@ Ultra-fast, ultra-lightweight launcher for Windows. Raycast, but native.
 
 ## Status
 
-`v0.6.3`, pre-release. Working today: global hotkey (runs elevated so it works
+`v0.6.4`, pre-release. Working today: global hotkey (runs elevated so it works
 over admin windows), fuzzy app search with icons (desktop + Store apps),
 frecency ranking, quicklinks, apex commands, a tray icon, aliases, an actions
 panel, and a live acrylic backdrop. See [ROADMAP.md](ROADMAP.md) for
@@ -70,14 +70,14 @@ Start-Process "$env:LOCALAPPDATA\Programs\Apex\apex.exe"
 | Key | |
 |---|---|
 | `Ctrl+Esc` | toggle the launcher (configurable) |
-| `Esc` | dismiss |
+| `Esc` | dismiss; in a quicklink's argument field, back to the query |
 | `↑` `↓` | move selection |
 | `Enter` | open |
 | `Ctrl+K` | actions for the selected result |
 | `←` `→` `Home` `End` | move the caret; `Ctrl` jumps by word, `Shift` selects |
 | `Ctrl+A` | select all |
 | `Ctrl+X` `Ctrl+C` `Ctrl+V` | cut, copy, paste - in the query and in any field |
-| `Tab` | next field, in forms |
+| `Tab` `Shift+Tab` | into and between a quicklink's argument fields; next field, in forms |
 
 The mouse works too: hover to highlight, click to launch, wheel to scroll,
 drag the scrollbar (or click its track to jump), click in the query to place
@@ -125,19 +125,42 @@ opened from the actions panel steps back to that panel.
 A quicklink opens a link, folder or program by name. Type `create quicklink`
 to make one, or `Ctrl+K` on an existing one to edit or delete it.
 
-A `{token}` in the link makes the quicklink take an argument: running it asks
-for a value using the token's name, then substitutes it in, percent-encoding
-when the link is a URL.
+A placeholder in the link makes the quicklink take an argument, filled in
+right in the search bar, the way Raycast does it. Select the quicklink and a
+field for each argument appears after the query: `Tab` moves into them
+(`Shift+Tab` back, and `←` `→` carry on from either end of one), `Esc`
+returns to the query, and `Enter` opens the link with the values
+substituted in - percent-encoded when the link is a URL. Typing the
+quicklink's alias and then a space jumps straight into its first argument,
+and Backspace in an empty one steps back out. `Enter` with a required
+argument still empty puts the caret there instead of opening anything.
 
 ```toml
-[quicklinks.github]
-name = 'Search GitHub'
-link = 'https://github.com/search?q={query}'
+[quicklinks.gify]
+name = 'Gify'
+link = 'https://giphy.com/search/{argument name="search"}'
 open_with = 'chrome'        # optional; defaults to the system handler
 ```
 
+Raycast's syntax works as written, so links copy straight across:
+
+| Placeholder | |
+|---|---|
+| `{argument name="search"}` | an argument; placeholders sharing a name share one field |
+| `{argument}` | an unnamed argument, a field of its own each time |
+| `{argument name="lang" default="en"}` | optional: left empty, the default is used |
+| `{argument name="repo" \| raw}` | substituted as typed, not percent-encoded |
+| `{query}` | apex's original form, named by the word inside |
+
+A link takes up to three arguments. The modifiers `raw`, `percent-encode`,
+`trim`, `uppercase` and `lowercase` chain after a `|`; any other is ignored,
+and `options="..."` is accepted but shown as a plain text field. Raycast's
+other placeholders, such as `{clipboard}` or `{date}`, are not filled in
+automatically: each becomes an argument of that name. A `{GUID}`, as in
+`shell:::{20D04FE0-3AEA-1069-A2D8-08002B30309D}`, is left alone.
+
 Prefer `'single quotes'`: they keep Windows paths like `C:\tools\x.exe`
-literal, with no escaping.
+literal, with no escaping, and Raycast's double quotes as they are.
 
 ### Curating what shows up
 

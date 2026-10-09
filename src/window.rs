@@ -645,6 +645,11 @@ unsafe fn repaint(hwnd: HWND) {
             opacity,
             scale,
         };
+        // The frame below borrows the whole App, so the renderer leaves it
+        // while it draws, and goes back before the paint that blits from it.
+        let Some(mut renderer) = app.renderer.take() else {
+            return;
+        };
         let panel = match &app.mode {
             Mode::Search => None,
             Mode::Actions { actions, selected } => Some(render::PanelView::Actions {
@@ -667,6 +672,8 @@ unsafe fn repaint(hwnd: HWND) {
         };
         let frame = render::Frame {
             query: &app.query,
+            args: app.arg_fields(),
+            arg_focus: app.arg_focus(),
             caret_visible: app.caret_visible,
             results: &app.results,
             selected: app.selected,
@@ -676,9 +683,8 @@ unsafe fn repaint(hwnd: HWND) {
             scroll: app.scroll,
             panel,
         };
-        if let Some(r) = app.renderer.as_mut() {
-            r.present(hwnd, &frame, &place);
-        }
+        renderer.present(hwnd, &frame, &place);
+        app.renderer = Some(renderer);
         // Pump the paint now that the App borrow above is done: WM_PAINT
         // fetches the App again to copy the frame in (see `Renderer::blit`).
         let _ = UpdateWindow(hwnd);
@@ -798,7 +804,10 @@ unsafe extern "system" fn wndproc(
             // Hover to highlight. Guarded on the cursor actually having
             // moved: showing the window under a stationary pointer emits
             // WM_MOUSEMOVE, which would otherwise yank the selection away
-            // from the top row before the user has touched anything.
+            // from the top row before the user has touched anything. Not
+            // while an argument is being typed, either: the fields belong
+            // to the selected row, so a nudge of the mouse would take what
+            // was typed with it.
             WM_MOUSEMOVE => {
                 // A scrollbar drag in progress: the pointer owns the thumb
                 // (the mouse is captured, so this arrives even off-window).
@@ -817,6 +826,7 @@ unsafe extern "system" fn wndproc(
                 {
                     let (x, y) = client_dips(hwnd, lparam);
                     if let Some(app) = app_mut(hwnd)
+                        && app.arg_focus().is_none()
                         && let Some(row) = app.row_at(x, y)
                         && app.select(row)
                     {
@@ -859,16 +869,16 @@ unsafe extern "system" fn wndproc(
                 if mode_kind(hwnd) == ModeKind::Search {
                     let (x, y) = client_dips(hwnd, lparam);
                     if y < render::INPUT_H {
-                        // A click in the input places the caret; with Shift
-                        // it extends the selection, as in any edit control.
+                        // A click in the input places the caret, in the
+                        // query or an argument field; with Shift it extends
+                        // the selection, as in any edit control.
                         let shift = (GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0;
                         if let Some(app) = app_mut(hwnd)
-                            && let Some(pos) = app
-                                .renderer
-                                .as_ref()
-                                .and_then(|r| r.hit_test_input(&app.query, x))
+                            && let Some(hit) = app.renderer.as_ref().and_then(|r| {
+                                r.hit_test_input(&app.query, app.arg_fields(), app.arg_focus(), x)
+                            })
                         {
-                            app.place_caret(pos, shift);
+                            app.place_caret(hit, shift);
                             nudge_caret(hwnd);
                             repaint(hwnd);
                         }
@@ -1222,7 +1232,22 @@ unsafe fn on_keydown(hwnd: HWND, key: VIRTUAL_KEY) {
 
         match mode_kind(hwnd) {
             ModeKind::Search => match key {
-                VK_ESCAPE => hide(hwnd),
+                // Out of an argument field first; Esc in the query dismisses.
+                VK_ESCAPE => {
+                    if app_mut(hwnd).is_some_and(|a| a.leave_args()) {
+                        nudge_caret(hwnd);
+                        repaint(hwnd);
+                    } else {
+                        hide(hwnd);
+                    }
+                }
+                // Into the selected row's arguments and between them.
+                VK_TAB => {
+                    if app_mut(hwnd).is_some_and(|a| a.tab(shift)) {
+                        nudge_caret(hwnd);
+                        repaint(hwnd);
+                    }
+                }
                 VK_K if ctrl => {
                     if app_mut(hwnd).map(|a| a.open_actions()).unwrap_or(false) {
                         repaint(hwnd);
@@ -1244,6 +1269,11 @@ unsafe fn on_keydown(hwnd: HWND, key: VIRTUAL_KEY) {
                     let outcome = app_mut(hwnd)
                         .map(|a| a.activate_selected())
                         .unwrap_or(UiOutcome::Stay);
+                    // Still here: perhaps the caret just moved into an
+                    // argument that needs filling in, so show it at once.
+                    if outcome == UiOutcome::Stay {
+                        nudge_caret(hwnd);
+                    }
                     settle(hwnd, outcome);
                 }
                 _ => {}

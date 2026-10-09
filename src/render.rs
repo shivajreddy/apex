@@ -47,6 +47,20 @@ const PANEL_PAD: f32 = 6.0;
 const PANEL_MARGIN: f32 = 8.0;
 /// Width of the text caret.
 const CARET_W: f32 = 2.0;
+// Argument fields: outlined boxes after the query, one per argument the
+// selected row takes - Raycast's inline arguments. Each is as wide as its
+// name or its value, whichever is longer, up to a share of the bar.
+const ARG_H: f32 = 32.0;
+const ARG_PAD_X: f32 = 10.0;
+const ARG_RADIUS: f32 = 7.0;
+/// Between the query and the first field.
+const ARG_LEAD: f32 = 14.0;
+/// Between one field and the next.
+const ARG_GAP: f32 = 8.0;
+/// The widest one field grows; past it, the text scrolls.
+const ARG_MAX_W: f32 = 260.0;
+/// The narrowest the fields squeeze the query, which then scrolls.
+const ARG_MIN_QUERY_W: f32 = 120.0;
 // Scrollbar: a rounded thumb on a faint track at the right edge of the list,
 // Raycast-style - shown only when the list overflows.
 const SCROLLBAR_W: f32 = 6.0;
@@ -164,6 +178,11 @@ pub fn form_window_height(fields: usize) -> f32 {
 /// Everything the renderer needs for one frame.
 pub struct Frame<'a> {
     pub query: &'a TextField,
+    /// The selected row's argument fields, drawn after the query. Empty
+    /// when it takes none, or while they are out of sight.
+    pub args: &'a [FormEntry],
+    /// Which of `args` has the caret; `None` while the query has it.
+    pub arg_focus: Option<usize>,
     pub caret_visible: bool,
     pub results: &'a [ResultItem],
     pub selected: usize,
@@ -195,6 +214,14 @@ pub enum PanelView<'a> {
         fields: &'a [FormEntry],
         focused: usize,
     },
+}
+
+/// What a click in the search bar lands on, with the byte offset in that
+/// field's text nearest to it.
+pub enum InputHit {
+    Query(usize),
+    /// An argument field, by index, and the offset in its value.
+    Arg(usize, usize),
 }
 
 /// The frame's size on screen, in physical pixels.
@@ -291,6 +318,7 @@ pub struct Renderer {
     dwrite: IDWriteFactory,
     d2d: ID2D1Factory,
     fmt_input: IDWriteTextFormat,
+    fmt_arg: IDWriteTextFormat,
     fmt_title: IDWriteTextFormat,
     fmt_subtitle: IDWriteTextFormat,
     fmt_subtitle_left: IDWriteTextFormat,
@@ -422,6 +450,9 @@ impl Renderer {
             let fmt_input = make(20.0, DWRITE_FONT_WEIGHT_NORMAL)?;
             fmt_input.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
             fmt_input.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            let fmt_arg = make(15.0, DWRITE_FONT_WEIGHT_NORMAL)?;
+            fmt_arg.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            fmt_arg.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
             let fmt_title = make(15.0, DWRITE_FONT_WEIGHT_NORMAL)?;
             fmt_title.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
             let fmt_subtitle = make(12.0, DWRITE_FONT_WEIGHT_NORMAL)?;
@@ -443,6 +474,7 @@ impl Renderer {
                 d2d,
                 dwrite,
                 fmt_input,
+                fmt_arg,
                 fmt_title,
                 fmt_subtitle,
                 fmt_subtitle_left,
@@ -532,43 +564,42 @@ impl Renderer {
         }
     }
 
-    /// Byte offset in the query nearest to a click at `x` DIPs from the
-    /// window's left edge, for placing the caret with the mouse.
-    pub fn hit_test_input(&self, field: &TextField, x: f32) -> Option<usize> {
-        let text = field.text();
-        let caret_x = measure(&self.dwrite, &self.fmt_input, &text[..field.caret()]);
-        let shift = field_shift(caret_x, WINDOW_WIDTH - PAD_X * 2.0);
-        let local = x - PAD_X + shift;
-        unsafe {
-            let units: Vec<u16> = text.encode_utf16().collect();
-            let layout = self
-                .dwrite
-                .CreateTextLayout(&units, &self.fmt_input, 8192.0, INPUT_H)
-                .ok()?;
-            let mut trailing = BOOL(0);
-            let mut inside = BOOL(0);
-            let mut metrics = DWRITE_HIT_TEST_METRICS::default();
-            layout
-                .HitTestPoint(local, INPUT_H / 2.0, &mut trailing, &mut inside, &mut metrics)
-                .ok()?;
-            let mut units_left = metrics.textPosition as usize
-                + if trailing.as_bool() {
-                    metrics.length as usize
-                } else {
-                    0
-                };
-            // UTF-16 index back to a byte offset.
-            let mut bytes = 0;
-            for c in text.chars() {
-                let len16 = c.len_utf16();
-                if len16 > units_left {
-                    break;
-                }
-                units_left -= len16;
-                bytes += c.len_utf8();
+    /// The search bar field under a click at `x` DIPs from the window's left
+    /// edge, and the byte offset in it nearest to the click, for placing the
+    /// caret with the mouse. `args` and `arg_focus` are the frame's, so this
+    /// tests against the layout that was drawn.
+    pub fn hit_test_input(
+        &self,
+        query: &TextField,
+        args: &[FormEntry],
+        arg_focus: Option<usize>,
+        x: f32,
+    ) -> Option<InputHit> {
+        let layout = input_layout(&self.dwrite, &self.fmt_input, &self.fmt_arg, query, args);
+        for (i, &(left, right)) in layout.args.iter().enumerate() {
+            if (left..right).contains(&x) {
+                let pos = hit_test_field(
+                    &self.dwrite,
+                    &self.fmt_arg,
+                    &args[i].value,
+                    left + ARG_PAD_X,
+                    right - left - ARG_PAD_X * 2.0,
+                    arg_focus == Some(i),
+                    x,
+                )?;
+                return Some(InputHit::Arg(i, pos));
             }
-            Some(bytes)
         }
+        let pos = hit_test_field(
+            &self.dwrite,
+            &self.fmt_input,
+            query,
+            PAD_X,
+            layout.query_right - PAD_X,
+            arg_focus.is_none(),
+            x,
+        )?;
+        Some(InputHit::Query(pos))
     }
 
     /// Draw `frame` and put it on screen at `place`.
@@ -623,6 +654,8 @@ impl Renderer {
     unsafe fn draw(&mut self, frame: &Frame, place: &Placement) -> Result<()> {
         let Frame {
             query,
+            args,
+            arg_focus,
             caret_visible,
             results,
             selected,
@@ -633,10 +666,12 @@ impl Renderer {
             panel,
         } = frame;
         let (query, caret_visible, selected, scroll) = (*query, *caret_visible, *selected, *scroll);
+        let (args, arg_focus) = (*args, *arg_focus);
         let translucent = self.translucent;
         let Self {
             dwrite,
             fmt_input,
+            fmt_arg,
             fmt_title,
             fmt_subtitle,
             fmt_subtitle_left,
@@ -699,28 +734,80 @@ impl Renderer {
                 rt.FillRectangle(&full, &b.bg_solid);
             }
 
-            // Search input (query text or placeholder).
+            // Search input: the query (or its placeholder), then the
+            // selected row's argument fields.
             let input_rect = D2D_RECT_F {
                 left: PAD_X,
                 top: 0.0,
                 right: width - PAD_X,
                 bottom: INPUT_H,
             };
-            if query.is_empty() {
+            if query.is_empty() && args.is_empty() {
                 draw_text(rt, "Search apps and commands…", fmt_input, &input_rect, &b.dim);
             }
+            let layout = input_layout(dwrite, fmt_input, fmt_arg, query, args);
+            // No caret anywhere while a panel has the keyboard.
+            let typing = panel.is_none();
             draw_field(
                 rt,
                 dwrite,
                 b,
                 query,
                 fmt_input,
-                &input_rect,
-                panel.is_none().then_some(Focus {
+                &D2D_RECT_F {
+                    right: layout.query_right,
+                    ..input_rect
+                },
+                (typing && arg_focus.is_none()).then_some(Focus {
                     caret_visible,
                     caret_half: 12.0,
                 }),
             );
+            for (i, (arg, &(left, right))) in args.iter().zip(&layout.args).enumerate() {
+                let focused = typing && arg_focus == Some(i);
+                let top = (INPUT_H - ARG_H) / 2.0;
+                // Outline inset half a DIP so the hairline stays crisp; the
+                // field with the caret is drawn brighter.
+                rt.DrawRoundedRectangle(
+                    &D2D1_ROUNDED_RECT {
+                        rect: D2D_RECT_F {
+                            left: left + 0.5,
+                            top: top + 0.5,
+                            right: right - 0.5,
+                            bottom: top + ARG_H - 0.5,
+                        },
+                        radiusX: ARG_RADIUS,
+                        radiusY: ARG_RADIUS,
+                    },
+                    if focused { &b.dim } else { &b.badge_border },
+                    1.0,
+                    None,
+                );
+                let inner = D2D_RECT_F {
+                    left: left + ARG_PAD_X,
+                    top,
+                    right: right - ARG_PAD_X,
+                    bottom: top + ARG_H,
+                };
+                // The argument's name stands in until something is typed.
+                if arg.value.is_empty() {
+                    rt.PushAxisAlignedClip(&inner, D2D1_ANTIALIAS_MODE_ALIASED);
+                    draw_text(rt, &arg.label, fmt_arg, &inner, &b.dim);
+                    rt.PopAxisAlignedClip();
+                }
+                draw_field(
+                    rt,
+                    dwrite,
+                    b,
+                    &arg.value,
+                    fmt_arg,
+                    &inner,
+                    focused.then_some(Focus {
+                        caret_visible,
+                        caret_half: 9.0,
+                    }),
+                );
+            }
 
             // The list region and bottom bar are always drawn - the window is
             // a fixed size, so an empty result set leaves the list area blank
@@ -1159,6 +1246,118 @@ impl Renderer {
 /// How far a field's content is shifted left so the caret stays in view.
 fn field_shift(caret_x: f32, avail: f32) -> f32 {
     (caret_x + CARET_W - avail).max(0.0)
+}
+
+/// Where the parts of the search bar go, in DIPs.
+struct InputLayout {
+    /// Right edge of the query field, which starts at `PAD_X`.
+    query_right: f32,
+    /// Left and right edge of each argument field.
+    args: Vec<(f32, f32)>,
+}
+
+/// Lay out the search bar: the query, then a field per argument straight
+/// after its text. Shared by drawing and hit-testing, so a click lands on
+/// exactly what is drawn.
+fn input_layout(
+    dwrite: &IDWriteFactory,
+    fmt_input: &IDWriteTextFormat,
+    fmt_arg: &IDWriteTextFormat,
+    query: &TextField,
+    args: &[FormEntry],
+) -> InputLayout {
+    let right = WINDOW_WIDTH - PAD_X;
+    if args.is_empty() {
+        return InputLayout {
+            query_right: right,
+            args: Vec::new(),
+        };
+    }
+    // Room for the caret just past the text, as `draw_field` places it.
+    let caret_room = CARET_W + 1.0;
+    let n = args.len() as f32;
+    let room = right - PAD_X - ARG_MIN_QUERY_W - ARG_LEAD - ARG_GAP * (n - 1.0);
+    let cap = (room / n).min(ARG_MAX_W);
+    let widths: Vec<f32> = args
+        .iter()
+        .map(|a| {
+            let name = measure(dwrite, fmt_arg, &a.label);
+            let value = measure(dwrite, fmt_arg, a.value.text());
+            (name.max(value) + caret_room + ARG_PAD_X * 2.0).min(cap)
+        })
+        .collect();
+    let fields_w = widths.iter().sum::<f32>() + ARG_GAP * (n - 1.0);
+    let wanted = PAD_X + measure(dwrite, fmt_input, query.text()) + caret_room;
+    let query_right = wanted.min(right - fields_w - ARG_LEAD);
+    let mut x = query_right + ARG_LEAD;
+    let spans = widths
+        .into_iter()
+        .map(|w| {
+            let span = (x, x + w);
+            x += w + ARG_GAP;
+            span
+        })
+        .collect();
+    InputLayout {
+        query_right,
+        args: spans,
+    }
+}
+
+/// The byte offset in `field` nearest to `x`, for a field that
+/// [`draw_field`] drew from `left` in `avail` DIPs of width - shifted to
+/// keep the caret in view only while `focused`, as it was drawn.
+fn hit_test_field(
+    dwrite: &IDWriteFactory,
+    format: &IDWriteTextFormat,
+    field: &TextField,
+    left: f32,
+    avail: f32,
+    focused: bool,
+    x: f32,
+) -> Option<usize> {
+    let text = field.text();
+    let shift = if focused {
+        field_shift(measure(dwrite, format, &text[..field.caret()]), avail)
+    } else {
+        0.0
+    };
+    let local = x - left + shift;
+    unsafe {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let layout = dwrite
+            .CreateTextLayout(&units, format, 8192.0, INPUT_H)
+            .ok()?;
+        let mut trailing = BOOL(0);
+        let mut inside = BOOL(0);
+        let mut metrics = DWRITE_HIT_TEST_METRICS::default();
+        layout
+            .HitTestPoint(
+                local,
+                INPUT_H / 2.0,
+                &mut trailing,
+                &mut inside,
+                &mut metrics,
+            )
+            .ok()?;
+        let mut units_left = metrics.textPosition as usize
+            + if trailing.as_bool() {
+                metrics.length as usize
+            } else {
+                0
+            };
+        // UTF-16 index back to a byte offset.
+        let mut bytes = 0;
+        for c in text.chars() {
+            let len16 = c.len_utf16();
+            if len16 > units_left {
+                break;
+            }
+            units_left -= len16;
+            bytes += c.len_utf8();
+        }
+        Some(bytes)
+    }
 }
 
 /// How a focused field shows its caret. `None` means the field is not the

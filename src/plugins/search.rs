@@ -191,7 +191,7 @@ impl Plugin for Search {
         }
     }
 
-    fn activate(&mut self, item: &ResultItem) -> ActionResult {
+    fn activate(&mut self, item: &ResultItem, _args: &[String]) -> ActionResult {
         if launch(&item.payload) {
             ActionResult::Close
         } else {
@@ -232,7 +232,7 @@ impl Plugin for Search {
         actions
     }
 
-    fn run_action(&mut self, action_id: &str, item: &ResultItem) -> ActionResult {
+    fn run_action(&mut self, action_id: &str, item: &ResultItem, _args: &[String]) -> ActionResult {
         match action_id {
             "open" => {
                 launch(&item.payload);

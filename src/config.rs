@@ -64,13 +64,15 @@ commands = true
 #
 #   [quicklinks.github]
 #   name = 'Search GitHub'
-#   link = 'https://github.com/search?q={query}'
+#   link = 'https://github.com/search?q={argument name="query"}'
 #   open_with = 'chrome'        # optional; defaults to the system handler
 #
-# A {token} in the link makes the quicklink take an argument: running it
-# asks for a value using the token's name, then substitutes it in.
+# An {argument} in the link is filled in right in the search bar: select
+# the quicklink and press Tab, or type its alias and a space. Raycast's
+# syntax works - name="...", default="..." for an optional one, | raw to
+# skip percent-encoding, up to three per link - and so does a bare {query}.
 # Prefer 'single quotes' - they keep Windows paths like C:\tools\x.exe
-# literal, with no escaping.
+# literal, with no escaping, and the double quotes above as they are.
 
 # Extra folders to index, alongside the Start menu. Scanned one level deep
 # for .exe, .lnk, .bat, .cmd and .ps1 - handy for portable apps. Add one
@@ -457,12 +459,14 @@ pub fn sanitize_key(text: &str) -> String {
 
 /// Strip characters that the writer cannot represent. [`quote`] falls back to
 /// a basic string when a value contains `'`, so a value containing both quote
-/// styles would be unrepresentable; double quotes are the rarer of the two in
-/// names and links, so they lose.
+/// styles would be unrepresentable. Double quotes are kept otherwise - a
+/// quicklink's `{argument name="query"}` needs them - and lose only to an
+/// apostrophe in the same value, the commoner of the two in names.
 pub fn sanitize_value(text: &str) -> String {
+    let both = text.contains('\'') && text.contains('"');
     text.trim()
         .chars()
-        .filter(|c| *c != '"' && !c.is_control())
+        .filter(|c| !(both && *c == '"') && !c.is_control())
         .collect()
 }
 
@@ -714,6 +718,19 @@ mod tests {
             assert_eq!(Config::from_text(&line).subtables("").len(), 0);
             assert_eq!(parse(&line)[&("s".to_string(), "k".to_string())], v);
         }
+    }
+
+    #[test]
+    fn double_quotes_survive_unless_an_apostrophe_is_there_too() {
+        let link = r#"https://giphy.com/search/{argument name="search"}"#;
+        assert_eq!(sanitize_value(link), link);
+        let line = format!("[s]\nk = {}\n", quote(&sanitize_value(link)));
+        assert_eq!(parse(&line)[&("s".to_string(), "k".to_string())], link);
+        // Both styles at once cannot be written, so the double quotes go.
+        assert_eq!(
+            sanitize_value(r#"{argument name="it's"}"#),
+            "{argument name=it's}"
+        );
     }
 
     #[test]

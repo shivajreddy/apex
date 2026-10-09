@@ -19,9 +19,11 @@ pub struct ResultItem {
     /// Id of the plugin that produced this item.
     pub plugin: &'static str,
     pub title: String,
-    /// Short label drawn as a pill immediately after the title, e.g. the
-    /// alias that reaches this item. Kept separate from `subtitle` so it can
-    /// sit next to the name rather than in the right-hand type column.
+    /// Short label drawn as a pill immediately after the title: the alias
+    /// that reaches this item. Kept separate from `subtitle` so it can sit
+    /// next to the name rather than in the right-hand type column. The shell
+    /// reads it as the alias too: typing it, then Space, jumps into the
+    /// item's [arguments](Plugin::arguments).
     pub badge: Option<String>,
     /// Dimmed label drawn right after the title (before the alias pill), the
     /// group the item belongs to - e.g. "Apex" for a command. Empty when the
@@ -95,6 +97,18 @@ pub struct Action {
     pub label: String,
 }
 
+/// An input a result takes before it runs, such as a quicklink's
+/// `{argument}`. Each is a field typed into after the query, in the search
+/// bar itself; the values reach [`Plugin::activate`] in the same order.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Argument {
+    /// Shown in the field while it is empty.
+    pub name: String,
+    /// Whether the result refuses to run while this is empty. An argument
+    /// with a default value is optional.
+    pub required: bool,
+}
+
 /// One editable line in a [`ActionResult::RequestForm`] form.
 pub struct FormField {
     pub label: String,
@@ -154,6 +168,10 @@ pub enum ActionResult {
         action_id: &'static str,
         fields: Vec<FormField>,
     },
+    /// Not run: a required [argument](Plugin::arguments) is empty. Back to
+    /// search with the caret in the first empty one; once it is filled in,
+    /// Enter runs the item again.
+    RequestArguments,
 }
 
 pub trait Plugin {
@@ -202,19 +220,34 @@ pub trait Plugin {
     /// on the UI thread.
     fn refresh(&mut self) {}
 
+    /// Inputs `item` takes before it runs, typed into fields after the
+    /// query. Asked for the selected row only, each time the selection or
+    /// the results change, so it must be cheap. Empty for most items.
+    fn arguments(&self, _item: &ResultItem) -> Vec<Argument> {
+        Vec::new()
+    }
+
     /// Run the default action for `item` - the Enter key.
     ///
-    /// Returns the same [`ActionResult`] as a panel action, so Enter can open
-    /// a prompt or a form rather than only launching something.
-    fn activate(&mut self, item: &ResultItem) -> ActionResult;
+    /// `args` holds what was typed for each of [`Plugin::arguments`], in
+    /// order and trimmed; it is empty for an item that takes none. Returns
+    /// the same [`ActionResult`] as a panel action, so Enter can open a
+    /// prompt or a form rather than only launching something.
+    fn activate(&mut self, item: &ResultItem, args: &[String]) -> ActionResult;
 
     /// Entries for the actions panel. Empty = no panel for this item.
     fn actions(&self, _item: &ResultItem) -> Vec<Action> {
         Vec::new()
     }
 
-    /// Run a panel action.
-    fn run_action(&mut self, _action_id: &str, _item: &ResultItem) -> ActionResult {
+    /// Run a panel action. `args` is as for [`Plugin::activate`], for the
+    /// actions that run the item.
+    fn run_action(
+        &mut self,
+        _action_id: &str,
+        _item: &ResultItem,
+        _args: &[String],
+    ) -> ActionResult {
         ActionResult::Done
     }
 

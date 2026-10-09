@@ -1,10 +1,11 @@
-//! Application state: query text, caret, plugins, current results, and the
-//! UI mode (search / actions panel / one-line text input).
+//! Application state: query text, caret, plugins, current results, the
+//! selected row's argument fields, and the UI mode (search / actions panel /
+//! one-line text input).
 
-use crate::editor::{Edit, FormEntry, TextField};
+use crate::editor::{Edit, FormEntry, Motion, TextField};
 use crate::frecency::{self, Frecency};
-use crate::plugin::{Action, ActionResult, FormField, Plugin, ResultItem, ShellCommand};
-use crate::render::Renderer;
+use crate::plugin::{Action, ActionResult, Argument, FormField, Plugin, ResultItem, ShellCommand};
+use crate::render::{InputHit, Renderer};
 use std::borrow::Cow;
 
 /// Hard cap on materialised rows. Generous: the default list holds every
@@ -121,6 +122,21 @@ pub enum Mode {
     },
 }
 
+/// The selected row's arguments, typed into fields after the query - the
+/// way Raycast takes a command's arguments in its search bar.
+#[derive(Default)]
+struct ArgInput {
+    /// The row they belong to, as `(plugin, payload)`.
+    owner: Option<(&'static str, String)>,
+    /// What its plugin asked for.
+    specs: Vec<Argument>,
+    /// One per spec: its name as the label, which is drawn as the
+    /// placeholder, and what has been typed.
+    fields: Vec<FormEntry>,
+    /// The field with the caret; `None` while the query has it.
+    focus: Option<usize>,
+}
+
 /// What the window should do after a mode-level operation.
 #[derive(PartialEq)]
 pub enum UiOutcome {
@@ -155,6 +171,8 @@ pub struct App {
     /// out in DIPs and converted with this at present time.
     pub dpi: f32,
     pub query: TextField,
+    /// The selected row's argument fields, after the query.
+    args: ArgInput,
     pub caret_visible: bool,
     pub plugins: Vec<Box<dyn Plugin>>,
     pub results: Vec<ResultItem>,
@@ -204,6 +222,7 @@ impl App {
             summon: None,
             dpi: 96.0,
             query: TextField::default(),
+            args: ArgInput::default(),
             caret_visible: true,
             plugins,
             results: Vec::new(),
@@ -227,6 +246,8 @@ impl App {
     /// effect either way.
     pub fn reload(&mut self) {
         self.mode = Mode::Search;
+        // A quicklink's link may have changed, and with it what it asks for.
+        self.args = ArgInput::default();
         for p in &mut self.plugins {
             p.refresh();
         }
@@ -268,12 +289,15 @@ impl App {
 
     // ---- text editing --------------------------------------------------
 
-    /// The field keyboard input currently goes to: the query in search mode,
-    /// the prompt's buffer, or the focused form field. None while the
-    /// actions panel is up.
+    /// The field keyboard input currently goes to: in search mode the query
+    /// or the argument field with the caret, else the prompt's buffer or
+    /// the focused form field. None while the actions panel is up.
     fn focused_field(&mut self) -> Option<&mut TextField> {
         match &mut self.mode {
-            Mode::Search => Some(&mut self.query),
+            Mode::Search => match self.args.focus {
+                Some(i) => self.args.fields.get_mut(i).map(|f| &mut f.value),
+                None => Some(&mut self.query),
+            },
             Mode::TextInput { buffer, .. } => Some(buffer),
             Mode::Form {
                 fields, focused, ..
@@ -282,18 +306,154 @@ impl App {
         }
     }
 
+    /// Whether typing goes to the query, and so re-runs the search.
+    fn query_focused(&self) -> bool {
+        matches!(self.mode, Mode::Search) && self.args.focus.is_none()
+    }
+
     /// Apply an edit to the focused field. Returns whether its text changed;
     /// a changed query is re-run against the plugins here, so callers only
     /// need to repaint (and refit the window).
     pub fn edit(&mut self, edit: Edit) -> bool {
+        if matches!(self.mode, Mode::Search) && self.cross_fields(&edit) {
+            return false;
+        }
+        let in_query = self.query_focused();
         let Some(field) = self.focused_field() else {
             return false;
         };
         let changed = field.apply(edit);
-        if changed && matches!(self.mode, Mode::Search) {
+        if changed && in_query {
             self.refresh_results();
         }
         changed
+    }
+
+    /// Keys that move the caret between the query and the argument fields
+    /// rather than editing either. True if `edit` was one of them:
+    ///
+    /// - Space straight after the selected row's alias jumps into its first
+    ///   argument, as in Raycast.
+    /// - Backspace in an empty argument steps back to the field before it.
+    /// - Left and Right carry on into the next field from either end of
+    ///   one. With Shift they only ever select.
+    fn cross_fields(&mut self, edit: &Edit) -> bool {
+        let count = self.args.fields.len();
+        if count == 0 {
+            return false;
+        }
+        let focus = self.args.focus;
+        let field = match focus {
+            Some(i) => &self.args.fields[i].value,
+            None => &self.query,
+        };
+        let collapsed = field.selection().is_none();
+        let at_start = collapsed && field.caret() == 0;
+        let at_end = collapsed && field.caret() == field.text().len();
+        let empty = field.is_empty();
+        // The neighbouring fields; the query comes before the first argument.
+        let next = focus.map_or(0, |i| i + 1);
+        let back = focus.and_then(|i| i.checked_sub(1));
+        let in_query = focus.is_none();
+        let (to, at_end_of_target) = match edit {
+            Edit::Char(0x20) if in_query && at_end && self.alias_typed() => (Some(0), false),
+            Edit::Backspace { .. } if !in_query && empty => (back, true),
+            Edit::Move {
+                motion: Motion::Right,
+                select: false,
+                ..
+            } if at_end && next < count => (Some(next), false),
+            Edit::Move {
+                motion: Motion::Left,
+                select: false,
+                ..
+            } if at_start && !in_query => (back, true),
+            _ => return false,
+        };
+        self.args.focus = to;
+        let target = match to {
+            Some(i) => &mut self.args.fields[i].value,
+            None => &mut self.query,
+        };
+        let pos = if at_end_of_target {
+            target.text().len()
+        } else {
+            0
+        };
+        target.set_caret(pos, false);
+        true
+    }
+
+    /// Whether the query is exactly the selected row's alias.
+    fn alias_typed(&self) -> bool {
+        self.results
+            .get(self.selected)
+            .and_then(|item| item.badge.as_deref())
+            .is_some_and(|alias| alias.eq_ignore_ascii_case(self.query.text()))
+    }
+
+    /// Tab, or Shift+Tab with `back`: move the caret from the query into the
+    /// selected row's argument fields and on through them, stopping at
+    /// either end. False when the row takes no arguments.
+    pub fn tab(&mut self, back: bool) -> bool {
+        let count = self.args.fields.len();
+        if count == 0 || !matches!(self.mode, Mode::Search) {
+            return false;
+        }
+        self.args.focus = match (self.args.focus, back) {
+            (None, false) => Some(0),
+            (Some(i), false) => Some((i + 1).min(count - 1)),
+            (None, true) | (Some(0), true) => None,
+            (Some(i), true) => Some(i - 1),
+        };
+        true
+    }
+
+    /// Esc while typing an argument: back to the query, keeping what was
+    /// typed. False when the query had the caret already, so that Esc goes
+    /// on to dismiss apex.
+    pub fn leave_args(&mut self) -> bool {
+        self.args.focus.take().is_some()
+    }
+
+    /// The argument fields to draw after the query. Kept out of sight on an
+    /// empty query until they are used, so browsing the default list keeps
+    /// its placeholder instead of flashing fields for every row that takes
+    /// arguments.
+    pub fn arg_fields(&self) -> &[FormEntry] {
+        let a = &self.args;
+        let used = a.focus.is_some() || a.fields.iter().any(|f| !f.value.is_empty());
+        if self.query.is_empty() && !used {
+            &[]
+        } else {
+            &a.fields
+        }
+    }
+
+    /// Which argument field has the caret, if one does.
+    pub fn arg_focus(&self) -> Option<usize> {
+        self.args.focus
+    }
+
+    /// What has been typed into each argument field, trimmed like prompts
+    /// and forms are.
+    fn arg_values(&self) -> Vec<String> {
+        self.args
+            .fields
+            .iter()
+            .map(|f| f.value.text().trim().to_string())
+            .collect()
+    }
+
+    /// The first required argument left empty, or failing that the first
+    /// argument.
+    fn first_missing_arg(&self) -> Option<usize> {
+        let a = &self.args;
+        a.specs
+            .iter()
+            .zip(&a.fields)
+            .position(|(spec, f)| spec.required && f.value.text().trim().is_empty())
+            .or((!a.fields.is_empty()).then_some(0))
     }
 
     /// Selected text of the focused field, for Ctrl+C.
@@ -303,16 +463,30 @@ impl App {
 
     /// Remove and return the focused field's selection, for Ctrl+X.
     pub fn cut(&mut self) -> Option<String> {
+        let in_query = self.query_focused();
         let text = self.focused_field()?.cut()?;
-        if matches!(self.mode, Mode::Search) {
+        if in_query {
             self.refresh_results();
         }
         Some(text)
     }
 
-    /// Put the query caret at a byte offset, e.g. under a mouse click.
-    pub fn place_caret(&mut self, pos: usize, select: bool) {
-        self.query.set_caret(pos, select);
+    /// Put the caret where the search bar was clicked: in the query, or in
+    /// an argument field, which takes the focus. `select` extends the
+    /// selection, but only within the field that already had the caret.
+    pub fn place_caret(&mut self, hit: InputHit, select: bool) {
+        let (to, pos) = match hit {
+            InputHit::Query(pos) => (None, pos),
+            InputHit::Arg(i, pos) if i < self.args.fields.len() => (Some(i), pos),
+            InputHit::Arg(..) => return,
+        };
+        let select = select && to == self.args.focus;
+        self.args.focus = to;
+        let field = match to {
+            Some(i) => &mut self.args.fields[i].value,
+            None => &mut self.query,
+        };
+        field.set_caret(pos, select);
     }
 
     /// Reset for the next summon: search mode, empty query, and the default
@@ -324,6 +498,8 @@ impl App {
         self.mode = Mode::Search;
         self.actions_return = None;
         self.listing = Listing::Normal;
+        // Typed arguments go too, even if the same row comes back on top.
+        self.args = ArgInput::default();
         self.query.clear();
         self.refresh_results();
     }
@@ -448,7 +624,8 @@ impl App {
             }
             _ => {}
         }
-        let result = self.dispatch(|p, item| p.run_action(action_id, item));
+        let args = self.arg_values();
+        let result = self.dispatch(|p, item| p.run_action(action_id, item, &args));
         let outcome = self.apply(result);
         // The action opened a form or a prompt: remember the panel it came
         // from, so Esc there goes back to it rather than closing everything.
@@ -559,6 +736,13 @@ impl App {
                 };
                 UiOutcome::Stay
             }
+            ActionResult::RequestArguments => {
+                // It did not run: a field it needs is empty. Put the caret
+                // there, the way an incomplete form would.
+                self.mode = Mode::Search;
+                self.args.focus = self.first_missing_arg();
+                UiOutcome::Stay
+            }
         }
     }
 
@@ -599,8 +783,9 @@ impl App {
     /// Re-run the current query, keeping the selection where possible.
     fn requery(&mut self) {
         let keep = self.selected;
-        self.refresh_results();
+        self.fill_results();
         self.selected = keep.min(self.results.len().saturating_sub(1));
+        self.sync_args();
     }
 
     /// Move selection by `delta`, clamped to the ends (no wrap-around), and
@@ -614,9 +799,55 @@ impl App {
         let last = self.results.len() as i32 - 1;
         self.selected = (self.selected as i32 + delta).clamp(0, last) as usize;
         self.ensure_visible();
+        self.sync_args();
     }
 
+    /// Rebuild the list for the current query, select the top row, and
+    /// bring up its argument fields.
     fn refresh_results(&mut self) {
+        self.fill_results();
+        self.sync_args();
+    }
+
+    /// Point the argument fields at the selected row. Run whenever the
+    /// results or the selection change; while the row - and what it asks
+    /// for - stays the same it changes nothing, so typed values survive
+    /// re-ranking as the query is edited. The sources view toggles rows
+    /// rather than running them, so there nothing takes arguments.
+    fn sync_args(&mut self) {
+        let item = match self.listing {
+            Listing::Manage => None,
+            _ => self.results.get(self.selected),
+        };
+        let specs = item
+            .and_then(|item| {
+                let plugin = self.plugins.iter().find(|p| p.id() == item.plugin)?;
+                Some(plugin.arguments(item))
+            })
+            .unwrap_or_default();
+        let owner = item.map(|i| (i.plugin, i.payload.clone()));
+        if owner == self.args.owner && specs == self.args.specs {
+            return;
+        }
+        self.args = ArgInput {
+            fields: specs
+                .iter()
+                .map(|a| FormEntry {
+                    label: a.name.clone(),
+                    value: TextField::default(),
+                })
+                .collect(),
+            specs,
+            owner,
+            focus: None,
+        };
+    }
+
+    /// Rebuild the list for the current query with the top row selected.
+    /// Callers that move the selection afterwards sync the argument fields
+    /// themselves, once it has settled; syncing here would first throw away
+    /// what was typed for a row that is about to be selected again.
+    fn fill_results(&mut self) {
         self.results.clear();
         self.sections.clear();
         self.dimmed.clear();
@@ -810,8 +1041,9 @@ impl App {
             p.refresh();
         }
         let keep = self.selected;
-        self.refresh_results();
+        self.fill_results();
         self.selected = keep.min(self.results.len().saturating_sub(1));
+        self.sync_args();
     }
 
     /// Switch to the hidden-entry listing.
@@ -984,8 +1216,9 @@ impl App {
         self.mode = Mode::Search;
         let keep = self.selected;
         let scroll = self.scroll;
-        self.refresh_results();
+        self.fill_results();
         self.selected = keep.min(self.results.len().saturating_sub(1));
+        self.sync_args();
         // In the sources view rows only change state, never position, so
         // stay where the user was instead of jumping back to the top.
         if self.listing == Listing::Manage {
@@ -1111,6 +1344,7 @@ impl App {
             return false;
         }
         self.selected = index;
+        self.sync_args();
         true
     }
 
@@ -1145,7 +1379,8 @@ impl App {
             self.toggle_selected();
             return UiOutcome::Stay;
         }
-        let result = self.dispatch(|p, item| p.activate(item));
+        let args = self.arg_values();
+        let result = self.dispatch(|p, item| p.activate(item, &args));
         self.apply(result)
     }
 
@@ -1300,7 +1535,7 @@ mod tests {
         fn query(&mut self, _q: &str, _out: &mut Vec<ResultItem>) {}
         // Enter opens a prompt directly; the one action opens the same
         // prompt from the actions panel.
-        fn activate(&mut self, _item: &ResultItem) -> ActionResult {
+        fn activate(&mut self, _item: &ResultItem, _args: &[String]) -> ActionResult {
             ActionResult::RequestText {
                 prompt: "value".into(),
                 action_id: "prompt",
@@ -1312,8 +1547,13 @@ mod tests {
                 label: "Prompt\u{2026}".into(),
             }]
         }
-        fn run_action(&mut self, _action_id: &str, item: &ResultItem) -> ActionResult {
-            self.activate(item)
+        fn run_action(
+            &mut self,
+            _action_id: &str,
+            item: &ResultItem,
+            args: &[String],
+        ) -> ActionResult {
+            self.activate(item, args)
         }
         fn catalogue(&mut self, out: &mut Vec<ResultItem>) {
             for name in ["alpha", "beta"] {
@@ -1436,5 +1676,334 @@ mod tests {
         a.clear_query();
         assert!(a.listing == Listing::Normal);
         assert!(a.dimmed.is_empty());
+    }
+
+    /// What each run of an [`Argy`] row was given.
+    type Runs = std::rc::Rc<std::cell::RefCell<Vec<Vec<String>>>>;
+
+    /// Rows that take arguments, the shape of quicklinks with `{argument}`
+    /// placeholders: `gify` (alias `g`) takes a required `search`, `pair` a
+    /// required `user` and an optional `repo`, and `plain` none.
+    struct Argy {
+        runs: Runs,
+    }
+
+    impl Argy {
+        const ROWS: [(&'static str, i32); 3] = [("gify", 3), ("pair", 2), ("plain", 1)];
+
+        fn row(payload: &str, score: i32) -> ResultItem {
+            let mut r = row("argy");
+            r.title = payload.into();
+            r.payload = payload.into();
+            r.badge = (payload == "gify").then(|| "g".to_string());
+            r.score = score;
+            r
+        }
+    }
+
+    impl Plugin for Argy {
+        fn id(&self) -> &'static str {
+            "argy"
+        }
+        // Every row matches; a row whose name starts with the query ranks
+        // first.
+        fn query(&mut self, q: &str, out: &mut Vec<ResultItem>) {
+            for (payload, score) in Self::ROWS {
+                let boost = if payload.starts_with(q) { 10 } else { 0 };
+                out.push(Self::row(payload, score + boost));
+            }
+        }
+        fn browse(&mut self, _limit: usize, out: &mut Vec<ResultItem>) {
+            for (payload, score) in Self::ROWS {
+                out.push(Self::row(payload, score));
+            }
+        }
+        fn arguments(&self, item: &ResultItem) -> Vec<Argument> {
+            let arg = |name: &str, required| Argument {
+                name: name.into(),
+                required,
+            };
+            match item.payload.as_str() {
+                "gify" => vec![arg("search", true)],
+                "pair" => vec![arg("user", true), arg("repo", false)],
+                _ => Vec::new(),
+            }
+        }
+        fn activate(&mut self, item: &ResultItem, args: &[String]) -> ActionResult {
+            let wanted = self.arguments(item);
+            let missing = wanted
+                .iter()
+                .enumerate()
+                .any(|(i, a)| a.required && args.get(i).is_none_or(|v| v.is_empty()));
+            if missing {
+                return ActionResult::RequestArguments;
+            }
+            self.runs.borrow_mut().push(args.to_vec());
+            // Dismiss rather than Close: Close records the launch, which
+            // would write the real launch history.
+            ActionResult::Dismiss
+        }
+        fn actions(&self, _item: &ResultItem) -> Vec<Action> {
+            vec![Action {
+                id: "open",
+                label: "Open".into(),
+            }]
+        }
+        fn run_action(
+            &mut self,
+            _action_id: &str,
+            item: &ResultItem,
+            args: &[String],
+        ) -> ActionResult {
+            self.activate(item, args)
+        }
+    }
+
+    fn argy() -> (App, Runs) {
+        let runs = Runs::default();
+        let plugin = Argy {
+            runs: std::rc::Rc::clone(&runs),
+        };
+        let a = App::new(
+            vec![Box::new(plugin) as Box<dyn Plugin>],
+            &crate::config::Config::from_text(""),
+        );
+        (a, runs)
+    }
+
+    /// Type `text` into whichever field has the caret, as WM_CHAR would.
+    fn type_text(a: &mut App, text: &str) {
+        for unit in text.encode_utf16() {
+            a.edit(Edit::Char(unit));
+        }
+    }
+
+    fn arg_texts(a: &App) -> Vec<&str> {
+        a.arg_fields().iter().map(|f| f.value.text()).collect()
+    }
+
+    fn arrow(motion: Motion, select: bool) -> Edit<'static> {
+        Edit::Move {
+            motion,
+            word: false,
+            select,
+        }
+    }
+
+    fn ran(runs: &Runs) -> Vec<Vec<String>> {
+        runs.borrow().clone()
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| v.to_string()).collect()
+    }
+
+    #[test]
+    fn tab_moves_into_the_arguments_and_esc_comes_back_out() {
+        let (mut a, runs) = argy();
+        type_text(&mut a, "gify");
+        assert_eq!(a.results[a.selected].payload, "gify");
+        // The selected row's argument shows after the query, empty.
+        assert_eq!(a.arg_fields().len(), 1);
+        assert_eq!(a.arg_fields()[0].label, "search");
+        assert_eq!(a.arg_focus(), None);
+        // Tab: typing fills the argument now, and is not a search.
+        assert!(a.tab(false));
+        assert_eq!(a.arg_focus(), Some(0));
+        type_text(&mut a, "cats");
+        assert_eq!(arg_texts(&a), ["cats"]);
+        assert_eq!(a.query.text(), "gify");
+        assert_eq!(a.results[a.selected].payload, "gify");
+        // Esc: back to the query, the value kept. In the query there is
+        // nothing to leave, so Esc goes on to dismiss.
+        assert!(a.leave_args());
+        assert_eq!(a.arg_focus(), None);
+        assert_eq!(arg_texts(&a), ["cats"]);
+        assert!(!a.leave_args());
+        // Enter runs the row with what was typed.
+        assert!(a.activate_selected() == UiOutcome::Hide);
+        assert_eq!(ran(&runs), [strings(&["cats"])]);
+    }
+
+    #[test]
+    fn space_after_an_alias_jumps_into_the_first_argument() {
+        let (mut a, _) = argy();
+        type_text(&mut a, "g ");
+        assert_eq!(a.arg_focus(), Some(0), "alias + space focuses the argument");
+        assert_eq!(a.query.text(), "g", "and the space is not typed");
+        // Backspace in the empty argument steps back out, deleting nothing.
+        a.edit(Edit::Backspace { word: false });
+        assert_eq!(a.arg_focus(), None);
+        assert_eq!(a.query.text(), "g");
+        // After anything but the alias, Space is just a space.
+        type_text(&mut a, "ify ");
+        assert_eq!(a.query.text(), "gify ");
+        assert_eq!(a.arg_focus(), None);
+        // Aliases are matched however they are typed.
+        let (mut a, _) = argy();
+        type_text(&mut a, "G ");
+        assert_eq!(a.arg_focus(), Some(0));
+    }
+
+    #[test]
+    fn enter_with_a_required_argument_empty_puts_the_caret_there() {
+        let (mut a, runs) = argy();
+        type_text(&mut a, "gify");
+        assert!(a.activate_selected() == UiOutcome::Stay);
+        assert_eq!(a.arg_focus(), Some(0));
+        // Blank is still empty.
+        type_text(&mut a, "  ");
+        assert!(a.activate_selected() == UiOutcome::Stay);
+        assert!(ran(&runs).is_empty(), "nothing ran");
+        type_text(&mut a, "cats ");
+        assert!(a.activate_selected() == UiOutcome::Hide);
+        assert_eq!(ran(&runs), [strings(&["cats"])], "values arrive trimmed");
+
+        // With an optional argument filled in and the required one not, the
+        // caret goes to the required one.
+        let (mut a, runs) = argy();
+        type_text(&mut a, "pair");
+        assert!(a.tab(false) && a.tab(false));
+        type_text(&mut a, "x");
+        assert!(a.activate_selected() == UiOutcome::Stay);
+        assert_eq!(a.arg_focus(), Some(0));
+        type_text(&mut a, "octo");
+        assert!(a.activate_selected() == UiOutcome::Hide);
+        assert_eq!(ran(&runs), [strings(&["octo", "x"])]);
+    }
+
+    #[test]
+    fn the_open_action_asks_for_arguments_too() {
+        let (mut a, runs) = argy();
+        type_text(&mut a, "gify");
+        assert!(a.open_actions());
+        assert!(a.run_panel_action() == UiOutcome::Stay);
+        assert!(
+            matches!(a.mode, Mode::Search),
+            "the panel gives way to the field"
+        );
+        assert_eq!(a.arg_focus(), Some(0));
+        type_text(&mut a, "cats");
+        assert!(a.open_actions());
+        assert!(a.run_panel_action() == UiOutcome::Hide);
+        assert_eq!(ran(&runs), [strings(&["cats"])]);
+    }
+
+    #[test]
+    fn tab_stops_at_either_end() {
+        let (mut a, _) = argy();
+        type_text(&mut a, "pair");
+        let mut focus = Vec::new();
+        for back in [false, false, false, true, true, true] {
+            assert!(a.tab(back));
+            focus.push(a.arg_focus());
+        }
+        assert_eq!(focus, [Some(0), Some(1), Some(1), Some(0), None, None]);
+        // A row with no arguments has nowhere to go.
+        let (mut a, _) = argy();
+        type_text(&mut a, "pl");
+        assert_eq!(a.results[a.selected].payload, "plain");
+        assert!(!a.tab(false));
+        assert!(a.arg_fields().is_empty());
+    }
+
+    #[test]
+    fn arrows_carry_on_between_the_query_and_the_arguments() {
+        let (mut a, _) = argy();
+        type_text(&mut a, "pair");
+        // Right at the end of the query enters the first argument...
+        a.edit(arrow(Motion::Right, false));
+        assert_eq!(a.arg_focus(), Some(0));
+        type_text(&mut a, "ab");
+        // ...and at the end of that, the next one.
+        a.edit(arrow(Motion::Right, false));
+        assert_eq!(a.arg_focus(), Some(1));
+        // Right at the end of the last stays put.
+        a.edit(arrow(Motion::Right, false));
+        assert_eq!(a.arg_focus(), Some(1));
+        // Left from the start comes back to the end of the one before.
+        a.edit(arrow(Motion::Left, false));
+        assert_eq!(a.arg_focus(), Some(0));
+        assert_eq!(a.args.fields[0].value.caret(), 2);
+        // Inside a field the arrows only move the caret, and with Shift they
+        // only select, even at the edge.
+        a.edit(arrow(Motion::Left, false));
+        a.edit(arrow(Motion::Left, true));
+        a.edit(arrow(Motion::Left, true));
+        assert_eq!(a.arg_focus(), Some(0));
+        assert_eq!(a.args.fields[0].value.selected_text(), Some("a"));
+        // A plain Left collapses the selection first, then crosses.
+        a.edit(arrow(Motion::Left, false));
+        assert_eq!(a.arg_focus(), Some(0));
+        a.edit(arrow(Motion::Left, false));
+        assert_eq!(a.arg_focus(), None);
+        assert_eq!(a.query.caret(), "pair".len());
+    }
+
+    #[test]
+    fn arguments_belong_to_the_selected_row() {
+        let (mut a, _) = argy();
+        type_text(&mut a, "g ");
+        type_text(&mut a, "cats");
+        // Another row: its own empty fields, the caret back in the query.
+        a.move_selection(1);
+        assert_eq!(a.results[a.selected].payload, "pair");
+        assert_eq!(arg_texts(&a), ["", ""]);
+        assert_eq!(a.arg_focus(), None);
+        // Back again: a fresh field, since what was typed went with the
+        // selection.
+        a.move_selection(-1);
+        assert_eq!(arg_texts(&a), [""]);
+
+        // But while the same row stays on top, editing the query keeps what
+        // was typed for it.
+        let (mut a, _) = argy();
+        type_text(&mut a, "g ");
+        type_text(&mut a, "cats");
+        assert!(a.leave_args());
+        type_text(&mut a, "if");
+        assert_eq!(a.results[a.selected].payload, "gify");
+        assert_eq!(arg_texts(&a), ["cats"]);
+    }
+
+    #[test]
+    fn a_click_puts_the_caret_in_the_field_under_it() {
+        let (mut a, _) = argy();
+        type_text(&mut a, "pair");
+        a.place_caret(InputHit::Arg(1, 0), false);
+        assert_eq!(a.arg_focus(), Some(1));
+        type_text(&mut a, "x");
+        assert_eq!(arg_texts(&a), ["", "x"]);
+        a.place_caret(InputHit::Query(2), false);
+        assert_eq!(a.arg_focus(), None);
+        assert_eq!(a.query.caret(), 2);
+        // Shift+click selects only within the field that has the caret.
+        a.place_caret(InputHit::Arg(1, 0), true);
+        assert_eq!(a.args.fields[1].value.selection(), None);
+        // A hit past the fields changes nothing.
+        a.place_caret(InputHit::Arg(5, 0), false);
+        assert_eq!(a.arg_focus(), Some(1));
+    }
+
+    #[test]
+    fn the_fields_stay_out_of_sight_while_browsing() {
+        let (mut a, _) = argy();
+        a.clear_query();
+        assert_eq!(a.results[a.selected].payload, "gify");
+        // An empty query lists rows rather than running one, so the fields
+        // wait to be used.
+        assert!(a.arg_fields().is_empty());
+        assert!(a.tab(false));
+        assert_eq!(a.arg_fields().len(), 1);
+        // Dismissing forgets what was typed, even with the same row on top.
+        type_text(&mut a, "cats");
+        a.clear_query();
+        assert_eq!(a.results[a.selected].payload, "gify");
+        assert!(a.arg_fields().is_empty());
+        assert!(a.tab(false));
+        assert_eq!(arg_texts(&a), [""]);
+        // The sources view toggles rows, so nothing there takes arguments.
+        a.show_manage();
+        assert!(!a.tab(false));
     }
 }
