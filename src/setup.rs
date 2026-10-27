@@ -71,25 +71,13 @@ fn write_shortcut(lnk: &Path, exe: &Path) -> windows::core::Result<()> {
 
 /// Create or remove the elevated logon task that starts apex at sign-in.
 ///
-/// `schtasks` is run as a plain child: apex is already elevated, so `/create
-/// /rl highest` needs no separate prompt. When enabled it is re-created each
-/// launch (`/f`) so the task always points at the exe's current location, the
-/// same way the Start-menu shortcut is re-written each launch.
+/// `schtasks` is run as a plain child: apex is already elevated, so creating a
+/// highest-privilege task needs no separate prompt. When enabled it is
+/// re-created each launch (`/f`) so the task always points at the exe's current
+/// location, the same way the Start-menu shortcut is re-written each launch.
 fn ensure_logon_task(enabled: bool, exe: &Path) {
     if enabled {
-        let ok = run_schtasks(&[
-            "/create",
-            "/tn",
-            TASK_NAME,
-            "/tr",
-            &format!("\"{}\"", exe.display()),
-            "/sc",
-            "onlogon",
-            "/rl",
-            "highest",
-            "/f",
-        ]);
-        if !ok {
+        if !create_logon_task(exe) {
             crate::dlog!("setup: schtasks create failed");
         }
     } else if task_exists() {
@@ -97,6 +85,74 @@ fn ensure_logon_task(enabled: bool, exe: &Path) {
             crate::dlog!("setup: schtasks delete failed");
         }
     }
+}
+
+/// Register the task from XML rather than `/sc onlogon` flags: those keep Task
+/// Scheduler's batch-job defaults, which break a resident app - the task only
+/// starts on AC power (a laptop signed in on battery never got apex), stops
+/// apex when the machine goes on battery, kills it after 72 hours, and runs it
+/// below normal priority (which apps apex starts directly inherit).
+fn create_logon_task(exe: &Path) -> bool {
+    let xml = std::env::temp_dir().join("apex-logon-task.xml");
+    if std::fs::write(&xml, utf16le_with_bom(&logon_task_xml(exe))).is_err() {
+        return false;
+    }
+    let ok = run_schtasks(&[
+        "/create",
+        "/tn",
+        TASK_NAME,
+        "/xml",
+        &xml.to_string_lossy(),
+        "/f",
+    ]);
+    let _ = std::fs::remove_file(&xml);
+    ok
+}
+
+/// What `schtasks /sc onlogon /rl highest` creates, minus those defaults.
+fn logon_task_xml(exe: &Path) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <LogonTrigger />
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>4</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{}</Command>
+    </Exec>
+  </Actions>
+</Task>
+"#,
+        xml_escape(&exe.display().to_string())
+    )
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Task Scheduler's own export encoding, which `schtasks /xml` always reads.
+fn utf16le_with_bom(s: &str) -> Vec<u8> {
+    std::iter::once(0xFEFF_u16)
+        .chain(s.encode_utf16())
+        .flat_map(u16::to_le_bytes)
+        .collect()
 }
 
 /// Whether the logon task is registered. Querying needs no elevation.
@@ -131,4 +187,27 @@ fn remove_run_key() {
 fn wide(s: &OsStr) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
     s.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logon_task_survives_battery_and_has_no_time_limit() {
+        let xml = logon_task_xml(Path::new(r"C:\Tools & Apps\apex.exe"));
+        assert!(xml.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));
+        assert!(xml.contains("<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"));
+        assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+        assert!(xml.contains("<RunLevel>HighestAvailable</RunLevel>"));
+        assert!(
+            xml.contains(r"<Command>C:\Tools &amp; Apps\apex.exe</Command>"),
+            "{xml}"
+        );
+    }
+
+    #[test]
+    fn task_file_is_utf16le_with_bom() {
+        assert_eq!(utf16le_with_bom("<a"), [0xFF, 0xFE, b'<', 0, b'a', 0]);
+    }
 }

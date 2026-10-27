@@ -51,7 +51,7 @@ registers, idempotently, from the `[general]` flags:
 | Flag | Effect |
 |---|---|
 | `start_menu` | Start menu shortcut, pointing at the running exe |
-| `start_on_startup` | `Apex` value under the `HKCU` `Run` key |
+| `start_on_startup` | elevated logon task (`Apex Elevated Logon`) |
 
 Both point at wherever the exe currently is, and both are removed on the next
 launch if you set the flag to `false`.
@@ -224,7 +224,7 @@ run. Symlink it into your dotfiles if that's how you roll.
 ```toml
 [general]
 start_menu = true        # Start menu entry, refreshed each launch
-start_on_startup = true  # run Apex at sign-in (HKCU Run key)
+start_on_startup = true  # run Apex at sign-in (elevated logon task)
 tray_icon = true         # tray icon: Open / Reload / Open Config / Quit
 
 [appearance]
