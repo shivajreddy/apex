@@ -12,7 +12,7 @@ Ultra-fast, ultra-lightweight launcher for Windows. Raycast, but native.
 
 ## Status
 
-`v0.6.4`, pre-release. Working today: global hotkey (runs elevated so it works
+`v0.6.5`, pre-release. Working today: global hotkey (runs elevated so it works
 over admin windows), fuzzy app search with icons (desktop + Store apps),
 frecency ranking, quicklinks, apex commands, a tray icon, aliases, an actions
 panel, and a live acrylic backdrop. See [ROADMAP.md](ROADMAP.md) for
