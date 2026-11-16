@@ -13,11 +13,12 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-use windows::core::{PCWSTR, w};
+use windows::core::w;
 
 use crate::appindex::{self, AppIndex};
 use crate::fuzzy;
 use crate::plugin::{Action, ActionResult, Aliases, Icon, Plugin, ResultItem};
+use crate::script::{self, Window};
 
 pub const ID: &str = "search";
 
@@ -202,10 +203,18 @@ impl Plugin for Search {
     }
 
     fn actions(&self, item: &ResultItem) -> Vec<Action> {
+        let script = is_script_file(&item.payload);
         let mut actions = vec![Action {
             id: "open",
-            label: "Open".to_string(),
+            label: if script { "Run" } else { "Open" }.to_string(),
         }];
+        // A script runs unseen; this runs it once where it can be watched.
+        if script {
+            actions.push(Action {
+                id: "run_terminal",
+                label: "Run in Terminal".to_string(),
+            });
+        }
         // Not for packaged (Store) apps: they run in their container and
         // cannot be elevated, so offering an action that silently does
         // nothing would be worse than not offering it.
@@ -238,8 +247,17 @@ impl Plugin for Search {
                 launch(&item.payload);
                 ActionResult::Close
             }
+            "run_terminal" => {
+                script::run(&item.payload, &[], Window::Keep, false);
+                ActionResult::Close
+            }
             "run_as_admin" => {
-                if crate::launch::open_as_admin(&target(&item.payload)) {
+                let started = if is_script_file(&item.payload) {
+                    script::run(&item.payload, &[], Window::default(), true)
+                } else {
+                    crate::launch::open_as_admin(&target(&item.payload))
+                };
+                if started {
                     ActionResult::Close
                 } else {
                     // A declined UAC prompt (unelevated builds) lands here.
@@ -327,35 +345,18 @@ fn target(app_id: &str) -> String {
 /// AppUserModelID and no file to point at, so fall back to the shell's
 /// Applications folder - the very list apex indexes.
 fn reveal(app_id: &str) -> bool {
-    let is_path = is_file_entry(app_id);
-    let param: Vec<u16> = if is_path {
-        format!("/select,\"{app_id}\"")
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    if is_file_entry(app_id) {
+        return crate::launch::reveal(app_id);
+    }
     unsafe {
-        let inst = if is_path {
-            ShellExecuteW(
-                None,
-                w!("open"),
-                w!("explorer.exe"),
-                PCWSTR(param.as_ptr()),
-                None,
-                SW_SHOWNORMAL,
-            )
-        } else {
-            ShellExecuteW(
-                None,
-                w!("open"),
-                w!("shell:AppsFolder"),
-                None,
-                None,
-                SW_SHOWNORMAL,
-            )
-        };
+        let inst = ShellExecuteW(
+            None,
+            w!("open"),
+            w!("shell:AppsFolder"),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        );
         let ok = inst.0 as isize > 32;
         if !ok {
             crate::dlog!("search: failed to reveal {app_id}");
@@ -364,13 +365,23 @@ fn reveal(app_id: &str) -> bool {
     }
 }
 
+/// Whether an entry is a script in a source folder, which runs with its
+/// interpreter rather than whatever opens its file type.
+fn is_script_file(app_id: &str) -> bool {
+    script::is_script(app_id) && is_file_entry(app_id)
+}
+
 /// Launch an entry. Returns true on success.
 ///
-/// Source-folder entries carry a real path and are run directly; AppsFolder
-/// ids are not paths and have to go through the `shell:AppsFolder` verb.
-/// Goes through [`crate::launch::open`], which hands the target to Explorer
-/// so it runs unelevated even though apex is elevated.
+/// Source-folder entries carry a real path and are run directly - a script
+/// by its interpreter, with no window; AppsFolder ids are not paths and have
+/// to go through the `shell:AppsFolder` verb. Goes through [`crate::launch`],
+/// which has Explorer start it so it runs unelevated even though apex is
+/// elevated.
 fn launch(app_id: &str) -> bool {
+    if is_script_file(app_id) {
+        return script::run(app_id, &[], Window::default(), false);
+    }
     crate::launch::open(&target(app_id), None)
 }
 

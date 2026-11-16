@@ -65,6 +65,7 @@ fn source_name(id: &str) -> Cow<'static, str> {
         SEARCH => "Applications".into(),
         "commands" => "Apex Commands".into(),
         "quicklinks" => "Quicklinks".into(),
+        "scripts" => "Scripts".into(),
         other => other.to_string().into(),
     }
 }

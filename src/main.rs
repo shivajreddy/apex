@@ -26,6 +26,7 @@ mod launch;
 mod plugin;
 mod plugins;
 mod render;
+mod script;
 mod setup;
 mod window;
 
@@ -42,6 +43,12 @@ fn plugins(config: &config::Config) -> Vec<Box<dyn plugin::Plugin>> {
     if config.plugin_enabled(plugins::quicklinks::ID) {
         list.push(Box::new(plugins::quicklinks::Quicklinks::new(
             config.subtables(plugins::quicklinks::ID),
+            aliases.clone(),
+        )));
+    }
+    if config.plugin_enabled(plugins::scripts::ID) {
+        list.push(Box::new(plugins::scripts::Scripts::new(
+            config.script_folders(),
             aliases.clone(),
         )));
     }

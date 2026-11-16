@@ -12,7 +12,7 @@ Ultra-fast, ultra-lightweight launcher for Windows. Raycast, but native.
 
 ## Status
 
-`v0.6.5`, pre-release. Working today: global hotkey (runs elevated so it works
+`v0.6.6`, pre-release. Working today: global hotkey (runs elevated so it works
 over admin windows), fuzzy app search with icons (desktop + Store apps),
 frecency ranking, quicklinks, apex commands, a tray icon, aliases, an actions
 panel, and a live acrylic backdrop. See [ROADMAP.md](ROADMAP.md) for
@@ -84,7 +84,7 @@ drag the scrollbar (or click its track to jump), click in the query to place
 the caret.
 
 Summoning apex with an empty query lists your most-used entries under
-`Suggestions`, then everything else - every app, quicklink and command -
+`Suggestions`, then everything else - every app, quicklink and script -
 under `Commands`. The list scrolls, so the window stays the same height
 whether you have ten entries or three hundred. `Suggestions` is omitted
 entirely until you have launched something.
@@ -159,8 +159,77 @@ other placeholders, such as `{clipboard}` or `{date}`, are not filled in
 automatically: each becomes an argument of that name. A `{GUID}`, as in
 `shell:::{20D04FE0-3AEA-1069-A2D8-08002B30309D}`, is left alone.
 
+A link that is a path may start with `~` and use `%NAME%` environment
+variables - expanded in the link's own text, never in a typed value - so one
+config can serve machines whose user folders differ.
+
 Prefer `'single quotes'`: they keep Windows paths like `C:\tools\x.exe`
 literal, with no escaping, and Raycast's double quotes as they are.
+
+### Scripts
+
+Every script in a script folder is a command: drop `flush-dns.ps1` into one
+and typing `flush` finds it. Apex runs each with the program that runs that
+kind of script - not whatever its file type opens, which for a `.ps1` is
+usually an editor:
+
+| Script | Runs with |
+|---|---|
+| `.ps1` | PowerShell 7 (`pwsh`), else Windows PowerShell |
+| `.bat` `.cmd` | `cmd` |
+| `.sh` | Git Bash - never WSL's `bash` |
+| `.py` `.pyw` | the Python launcher (`py`), else `python` |
+
+The folders are the `[scripts]` list:
+
+```toml
+[scripts]
+1 = '~\dotfiles\windows\scripts\apex'
+2 = 'D:\tools\scripts'
+```
+
+With no `[scripts]` section at all, apex looks in
+`~\dotfiles\windows\scripts\apex`, so every machine that shares a dotfiles
+repo gets its scripts with no config. Listing folders replaces that default,
+so include it to keep it; an empty `[scripts]` means no folders. A folder a
+machine does not have is skipped without complaint, so one list can serve
+several machines. Paths may start with `~` and use `%NAME%` variables.
+Folders are read one level deep - helpers can live in a subfolder - at
+startup and on `Apex: Reload`, which is what picks up a new script. A
+script's name is its file name, without the extension.
+
+A script runs from its own folder, as you rather than as administrator
+(`Ctrl+K` offers **Run as Administrator**), and with no window at all: it
+runs in the background, with its input closed, so one that stops to ask for
+something ends rather than waiting unseen. `Ctrl+K` > **Run in Terminal**
+runs it once in a terminal instead, to see its output, or why it failed;
+**Open in Explorer** shows where it lives. PowerShell runs scripts with
+`-ExecutionPolicy Bypass`, as a shortcut to them would: choosing to run one
+is the decision the policy exists to ask for.
+
+For a script that takes arguments, or should always show its window, make a
+quicklink to it - a quicklink whose link is a script runs it the same way:
+
+```toml
+[quicklinks.deploy]
+name = 'Deploy'
+link = '~\scripts\deploy.ps1 -Env {argument name="env" default="staging"}'
+window = 'keep'
+```
+
+Whatever follows the script's path is its arguments, split like a command
+line - wrap one with spaces in double quotes. Placeholders work as in any
+other link, and a value typed into one stays a single argument, spaces and
+all. `window` sets what the script's window does:
+
+| `window` | |
+|---|---|
+| `hidden` | no window - the default |
+| `keep` | a terminal that stays open afterwards, at a prompt in the script's folder |
+| `close` | a terminal that closes when the script ends |
+
+With `open_with` set, a script is opened by that program instead of run - in
+an editor, say.
 
 ### Curating what shows up
 
@@ -170,8 +239,8 @@ offers **Hide from Apex**; `Apex: Manage Hidden Entries` lists what you hid,
 with **Unhide** to put it back.
 
 For the whole picture, `Apex: Sources & Commands` lists every source apex
-draws from - its own commands, quicklinks, each source folder, and the
-applications - as sections, with each entry marked **On** or **Off**. `Enter`
+draws from - its own commands, quicklinks, scripts, each source folder, and
+the applications - as sections, with each entry marked **On** or **Off**. `Enter`
 flips the highlighted entry (turned-off rows are drawn faded), and `Ctrl+K`
 also offers **Turn Off All** / **Turn On All** for that source. It is the
 same switch as hiding: an entry that is off never appears in results.
@@ -180,9 +249,11 @@ same switch as hiding: an entry that is off never appears in results.
 
 Portable apps and loose scripts never get a Start Menu entry, so apex cannot
 see them by default. `Apex: Add Source Folder` takes a folder and indexes
-what is in it - `.exe`, `.lnk`, `.bat`, `.cmd` and `.ps1`, one level deep.
-`Apex: Manage Source Folders` lists what you have added, with **Remove Source
-Folder** behind `Ctrl+K`; removing reindexes immediately.
+what is in it - `.exe` and `.lnk` files, and the scripts apex runs (`.ps1`,
+`.bat`, `.cmd`, `.sh`, `.py`, `.pyw`) - one level deep. A script there runs
+as one in a quicklink does, with no window; `Ctrl+K` > **Run in Terminal**
+shows one. `Apex: Manage Source Folders` lists what you have added, with
+**Remove Source Folder** behind `Ctrl+K`; removing reindexes immediately.
 
 ```toml
 [sources]
@@ -200,7 +271,7 @@ hidden synonyms (`startup` finds Toggle Start at Login, `exit` finds Quit).
 
 | Command | |
 |---|---|
-| `Apex: Reload` | re-read apps, quicklinks, aliases and config from disk |
+| `Apex: Reload` | re-read apps, quicklinks, scripts, aliases and config from disk |
 | `Apex: Restart` | relaunch, the only way to apply `[hotkey]` / `[general]` |
 | `Apex: Quit` | exit |
 | `Apex: Open Config` | open `config.toml` in your editor |
@@ -240,6 +311,7 @@ key = "escape"           # a-z, 0-9, f1-f24, space, escape, tab, grave, enter
 [plugins]
 search = true            # disabled plugins are never constructed: zero cost
 quicklinks = true
+scripts = true
 commands = true
 ```
 
@@ -284,12 +356,15 @@ works everywhere.
   otherwise start everything as administrator - Windows never consults the
   target's manifest. So apex hands each launch to Explorer, which forwards it
   to the desktop shell running as you, and the app comes back at normal
-  integrity. The one exception is a quicklink with `open_with`: Explorer
-  can't forward a program-and-argument pair, so those launch elevated.
-- **Run as Administrator on demand.** `Ctrl+K` on any app offers **Run as
-  Administrator**, which starts it with apex's own elevated token - no UAC
-  prompt, since you already answered one for apex. Not offered for Store
-  apps, which cannot be elevated.
+  integrity. A program with arguments - a script's interpreter, a quicklink's
+  `open_with` - can't be forwarded that way, so apex asks the desktop's
+  Explorer to start it through its automation object, the documented route
+  from an elevated process to an unelevated one; only with no Explorer
+  running as the shell does it start elevated.
+- **Run as Administrator on demand.** `Ctrl+K` on any app or script offers
+  **Run as Administrator**, which starts it with apex's own elevated token -
+  no UAC prompt, since you already answered one for apex. Not offered for
+  Store apps, which cannot be elevated.
 - To stop apex running elevated, uninstall this build and the task:
   `schtasks /delete /tn "Apex Elevated Logon" /f`.
 

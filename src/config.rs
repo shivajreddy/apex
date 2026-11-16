@@ -5,11 +5,19 @@
 //! beyond the parsed map. A missing file is created with commented defaults
 //! so the options are discoverable.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 /// Config section listing extra folders to index.
 pub const SOURCES: &str = "sources";
+
+/// Config section listing folders of scripts, each script a command.
+pub const SCRIPTS: &str = "scripts";
+
+/// The script folders when the file has no `[scripts]` section: the folder
+/// dotfiles keeps apex's scripts in, so every machine sharing that repo gets
+/// them without a line of config.
+pub const DEFAULT_SCRIPT_FOLDERS: [&str; 1] = [r"~\dotfiles\windows\scripts\apex"];
 
 // MOD_CONTROL / VK_ESCAPE as plain integers to keep this module POD.
 pub const DEFAULT_HOTKEY_MODS: u32 = 0x0002;
@@ -55,6 +63,8 @@ key = "escape"
 # constructed and uses zero memory.
 search = true
 quicklinks = true
+# Every script in the [scripts] folders, runnable by name.
+scripts = true
 # Apex's own commands, e.g. "Reload Apex" - which re-reads this file and
 # rescans installed applications without a restart.
 commands = true
@@ -71,15 +81,36 @@ commands = true
 # the quicklink and press Tab, or type its alias and a space. Raycast's
 # syntax works - name="...", default="..." for an optional one, | raw to
 # skip percent-encoding, up to three per link - and so does a bare {query}.
+#
+# A link to a script - .ps1, .bat, .cmd, .sh or .py - runs it, from its own
+# folder and with no window, passing whatever follows its path as arguments.
+# A path may start with ~ and use %NAME% environment variables:
+#
+#   [quicklinks.flush-dns]
+#   name = 'Flush DNS'
+#   link = '~\scripts\flush-dns.ps1'
+#   window = 'keep'     # optional: 'hidden' (default), 'keep' or 'close'
+#
 # Prefer 'single quotes' - they keep Windows paths like C:\tools\x.exe
 # literal, with no escaping, and the double quotes above as they are.
 
 # Extra folders to index, alongside the Start menu. Scanned one level deep
-# for .exe, .lnk, .bat, .cmd and .ps1 - handy for portable apps. Add one
+# for programs, shortcuts and scripts - handy for portable apps. Add one
 # with "Apex: Add Source Folder", or by hand here, then reload.
 #
 #   [sources]
 #   1 = 'D:\PortableApps'
+
+# Folders of scripts - .ps1, .bat, .cmd, .sh, .py - each script a command
+# that runs by name, with no window. Scanned one level deep, so helpers can
+# live in a subfolder; reload to pick up new scripts. A folder a machine
+# does not have is skipped, so one list can serve several machines. With no
+# [scripts] section apex looks in ~\dotfiles\windows\scripts\apex; listing
+# folders here replaces that default, so include it to keep it.
+#
+#   [scripts]
+#   1 = '~\dotfiles\windows\scripts\apex'
+#   2 = 'D:\tools\scripts'
 
 # Entries removed from apex, as plugin/payload. Written by the "Hide from
 # Apex" action; review them with "Apex: Manage Hidden Entries". The keys are
@@ -91,6 +122,9 @@ commands = true
 
 pub struct Config {
     values: HashMap<(String, String), String>,
+    /// Every `[section]` the file names, empty ones included - which
+    /// `values` has no trace of.
+    sections: HashSet<String>,
     pub hotkey_mods: u32,
     pub hotkey_vk: u32,
 }
@@ -107,6 +141,7 @@ impl Config {
             hotkey_from(&values).unwrap_or((DEFAULT_HOTKEY_MODS, DEFAULT_HOTKEY_VK));
         Self {
             values,
+            sections: section_names(text),
             hotkey_mods,
             hotkey_vk,
         }
@@ -182,6 +217,18 @@ impl Config {
             .collect();
         items.sort_by_key(|(n, _)| *n);
         items.into_iter().map(|(_, v)| v.clone()).collect()
+    }
+
+    /// Folders to find scripts in, as written: the `[scripts]` list, or
+    /// [`DEFAULT_SCRIPT_FOLDERS`] when the file has no `[scripts]` section
+    /// at all. A list replaces the default rather than adding to it, and an
+    /// empty `[scripts]` means none.
+    pub fn script_folders(&self) -> Vec<String> {
+        if self.sections.contains(SCRIPTS) {
+            self.list_values(SCRIPTS)
+        } else {
+            DEFAULT_SCRIPT_FOLDERS.map(str::to_string).to_vec()
+        }
     }
 
     /// One-level sub-tables under `prefix`, e.g. `[quicklinks.github]` for
@@ -470,6 +517,49 @@ pub fn sanitize_value(text: &str) -> String {
         .collect()
 }
 
+/// A folder or file path from the config, ready to use: `~` and `%NAME%`
+/// expanded, and `/` as `\`.
+pub fn expand_path(path: &str) -> String {
+    expand_env(&expand_home(path.trim())).replace('/', "\\")
+}
+
+/// `text` with a leading `~` - alone, or before a `\` or `/` - replaced by
+/// the user's profile folder.
+pub fn expand_home(text: &str) -> String {
+    match text.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with(['\\', '/']) => {
+            match std::env::var("USERPROFILE") {
+                Ok(home) => format!("{home}{rest}"),
+                Err(_) => text.to_string(),
+            }
+        }
+        _ => text.to_string(),
+    }
+}
+
+/// `text` with each `%NAME%` replaced by that environment variable. One that
+/// is not set is left as written, as Windows itself leaves it.
+pub fn expand_env(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('%') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('%') else {
+            rest = &rest[start..];
+            break;
+        };
+        let name = &after[..end];
+        match std::env::var(name).ok().filter(|_| !name.is_empty()) {
+            Some(value) => out.push_str(&value),
+            None => out.push_str(&rest[start..start + end + 2]),
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 pub fn config_path() -> Option<PathBuf> {
     let appdata = std::env::var_os("APPDATA")?;
     Some(PathBuf::from(appdata).join("apex").join("config.toml"))
@@ -506,6 +596,14 @@ fn parse(text: &str) -> HashMap<(String, String), String> {
         }
     }
     out
+}
+
+/// The name of every `[section]` in `text`, lowercased as [`parse`] does.
+fn section_names(text: &str) -> HashSet<String> {
+    text.lines()
+        .filter_map(|line| header_name(strip_comment(line)))
+        .map(str::to_lowercase)
+        .collect()
 }
 
 /// Cut a `#` comment, respecting both quote styles so a `#` inside a link
@@ -634,6 +732,13 @@ mod tests {
         assert!(cfg.acrylic());
         // Animation ships off; the default file states it explicitly.
         assert!(!cfg.flag("appearance", "animation", true));
+        // Its [scripts] block is an example, commented out: the default
+        // folder applies.
+        assert!(cfg.plugin_enabled("scripts"));
+        assert_eq!(
+            cfg.script_folders(),
+            DEFAULT_SCRIPT_FOLDERS.map(str::to_string).to_vec()
+        );
     }
 
     #[test]
@@ -731,6 +836,65 @@ mod tests {
             sanitize_value(r#"{argument name="it's"}"#),
             "{argument name=it's}"
         );
+    }
+
+    #[test]
+    fn script_folders_default_until_the_file_has_a_scripts_section() {
+        let default = DEFAULT_SCRIPT_FOLDERS.map(str::to_string).to_vec();
+        assert_eq!(Config::from_text("").script_folders(), default);
+        assert_eq!(
+            Config::from_text("[general]\nstart_menu = true\n").script_folders(),
+            default
+        );
+        // A list replaces the default, in key order.
+        let cfg = Config::from_text("[scripts]\n2 = 'D:\\b'\n1 = '~/a'\n");
+        assert_eq!(cfg.script_folders(), vec!["~/a", r"D:\b"]);
+        // An empty section means none, whatever its case or comment.
+        assert!(Config::from_text("[scripts]\n").script_folders().is_empty());
+        assert!(
+            Config::from_text("[Scripts]  # none here\n\n[general]\nx = 1\n")
+                .script_folders()
+                .is_empty()
+        );
+        // A section that is commented out is no section.
+        assert_eq!(
+            Config::from_text("#   [scripts]\n#   1 = 'x'\n").script_folders(),
+            default
+        );
+    }
+
+    #[test]
+    fn config_paths_expand_home_variables_and_slashes() {
+        let home = std::env::var("USERPROFILE").unwrap();
+        let root = std::env::var("SystemRoot").unwrap();
+        assert_eq!(
+            expand_path(r"~\dotfiles\scripts"),
+            format!(r"{home}\dotfiles\scripts")
+        );
+        assert_eq!(
+            expand_path("~/dotfiles/scripts/"),
+            format!(r"{home}\dotfiles\scripts\")
+        );
+        assert_eq!(expand_path("~"), home);
+        assert_eq!(expand_path(r"%SystemRoot%\Temp"), format!(r"{root}\Temp"));
+        assert_eq!(expand_path(" D:/tools/scripts "), r"D:\tools\scripts");
+        // Only a ~ that stands for the profile folder.
+        assert_eq!(expand_path(r"~user\x"), r"~user\x");
+        assert_eq!(expand_path(r"C:\a~b"), r"C:\a~b");
+    }
+
+    #[test]
+    fn unset_variables_and_stray_percents_are_left_as_written() {
+        let root = std::env::var("SystemRoot").unwrap();
+        assert_eq!(expand_env("100%"), "100%");
+        assert_eq!(expand_env("a%%b"), "a%%b");
+        assert_eq!(expand_env("%APEX_SURELY_UNSET%"), "%APEX_SURELY_UNSET%");
+        assert_eq!(
+            expand_env("%APEX_SURELY_UNSET%%SystemRoot%"),
+            format!("%APEX_SURELY_UNSET%{root}")
+        );
+        // Names are case-insensitive, as on Windows.
+        assert_eq!(expand_env("x%systemroot%y"), format!("x{root}y"));
     }
 
     #[test]

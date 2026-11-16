@@ -2,4 +2,5 @@
 
 pub mod commands;
 pub mod quicklinks;
+pub mod scripts;
 pub mod search;

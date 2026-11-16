@@ -16,6 +16,19 @@
 //! value is substituted in, percent-encoded when the link is a URL. That
 //! single mechanism covers both web search and plain bookmarks.
 //!
+//! A link to a script runs it, with whatever follows its path as the
+//! script's arguments (see [`crate::script`]):
+//!
+//! ```toml
+//! [quicklinks.deploy]
+//! name = 'Deploy'
+//! link = '~\scripts\deploy.ps1 -Env {argument name="env" default="staging"}'
+//! window = 'keep'               # optional: 'hidden' (default), 'keep', 'close'
+//! ```
+//!
+//! A path may start with `~` and use `%NAME%` environment variables, so one
+//! config can serve machines whose user folders differ.
+//!
 //! Quicklinks are created and edited from inside apex, which rewrites only
 //! the relevant `[quicklinks.*]` block - the rest of the file, comments
 //! included, is untouched. They live in the roaming config rather than in
@@ -30,6 +43,7 @@ use crate::config;
 use crate::fuzzy;
 use crate::icon;
 use crate::plugin::{Action, ActionResult, Aliases, Argument, FormField, Icon, Plugin, ResultItem};
+use crate::script::{self, Window};
 
 pub const ID: &str = "quicklinks";
 
@@ -53,6 +67,9 @@ const MAX_ARGS: usize = 3;
 /// syntax is visible from inside apex.
 const LINK_LABEL: &str = "Link  \u{b7}  include {argument} to take input";
 
+/// The form's window field, which only a script link uses.
+const WINDOW_LABEL: &str = "Script window (optional): hidden, keep or close";
+
 /// Score boost for an exact alias hit; large enough to always rank first
 /// (the same figure the application plugin uses).
 const ALIAS_BOOST: i32 = 2000;
@@ -64,6 +81,9 @@ struct Entry {
     name: String,
     link: String,
     open_with: String,
+    /// The `window` setting as written, for a script link. Kept verbatim so
+    /// the edit form shows what the file says, even if it is not valid.
+    window: String,
     name_folded: Vec<char>,
     bonus: Vec<i32>,
     icon: Option<Arc<Icon>>,
@@ -75,6 +95,7 @@ impl Entry {
         name: String,
         link: String,
         open_with: String,
+        window: String,
         icon: Option<Arc<Icon>>,
     ) -> Self {
         Self {
@@ -84,8 +105,36 @@ impl Entry {
             name,
             link,
             open_with,
+            window,
             icon,
         }
+    }
+
+    /// Where the script is, when the link runs one. With `open_with` set the
+    /// script is opened by that program instead - in an editor, say.
+    fn script(&self, template: &Template) -> Option<ScriptLink> {
+        if self.open_with.is_empty() {
+            template.script()
+        } else {
+            None
+        }
+    }
+
+    fn runs_script(&self) -> bool {
+        self.script(&Template::parse(&self.link)).is_some()
+    }
+
+    /// The window a script runs with. A setting apex cannot read means the
+    /// default, not a refusal to run.
+    fn window(&self) -> Window {
+        Window::parse(&self.window).unwrap_or_else(|| {
+            crate::dlog!(
+                "quicklinks: {}: unknown window {:?}",
+                self.slug,
+                self.window
+            );
+            Window::default()
+        })
     }
 
     fn item(&self, alias: Option<&str>, score: i32) -> ResultItem {
@@ -122,7 +171,7 @@ impl IconCache {
 fn icon_id(link: &str) -> SHSTOCKICONID {
     if link.contains("://") {
         SIID_INTERNET
-    } else if std::path::Path::new(link).is_dir() {
+    } else if std::path::Path::new(&config::expand_path(link)).is_dir() {
         SIID_FOLDER
     } else {
         SIID_APPLICATION
@@ -156,12 +205,14 @@ impl Quicklinks {
                 None => slug.clone(),
             };
             let open_with = kv.get("open_with").map(|s| s.trim()).unwrap_or_default();
+            let window = kv.get("window").map(|s| s.trim()).unwrap_or_default();
             let art = icons.get(icon_id(link));
             entries.push(Entry::new(
                 slug,
                 name,
                 link.to_string(),
                 open_with.to_string(),
+                window.to_string(),
                 art,
             ));
         }
@@ -218,24 +269,42 @@ impl Quicklinks {
     }
 
     fn form(title: &str, entry: Option<&Entry>, action_id: &'static str) -> ActionResult {
-        let (name, link, open_with) = match entry {
-            Some(e) => (e.name.as_str(), e.link.as_str(), e.open_with.as_str()),
-            None => ("", "", ""),
+        let (name, link, open_with, window) = match entry {
+            Some(e) => (
+                e.name.as_str(),
+                e.link.as_str(),
+                e.open_with.as_str(),
+                e.window.as_str(),
+            ),
+            None => ("", "", "", ""),
         };
         ActionResult::RequestForm {
             title: title.to_string(),
             action_id,
-            fields: vec![
-                FormField::new("Name", name),
-                FormField::new(LINK_LABEL, link),
-                FormField::new("Open with (optional)", open_with),
-            ],
+            fields: Self::fields(name, link, open_with, window),
         }
     }
 
+    fn fields(name: &str, link: &str, open_with: &str, window: &str) -> Vec<FormField> {
+        vec![
+            FormField::new("Name", name),
+            FormField::new(LINK_LABEL, link),
+            FormField::new("Open with (optional)", open_with),
+            FormField::new(WINDOW_LABEL, window),
+        ]
+    }
+
     /// Open a quicklink with what was typed for its arguments - or, while a
-    /// required one is empty, ask for it instead.
-    fn run(&self, slug: &str, args: &[String]) -> ActionResult {
+    /// required one is empty, ask for it instead. A link to a script runs
+    /// it: in the quicklink's own window unless `window` overrides that, and
+    /// as administrator with `admin`.
+    fn run(
+        &self,
+        slug: &str,
+        args: &[String],
+        window: Option<Window>,
+        admin: bool,
+    ) -> ActionResult {
         let Some(e) = self.find(slug) else {
             return ActionResult::Done;
         };
@@ -243,22 +312,39 @@ impl Quicklinks {
         if template.missing(args) {
             return ActionResult::RequestArguments;
         }
-        open(&template.fill(args), &e.open_with);
+        match e.script(&template) {
+            Some(link) => {
+                let path = template.render(link.path.clone(), args, false, true);
+                let argv = template.argv(link.args, args);
+                script::run(&path, &argv, window.unwrap_or_else(|| e.window()), admin);
+            }
+            None => {
+                open(&template.fill(args), &e.open_with);
+            }
+        }
         ActionResult::Close
     }
 
     /// Write a quicklink to memory and to the config file.
-    fn save(&mut self, slug: String, name: String, link: String, open_with: String) {
+    fn save(
+        &mut self,
+        slug: String,
+        name: String,
+        link: String,
+        open_with: String,
+        window: String,
+    ) {
         config::upsert_quicklink_file(
             &slug,
             &[
                 ("name", &name),
                 ("link", &link),
                 ("open_with", &open_with),
+                ("window", &window),
             ],
         );
         let art = self.icons.get(icon_id(&link));
-        let entry = Entry::new(slug, name, link, open_with, art);
+        let entry = Entry::new(slug, name, link, open_with, window, art);
         match self.entries.iter().position(|e| e.slug == entry.slug) {
             Some(i) => self.entries[i] = entry,
             None => self.entries.push(entry),
@@ -327,7 +413,7 @@ impl Plugin for Quicklinks {
         if item.payload == CREATE_PAYLOAD {
             return Self::form("New Quicklink", None, "create");
         }
-        self.run(&item.payload, args)
+        self.run(&item.payload, args, None, false)
     }
 
     fn actions(&self, item: &ResultItem) -> Vec<Action> {
@@ -339,20 +425,33 @@ impl Plugin for Quicklinks {
         }
         // No "Create" here: that belongs to the create row, not to the
         // actions of an existing quicklink.
-        let mut actions = vec![
-            Action {
-                id: "open",
-                label: "Open".to_string(),
-            },
-            Action {
-                id: "edit",
-                label: "Edit Quicklink\u{2026}".to_string(),
-            },
-            Action {
-                id: "delete",
-                label: "Delete Quicklink".to_string(),
-            },
-        ];
+        let entry = self.find(&item.payload);
+        let script = entry.is_some_and(Entry::runs_script);
+        let mut actions = vec![Action {
+            id: "open",
+            label: if script { "Run" } else { "Open" }.to_string(),
+        }];
+        if script {
+            // A script that runs unseen can still be watched, once.
+            if entry.is_some_and(|e| e.window() != Window::Keep) {
+                actions.push(Action {
+                    id: "run_terminal",
+                    label: "Run in Terminal".to_string(),
+                });
+            }
+            actions.push(Action {
+                id: "run_as_admin",
+                label: "Run as Administrator".to_string(),
+            });
+        }
+        actions.push(Action {
+            id: "edit",
+            label: "Edit Quicklink\u{2026}".to_string(),
+        });
+        actions.push(Action {
+            id: "delete",
+            label: "Delete Quicklink".to_string(),
+        });
         if let Some(alias) = self.alias_of(&item.payload) {
             actions.push(Action {
                 id: "remove_alias",
@@ -368,7 +467,9 @@ impl Plugin for Quicklinks {
 
     fn run_action(&mut self, action_id: &str, item: &ResultItem, args: &[String]) -> ActionResult {
         match action_id {
-            "open" => self.run(&item.payload, args),
+            "open" => self.run(&item.payload, args, None, false),
+            "run_terminal" => self.run(&item.payload, args, Some(Window::Keep), false),
+            "run_as_admin" => self.run(&item.payload, args, None, true),
             "create" => Self::form("New Quicklink", None, "create"),
             "edit" => match self.find(&item.payload) {
                 Some(e) => Self::form("Edit Quicklink", Some(e), "edit"),
@@ -421,29 +522,38 @@ impl Plugin for Quicklinks {
                 .map(|f| config::sanitize_value(&f.value))
                 .unwrap_or_default()
         };
-        let (name, link, open_with) = (value(0), value(1), value(2));
-        // A quicklink with no target cannot do anything. Reopen the form
+        let (name, link, open_with, window) = (value(0), value(1), value(2), value(3));
+        // A quicklink with no target cannot do anything, and a window
+        // setting apex cannot read would be quietly ignored. Reopen the form
         // carrying the entered values back, rather than writing a broken
         // entry or discarding what was typed.
-        if link.is_empty() {
+        let problem = if link.is_empty() {
+            Some("Link is required")
+        } else if Window::parse(&window).is_none() {
+            Some("Script window must be hidden, keep or close")
+        } else {
+            None
+        };
+        if let Some(title) = problem {
             return ActionResult::RequestForm {
-                title: "Link is required".to_string(),
+                title: title.to_string(),
                 action_id: if action_id == "edit" { "edit" } else { "create" },
-                fields: vec![
-                    FormField::new("Name", &name),
-                    FormField::new(LINK_LABEL, &link),
-                    FormField::new("Open with (optional)", &open_with),
-                ],
+                fields: Self::fields(&name, &link, &open_with, &window),
             };
         }
         let name = if name.is_empty() { link.clone() } else { name };
+        // Written as apex spells it; the default is not written at all.
+        let window = Window::parse(&window)
+            .unwrap_or_default()
+            .setting()
+            .to_string();
 
         let slug = match action_id {
             // Reuse the existing slug so renaming preserves launch history.
             "edit" if self.find(&item.payload).is_some() => item.payload.clone(),
             _ => self.free_slug(&name),
         };
-        self.save(slug, name, link, open_with);
+        self.save(slug, name, link, open_with, window);
         ActionResult::Done
     }
 }
@@ -518,28 +628,154 @@ impl<'a> Template<'a> {
         })
     }
 
+    /// What argument `i` comes to: what was typed, else its default.
+    fn value<'v>(&'v self, values: &'v [String], i: usize) -> &'v str {
+        match values.get(i) {
+            Some(v) if !v.is_empty() => v,
+            _ => self.args[i].1.as_deref().unwrap_or(""),
+        }
+    }
+
     /// The link with each placeholder replaced by its argument's value, or
     /// by the default when that was left empty.
     ///
     /// Percent-encodes only for URLs, unless a modifier says otherwise: a
-    /// file path argument must keep its spaces and backslashes intact.
+    /// file path argument must keep its spaces and backslashes intact. A
+    /// link that is a path rather than a URI has `~` and `%NAME%` expanded.
     fn fill(&self, values: &[String]) -> String {
-        let url = self.link.contains("://");
-        let mut out = String::with_capacity(self.link.len());
-        let mut copied = 0;
+        let all = 0..self.link.len();
+        self.render(all, values, self.link.contains("://"), !is_uri(self.link))
+    }
+
+    /// `range` of the link with the placeholders in it filled in. `encode`
+    /// percent-encodes the values; `expand` expands what the link itself
+    /// spells out - a `~` the range starts with, and `%NAME%` variables -
+    /// but never a value that was typed.
+    fn render(
+        &self,
+        range: std::ops::Range<usize>,
+        values: &[String],
+        encode: bool,
+        expand: bool,
+    ) -> String {
+        let mut out = String::with_capacity(range.len());
+        let mut copied = range.start;
         for (hole, slot) in self.holes.iter().zip(&self.slots) {
             let Some(i) = *slot else { continue };
-            let value = match values.get(i) {
-                Some(v) if !v.is_empty() => v.as_str(),
-                _ => self.args[i].1.as_deref().unwrap_or(""),
-            };
-            out.push_str(&self.link[copied..hole.span.start]);
-            out.push_str(&hole.render(value, url));
+            if hole.span.start < range.start || hole.span.end > range.end {
+                continue;
+            }
+            let first = copied == range.start;
+            out.push_str(&self.literal(copied..hole.span.start, first, expand));
+            out.push_str(&hole.render(self.value(values, i), encode));
             copied = hole.span.end;
         }
-        out.push_str(&self.link[copied..]);
+        let first = copied == range.start;
+        out.push_str(&self.literal(copied..range.end, first, expand));
         out
     }
+
+    /// Text the link spells out itself, expanded when `expand`: `%NAME%`
+    /// variables, and a leading `~` when it is the `first` text of its part.
+    fn literal(&self, span: std::ops::Range<usize>, first: bool, expand: bool) -> String {
+        let text = &self.link[span];
+        match (expand, first) {
+            (false, _) => text.to_string(),
+            (true, true) => config::expand_env(&config::expand_home(text)),
+            (true, false) => config::expand_env(text),
+        }
+    }
+
+    /// Where the script is, if the link runs one: a path ending in a
+    /// script's extension (see [`crate::script`]), then its arguments. The
+    /// path runs to the first word that ends in one, so it needs no quotes
+    /// even with spaces in it; quotes around it work too.
+    fn script(&self) -> Option<ScriptLink> {
+        let link = self.link;
+        if is_uri(link) {
+            return None;
+        }
+        if let Some(rest) = link.strip_prefix('"') {
+            let end = 1 + rest.find('"')?;
+            return script::is_script(&link[1..end]).then_some(ScriptLink {
+                path: 1..end,
+                args: end + 1,
+            });
+        }
+        link.char_indices()
+            .filter(|(_, c)| c.is_whitespace())
+            .map(|(i, _)| i)
+            .chain([link.len()])
+            .find(|&end| script::is_script(&link[..end]))
+            .map(|end| ScriptLink {
+                path: 0..end,
+                args: end,
+            })
+    }
+
+    /// The link from `from` on, as a script's arguments: split at spaces
+    /// the way a command line is, except inside double quotes, which come
+    /// off. A placeholder never splits, and neither does the value typed for
+    /// it: a value with spaces in it stays one argument. `%NAME%` variables
+    /// the link spells out are expanded; typed values never are.
+    fn argv(&self, from: usize, values: &[String]) -> Vec<String> {
+        let mut args = Vec::new();
+        // The argument being read, once one has begun, and link text of it
+        // still to be expanded into it.
+        let mut arg: Option<String> = None;
+        let mut text = String::new();
+        let mut quoted = false;
+        let mut holes = self
+            .holes
+            .iter()
+            .zip(&self.slots)
+            .skip_while(|(hole, _)| hole.span.start < from)
+            .peekable();
+        let mut i = from;
+        while let Some(c) = self.link[i..].chars().next() {
+            if let Some((hole, slot)) = holes.next_if(|(hole, _)| hole.span.start == i) {
+                let a = arg.get_or_insert_with(String::new);
+                a.push_str(&config::expand_env(&std::mem::take(&mut text)));
+                match *slot {
+                    Some(n) => a.push_str(&hole.render(self.value(values, n), false)),
+                    // Past MAX_ARGS: as written.
+                    None => a.push_str(&self.link[hole.span.clone()]),
+                }
+                i = hole.span.end;
+                continue;
+            }
+            i += c.len_utf8();
+            if c.is_whitespace() && !quoted {
+                if let Some(mut a) = arg.take() {
+                    a.push_str(&config::expand_env(&std::mem::take(&mut text)));
+                    args.push(a);
+                }
+                continue;
+            }
+            // A quote begins an argument too, so `""` passes an empty one.
+            if arg.is_none() {
+                arg = Some(String::new());
+            }
+            if c == '"' {
+                quoted = !quoted;
+            } else {
+                text.push(c);
+            }
+        }
+        if let Some(mut a) = arg {
+            a.push_str(&config::expand_env(&text));
+            args.push(a);
+        }
+        args
+    }
+}
+
+/// Where the parts of a link that runs a script are.
+struct ScriptLink {
+    /// The script's path, without any quotes around it.
+    path: std::ops::Range<usize>,
+    /// Where its arguments begin.
+    args: usize,
 }
 
 /// A `{...}` in a link that reads an argument.
@@ -725,6 +961,18 @@ fn is_guid(s: &str) -> bool {
         })
 }
 
+/// Whether a link is a URI - `https://...`, `mailto:...`, `shell:...` -
+/// rather than a path, which apex expands. A drive letter is no scheme.
+fn is_uri(link: &str) -> bool {
+    link.split_once(':').is_some_and(|(scheme, _)| {
+        scheme.len() > 1
+            && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    })
+}
+
 fn percent_encode(s: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(s.len() + 8);
@@ -745,10 +993,9 @@ fn percent_encode(s: &str) -> String {
 
 /// Hand the link to the shell, optionally through a specific program.
 ///
-/// Routes through [`crate::launch::open`] so a plain link opens unelevated
-/// (via Explorer) even though apex is elevated. A link with `open_with` names
-/// a program, which Explorer cannot forward, so that case launches directly
-/// and inherits elevation - the one documented gap.
+/// Routes through [`crate::launch::open`] so the link opens unelevated even
+/// though apex is elevated - with `open_with` too, which goes by way of the
+/// desktop's Explorer.
 fn open(link: &str, open_with: &str) -> bool {
     let program = (!open_with.is_empty()).then_some(open_with);
     crate::launch::open(link, program)
@@ -1098,5 +1345,247 @@ mod tests {
         let mut out = Vec::new();
         q.browse(2, &mut out);
         assert_eq!(out.len(), 2);
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| v.to_string()).collect()
+    }
+
+    fn home() -> String {
+        std::env::var("USERPROFILE").unwrap()
+    }
+
+    /// A script link's path and arguments, as running it would pass them -
+    /// without running it.
+    fn script_of(link: &str, values: &[&str]) -> Option<(String, Vec<String>)> {
+        let values = strings(values);
+        let t = Template::parse(link);
+        let s = t.script()?;
+        Some((
+            t.render(s.path.clone(), &values, false, true),
+            t.argv(s.args, &values),
+        ))
+    }
+
+    #[test]
+    fn a_link_to_a_script_splits_into_its_path_and_arguments() {
+        // The path runs to its extension, spaces and all.
+        assert_eq!(
+            script_of(r"C:\My Scripts\deploy.ps1 -Env prod", &[]),
+            Some((
+                r"C:\My Scripts\deploy.ps1".to_string(),
+                strings(&["-Env", "prod"])
+            ))
+        );
+        // Quotes around it work too.
+        assert_eq!(
+            script_of(r#""C:\My Scripts\x.bat" one"#, &[]),
+            Some((r"C:\My Scripts\x.bat".to_string(), strings(&["one"])))
+        );
+        assert_eq!(
+            script_of(r"D:\sync.sh", &[]),
+            Some((r"D:\sync.sh".to_string(), Vec::new()))
+        );
+        // A URL to a script is a download, and a program is no script.
+        assert_eq!(script_of("https://x.dev/install.sh", &[]), None);
+        assert_eq!(script_of(r"C:\tools\app.exe --flag", &[]), None);
+        assert_eq!(script_of(r"C:\notes", &[]), None);
+    }
+
+    #[test]
+    fn script_arguments_split_like_a_command_line_but_values_never_do() {
+        let link = r#"C:\s\x.ps1 -Msg {argument name="msg"} --tag "two words" "" -Who "Hi {argument name="who"}!""#;
+        let (_, args) = script_of(link, &["hello world", "Bo"]).unwrap();
+        assert_eq!(
+            args,
+            strings(&[
+                "-Msg",
+                "hello world",
+                "--tag",
+                "two words",
+                "",
+                "-Who",
+                "Hi Bo!"
+            ])
+        );
+        // Modifiers apply; a script argument is never percent-encoded
+        // unless asked.
+        let (_, args) =
+            script_of("C:\\s\\x.sh {q | uppercase} {q | percent-encode}", &["a b"]).unwrap();
+        assert_eq!(args, strings(&["A B", "a%20b"]));
+    }
+
+    #[test]
+    fn a_path_may_start_with_home_and_name_environment_variables() {
+        let root = std::env::var("SystemRoot").unwrap();
+        assert_eq!(
+            script_of(r"~\dotfiles\scripts\flush-dns.ps1", &[])
+                .unwrap()
+                .0,
+            format!(r"{}\dotfiles\scripts\flush-dns.ps1", home())
+        );
+        // In the link's own text, the path and the arguments alike; never
+        // in a typed value.
+        assert_eq!(
+            script_of(
+                r#"%SystemRoot%\x.cmd %SystemRoot%\log {argument name="dir"}"#,
+                &["%SystemRoot%"]
+            ),
+            Some((
+                format!(r"{root}\x.cmd"),
+                vec![format!(r"{root}\log"), "%SystemRoot%".to_string()]
+            ))
+        );
+        // Plain path links expand too; URIs never do.
+        assert_eq!(fill(r"~\Downloads", &[]), format!(r"{}\Downloads", home()));
+        assert_eq!(fill("~", &[]), home());
+        assert_eq!(fill(r"~user\x", &[]), r"~user\x");
+        assert_eq!(
+            fill("https://x.dev/~me/%SystemRoot%", &[]),
+            "https://x.dev/~me/%SystemRoot%"
+        );
+        assert_eq!(
+            fill("mailto:a@b.c?subject=%SystemRoot%", &[]),
+            "mailto:a@b.c?subject=%SystemRoot%"
+        );
+        assert_eq!(
+            fill(r"C:\notes\{name}.md", &["%SystemRoot%"]),
+            r"C:\notes\%SystemRoot%.md"
+        );
+    }
+
+    #[test]
+    fn uris_are_told_from_paths() {
+        for uri in [
+            "https://x.dev",
+            "mailto:a@b.c",
+            "shell:::{20D04FE0-3AEA-1069-A2D8-08002B30309D}",
+            "ms-settings:display",
+        ] {
+            assert!(is_uri(uri), "{uri}");
+        }
+        for path in [
+            r"C:\tools\x.ps1",
+            r"~\x.sh",
+            r"%USERPROFILE%\x",
+            r"\\server\share\x.bat",
+            "notes",
+        ] {
+            assert!(!is_uri(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_script_quicklink_runs_and_offers_a_terminal_and_admin() {
+        let mut q = ql(&[
+            (
+                "dns",
+                &[("name", "Flush DNS"), ("link", r"~\s\flush-dns.ps1")],
+            ),
+            (
+                "status",
+                &[
+                    ("name", "Status"),
+                    ("link", r"C:\s\status.ps1"),
+                    ("window", "keep"),
+                ],
+            ),
+            (
+                "editor",
+                &[
+                    ("name", "Edit"),
+                    ("link", r"C:\s\x.ps1"),
+                    ("open_with", "notepad"),
+                ],
+            ),
+            (
+                "web",
+                &[("name", "Web"), ("link", "https://x.dev/install.sh")],
+            ),
+            (
+                "odd",
+                &[
+                    ("name", "Odd"),
+                    ("link", r"C:\s\odd.sh"),
+                    ("window", "sometimes"),
+                ],
+            ),
+        ]);
+        let mut actions = |slug: &str| -> Vec<(&'static str, String)> {
+            let item = q.item_for(slug).unwrap();
+            q.actions(&item)
+                .into_iter()
+                .map(|a| (a.id, a.label))
+                .collect()
+        };
+        let has = |list: &[(&str, String)], id: &str| list.iter().any(|(i, _)| *i == id);
+
+        let dns = actions("dns");
+        assert_eq!(dns[0], ("open", "Run".to_string()));
+        assert!(has(&dns, "run_terminal") && has(&dns, "run_as_admin"));
+        // Already in a terminal: no point offering one.
+        let status = actions("status");
+        assert!(!has(&status, "run_terminal") && has(&status, "run_as_admin"));
+        // With open_with the script is opened, not run; a URL is a URL.
+        for slug in ["editor", "web"] {
+            let list = actions(slug);
+            assert_eq!(list[0], ("open", "Open".to_string()), "{slug}");
+            assert!(
+                !has(&list, "run_terminal") && !has(&list, "run_as_admin"),
+                "{slug}"
+            );
+        }
+
+        assert_eq!(q.find("status").unwrap().window(), Window::Keep);
+        assert_eq!(q.find("dns").unwrap().window(), Window::Hidden);
+        // A setting apex cannot read runs with the default, not at all.
+        assert_eq!(q.find("odd").unwrap().window(), Window::Hidden);
+    }
+
+    #[test]
+    fn a_script_waits_for_its_required_arguments_from_every_action() {
+        let mut q = ql(&[(
+            "deploy",
+            &[("link", r#"C:\s\deploy.ps1 -Env {argument name="env"}"#)],
+        )]);
+        let item = q.item_for("deploy").unwrap();
+        assert_eq!(q.arguments(&item), vec![arg("env", true)]);
+        assert!(matches!(
+            q.activate(&item, &[String::new()]),
+            ActionResult::RequestArguments
+        ));
+        for action in ["run_terminal", "run_as_admin"] {
+            assert!(matches!(
+                q.run_action(action, &item, &[]),
+                ActionResult::RequestArguments
+            ));
+        }
+    }
+
+    #[test]
+    fn the_form_carries_the_window_and_refuses_one_it_cannot_read() {
+        let mut q = ql(&[(
+            "s",
+            &[("name", "S"), ("link", r"C:\s\x.ps1"), ("window", "close")],
+        )]);
+        let item = q.item_for("s").unwrap();
+        match q.run_action("edit", &item, &[]) {
+            ActionResult::RequestForm { fields, .. } => {
+                assert_eq!(fields.len(), 4);
+                assert_eq!(fields[3].value, "close");
+            }
+            _ => panic!("expected the edit form"),
+        }
+        // Reopens with what was typed, and saves nothing.
+        let typed = Quicklinks::fields("S", r"C:\s\x.ps1", "", "sometimes");
+        match q.submit_form("edit", &item, &typed) {
+            ActionResult::RequestForm { title, fields, .. } => {
+                assert!(title.contains("hidden, keep or close"), "{title}");
+                assert_eq!(fields[1].value, r"C:\s\x.ps1");
+                assert_eq!(fields[3].value, "sometimes");
+            }
+            _ => panic!("expected the form to reopen"),
+        }
+        assert_eq!(q.find("s").unwrap().window, "close");
     }
 }

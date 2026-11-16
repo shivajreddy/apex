@@ -151,7 +151,23 @@ of private memory; reading the index file adds none.
   Percent-encoded only for URLs, unless a modifier (`| raw`) says otherwise
 - Created and edited in-app through a multi-field form; slugs survive renames
   so launch history isn't orphaned
-- Optional `open_with` to route through a specific program
+- Optional `open_with` to route through a specific program, started
+  unelevated through the desktop's Explorer
+- Scripts: a link to a `.ps1`, `.bat`/`.cmd`, `.sh` or `.py` runs it with
+  its interpreter (PowerShell, cmd, Git Bash, the Python launcher), from its
+  own folder, unelevated, with no window unless `window = 'keep'`/`'close'`;
+  arguments follow the path. Source-folder scripts run the same way. Paths
+  may use `~` and `%NAME%`, so one config serves machines with different
+  user folders
+
+**Scripts plugin**
+- Every script in the `[scripts]` folders is a command, named by its file
+  name: Run, Run in Terminal, Run as Administrator, Open in Explorer, aliases
+- With no `[scripts]` section the folder is `~\dotfiles\windows\scripts\apex`,
+  so machines sharing a dotfiles repo get its scripts with no config; a
+  folder a machine lacks is skipped silently
+- Folders are read one level deep on a background thread, at startup and on
+  `Apex: Reload`
 
 **Commands plugin**
 - `Apex: ` namespace — Reload, Restart, Quit, Open Config, Open Config Folder,

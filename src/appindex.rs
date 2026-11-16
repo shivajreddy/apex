@@ -35,8 +35,9 @@ use crate::plugin::Icon;
 /// Command-line flag that turns the exe into the index helper.
 pub const HELPER_FLAG: &str = "--index";
 
-/// What counts as launchable in a user-added source folder.
-const SOURCE_EXTENSIONS: [&str; 5] = ["exe", "lnk", "bat", "cmd", "ps1"];
+/// What counts as launchable in a user-added source folder: programs,
+/// shortcuts, and every kind of script apex runs (`crate::script`).
+const SOURCE_EXTENSIONS: [&str; 8] = ["exe", "lnk", "bat", "cmd", "ps1", "sh", "py", "pyw"];
 
 /// How long the launcher waits for the helper before giving up on it.
 /// Indexing takes about a second; this only matters if the shell hangs.
